@@ -459,8 +459,20 @@
     });
   }
 
+  function clearBusyMarks() {
+    Array.prototype.forEach.call(document.querySelectorAll(".is-busy"), function (el) {
+      if (window.SqlBusy) window.SqlBusy.mark(el, false);
+      else el.classList.remove("is-busy");
+    });
+  }
+
+  function closeExplorerDrawer() {
+    document.body.classList.remove("is-explorer-open");
+  }
+
   function showHome() {
     setMode("browse");
+    clearBusyMarks();
     state.browse = { view: "home", database: "", kind: "all", query: "" };
     state.table = null;
     state.selectedRow = null;
@@ -519,6 +531,7 @@
         var act = event.target.getAttribute("data-act");
         if (act === "export") {
           event.stopPropagation();
+          if (window.SqlBusy) window.SqlBusy.mark(event.target, true);
           openDatabaseExport(db.name);
           return;
         }
@@ -528,6 +541,7 @@
           return;
         }
         if (closestClass(event.target, "card-actions")) return;
+        card.classList.add("is-busy");
         openDatabase(db.name, true);
       });
       grid.appendChild(card);
@@ -536,6 +550,7 @@
   }
 
   function openDatabase(name, loadObjects) {
+    closeExplorerDrawer();
     setMode("browse");
     state.browse.view = "database";
     state.browse.database = name;
@@ -552,6 +567,7 @@
   }
 
   function renderDatabasePage(name) {
+    clearBusyMarks();
     var catalog = state.catalog[name];
     setCrumbs([
       { label: "Database", onClick: showHome },
@@ -646,10 +662,12 @@
         card.addEventListener("click", function (event) {
           if (event.target.getAttribute("data-act") === "export") {
             event.stopPropagation();
+            if (window.SqlBusy) window.SqlBusy.mark(event.target, true);
             openTableExport(name, entry.item.schema, entry.item.name, entry.item.row_count);
             return;
           }
           if (closestClass(event.target, "card-actions")) return;
+          card.classList.add("is-busy");
           openTable(name, entry.item.schema, entry.item.name);
         });
         grid.appendChild(card);
@@ -706,6 +724,7 @@
   }
 
   function openTable(database, schema, table) {
+    closeExplorerDrawer();
     setMode("browse");
     state.browse.view = "table";
     state.browse.database = database;
@@ -1178,6 +1197,12 @@
     }
     next();
   });
+  var explorerToggle = document.getElementById("btn-explorer");
+  if (explorerToggle) {
+    explorerToggle.addEventListener("click", function () {
+      document.body.classList.toggle("is-explorer-open");
+    });
+  }
   document.getElementById("btn-new-conn").addEventListener("click", function () {
     window.location.href = "/connect";
   });

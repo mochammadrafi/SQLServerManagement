@@ -1,8 +1,6 @@
 (function (global) {
   var pollTimer = null;
   var currentJobId = null;
-  var folderTarget = null;
-  var folderPath = "";
   var defaultFolder = "";
 
   function $(id) {
@@ -363,36 +361,31 @@
   }
 
   function openFolderPicker(inputId) {
-    folderTarget = inputId;
-    loadFolder($(inputId).value || defaultFolder || "");
-    $("folder-modal").hidden = false;
-  }
-
-  function loadFolder(path) {
-    window.SqlLoading.showIn($("folder-modal").querySelector(".modal-card"), "Membaca folder", path || "Daftar drive");
-    api("/api/fs?path=" + encodeURIComponent(path || "")).then(function (data) {
-      window.SqlLoading.hideIn($("folder-modal").querySelector(".modal-card"));
+    var btn = document.activeElement;
+    var input = $(inputId);
+    if (window.SqlBusy) window.SqlBusy.mark(btn, true);
+    window.SqlLoading.show(
+      "Pilih folder",
+      "Dialog folder sistem sudah terbuka. Kalau tidak kelihatan, cek di belakang jendela browser."
+    );
+    api("/api/fs/pick", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: (input && input.value) || defaultFolder || "" })
+    }).then(function (data) {
+      window.SqlLoading.hide();
+      if (window.SqlBusy) window.SqlBusy.mark(btn, false);
       if (!data.ok) {
-        $("folder-list").innerHTML = '<p class="form-error">' + (data.error || "Gagal membaca folder") + "</p>";
+        if (data.error && !/dibatalkan/i.test(data.error)) {
+          window.alert(data.error + (data.hint ? "\n" + data.hint : ""));
+        }
         return;
       }
-      folderPath = data.path || "";
-      $("folder-path").textContent = folderPath || "Drive";
-      $("folder-up").disabled = !data.parent && data.path !== "";
-      $("folder-up").setAttribute("data-parent", data.parent || "");
-      var host = $("folder-list");
-      host.innerHTML = "";
-      (data.entries || []).forEach(function (entry) {
-        var btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "folder-item";
-        btn.textContent = (entry.kind === "drive" ? "Disk " : "") + entry.name;
-        btn.addEventListener("click", function () { loadFolder(entry.path); });
-        host.appendChild(btn);
-      });
-      if (!(data.entries || []).length) {
-        host.innerHTML = '<p class="empty-inline">Tidak ada subfolder.</p>';
-      }
+      if (input) input.value = data.path || defaultFolder;
+    }).catch(function (err) {
+      window.SqlLoading.hide();
+      if (window.SqlBusy) window.SqlBusy.mark(btn, false);
+      window.alert(String(err));
     });
   }
 
@@ -501,7 +494,6 @@
     $("db-export-close").addEventListener("click", function () { $("db-export-modal").hidden = true; });
     $("backup-close").addEventListener("click", function () { $("backup-modal").hidden = true; });
     $("jobs-close").addEventListener("click", function () { $("jobs-modal").hidden = true; });
-    $("folder-close").addEventListener("click", function () { $("folder-modal").hidden = true; });
     $("export-start").addEventListener("click", startExport);
     $("db-export-start").addEventListener("click", startDatabaseExport);
     $("backup-start").addEventListener("click", startBackup);
@@ -515,13 +507,6 @@
     $("db-export-none").addEventListener("click", function () {
       Array.prototype.forEach.call($("db-export-tables").querySelectorAll("input"), function (box) { box.checked = false; });
     });
-    $("folder-up").addEventListener("click", function () {
-      loadFolder($("folder-up").getAttribute("data-parent") || "");
-    });
-    $("folder-use").addEventListener("click", function () {
-      if (folderTarget) $(folderTarget).value = folderPath || defaultFolder;
-      $("folder-modal").hidden = true;
-    });
     $("export-all").addEventListener("click", function () {
       Array.prototype.forEach.call($("export-columns").querySelectorAll("input"), function (box) { box.checked = true; });
     });
@@ -534,7 +519,7 @@
       if (!id) return;
       api("/api/export/" + id + "/cancel", { method: "POST" }).then(refreshJobs);
     });
-    ["export-modal", "db-export-modal", "backup-modal", "jobs-modal", "folder-modal"].forEach(function (id) {
+    ["export-modal", "db-export-modal", "backup-modal", "jobs-modal"].forEach(function (id) {
       $(id).addEventListener("click", function (event) {
         if (event.target === $(id)) $(id).hidden = true;
       });

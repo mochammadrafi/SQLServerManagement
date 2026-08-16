@@ -17,7 +17,7 @@ from sqlsm.client import (
     pick_odbc_driver,
 )
 from sqlsm.export import cancel_job, get_job, list_jobs, start_backup, start_export, start_export_database
-from sqlsm.fsutil import default_data_folder, list_folders
+from sqlsm.fsutil import default_data_folder, existing_start_dir, list_folders, pick_folder
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 app = Flask(
@@ -176,7 +176,7 @@ def api_meta():
             "windows": sys.platform == "win32",
             "odbc_drivers": drivers,
             "preferred_driver": pick_odbc_driver(drivers),
-            "default_folder": default_data_folder(),
+            "default_folder": existing_start_dir(default_data_folder()),
         }
     )
 
@@ -544,6 +544,15 @@ def api_export_part(job_id, name):
 def api_fs():
     try:
         return jsonify({"ok": True, **list_folders(request.args.get("path") or "")})
+    except Exception as exc:
+        return _error_payload(exc)
+
+
+@app.route("/api/fs/pick", methods=["POST"])
+def api_fs_pick():
+    payload = request.get_json(silent=True) or {}
+    try:
+        return jsonify({"ok": True, **pick_folder(str(payload.get("path") or ""))})
     except Exception as exc:
         return _error_payload(exc)
 

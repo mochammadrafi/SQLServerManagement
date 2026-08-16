@@ -5,11 +5,19 @@
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SQL Server Management</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=7">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=8">
 </head>
 <body class="page-workspace">
+  <div id="busy-strip" class="busy-strip" hidden>
+    <div class="busy-bar"></div>
+    <div class="busy-copy">
+      <strong id="busy-title">Memuat</strong>
+      <span id="busy-text">Menunggu respons.</span>
+    </div>
+  </div>
   <header class="app-header">
     <div class="header-left">
+      <button type="button" class="btn-ghost header-menu" id="btn-explorer" aria-label="Tampilkan daftar database">Menu</button>
       <span class="brand-mark">SQL Server Management</span>
       <div class="conn-switch">
         <select id="conn-select"></select>
@@ -123,7 +131,7 @@
         <h4>Tabel besar (100 juta+ baris)</h4>
         <p>Aplikasi tidak pernah memuat seluruh tabel. Yang tampil hanya satu halaman (100–1000 baris). Jumlah baris diambil dari statistik partisi, bukan <code>COUNT(*)</code>.</p>
         <h4>Export / backup</h4>
-        <p>Dari kartu database: Backup (.bak) atau Export semua tabel (CSV). Dari kartu tabel: Export tabel itu saja. CSV bisa dipecah per ukuran (default 10 GB). File .bak ditulis oleh layanan SQL Server ke folder yang dipilih.</p>
+        <p>Dari kartu database: Backup (.bak) atau Export semua tabel (CSV). Dari kartu tabel: Export tabel itu saja. <strong>Pilih folder...</strong> membuka dialog folder Windows/macOS seperti aplikasi biasa. File .bak harus ke folder yang bisa ditulis akun SQL Server.</p>
         <h4>SQL</h4>
         <p>Mode SQL untuk query ad-hoc. Jangan <code>SELECT *</code> tanpa <code>TOP</code> pada tabel besar. Hasil dipotong 1000 baris. F5 / Ctrl+Enter menjalankan SQL.</p>
         <h4>Hati-hati</h4>
@@ -152,8 +160,8 @@
         <label class="field">
           <span>Folder tujuan</span>
           <div class="field-row">
-            <input id="export-folder" type="text" placeholder="C:\SQLSM-Data">
-            <button type="button" class="btn-secondary" id="export-browse">Pilih folder</button>
+            <input id="export-folder" type="text" placeholder="Pilih folder tujuan">
+            <button type="button" class="btn-secondary" id="export-browse">Pilih folder...</button>
           </div>
         </label>
         <label class="field">
@@ -212,8 +220,8 @@
         <label class="field">
           <span>Folder tujuan</span>
           <div class="field-row">
-            <input id="db-export-folder" type="text" placeholder="C:\SQLSM-Data">
-            <button type="button" class="btn-secondary" id="db-export-browse">Pilih folder</button>
+            <input id="db-export-folder" type="text" placeholder="Pilih folder tujuan">
+            <button type="button" class="btn-secondary" id="db-export-browse">Pilih folder...</button>
           </div>
         </label>
         <label class="field">
@@ -270,8 +278,8 @@
         <label class="field">
           <span>Folder tujuan</span>
           <div class="field-row">
-            <input id="backup-folder" type="text" placeholder="C:\SQLSM-Data">
-            <button type="button" class="btn-secondary" id="backup-browse">Pilih folder</button>
+            <input id="backup-folder" type="text" placeholder="Pilih folder tujuan">
+            <button type="button" class="btn-secondary" id="backup-browse">Pilih folder...</button>
           </div>
         </label>
         <label class="field">
@@ -286,23 +294,6 @@
         <label class="choice tight"><input id="backup-compress" type="checkbox" checked> <span>Kompresi backup (jika edisi SQL Server mendukung)</span></label>
         <p id="backup-error" class="form-error" hidden></p>
         <button type="button" class="btn-primary" id="backup-start">Mulai backup</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="folder-modal" class="modal" hidden>
-    <div class="modal-card">
-      <div class="modal-head">
-        <h3>Pilih folder</h3>
-        <button type="button" class="btn-ghost" id="folder-close">Tutup</button>
-      </div>
-      <div class="help-body">
-        <div class="folder-nav">
-          <button type="button" class="btn-tiny" id="folder-up">Naik</button>
-          <span id="folder-path" class="folder-path"></span>
-        </div>
-        <div id="folder-list" class="folder-list"></div>
-        <button type="button" class="btn-primary" id="folder-use">Pakai folder ini</button>
       </div>
     </div>
   </div>
@@ -326,9 +317,9 @@
     </div>
   </div>
 
-  <script src="{{ url_for('static', filename='js/ui.js') }}?v=7"></script>
-  <script src="{{ url_for('static', filename='js/grid.js') }}?v=7"></script>
-  <script src="{{ url_for('static', filename='js/export.js') }}?v=7"></script>
-  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=7"></script>
+  <script src="{{ url_for('static', filename='js/ui.js') }}?v=8"></script>
+  <script src="{{ url_for('static', filename='js/grid.js') }}?v=8"></script>
+  <script src="{{ url_for('static', filename='js/export.js') }}?v=8"></script>
+  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=8"></script>
 </body>
 </html>

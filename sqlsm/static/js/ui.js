@@ -99,8 +99,64 @@
     return overlay;
   }
 
+  var busyDepth = 0;
+
+  function ensureBusy() {
+    var strip = document.getElementById("busy-strip");
+    if (strip) return strip;
+    strip = document.createElement("div");
+    strip.id = "busy-strip";
+    strip.className = "busy-strip";
+    strip.hidden = true;
+    strip.innerHTML =
+      '<div class="busy-bar"></div>' +
+      '<div class="busy-copy"><strong id="busy-title">Memuat</strong>' +
+      '<span id="busy-text">Menunggu respons.</span></div>';
+    document.body.appendChild(strip);
+    return strip;
+  }
+
+  function setBusyText(title, text) {
+    var heading = document.getElementById("busy-title");
+    var body = document.getElementById("busy-text");
+    if (heading) heading.textContent = title || "Memuat";
+    if (body) body.textContent = text || "";
+    var status = document.getElementById("status-text");
+    if (status) status.textContent = title || "Memuat";
+    var meta = document.getElementById("status-meta");
+    if (meta && text) meta.textContent = text;
+  }
+
+  function startBusy(title, text) {
+    busyDepth = 1;
+    var strip = ensureBusy();
+    setBusyText(title, text);
+    strip.hidden = false;
+    document.body.classList.add("is-busy");
+  }
+
+  function endBusy() {
+    busyDepth = 0;
+    var strip = document.getElementById("busy-strip");
+    if (strip) strip.hidden = true;
+    document.body.classList.remove("is-busy");
+  }
+
+  function markBusy(el, on) {
+    if (!el) return;
+    if (on) {
+      el.classList.add("is-busy");
+      if (el.tagName === "BUTTON" || el.tagName === "INPUT") el.disabled = true;
+    } else {
+      el.classList.remove("is-busy");
+      if (el.tagName === "BUTTON" || el.tagName === "INPUT") el.disabled = false;
+    }
+  }
+
   function showBoot(title, text) {
-    var overlay = ensureBoot();
+    startBusy(title, text);
+    var overlay = document.getElementById("boot-overlay");
+    if (!overlay || overlay.hidden) return;
     var heading = document.getElementById("boot-title");
     var body = document.getElementById("boot-text");
     if (heading) heading.textContent = title || "Memuat";
@@ -111,9 +167,11 @@
   function hideBoot() {
     var overlay = document.getElementById("boot-overlay");
     if (overlay) overlay.hidden = true;
+    endBusy();
   }
 
   function showIn(host, title, text) {
+    startBusy(title, text);
     if (!host) return;
     host.classList.add("is-loading-host");
     var layer = childByClass(host, "panel-loading");
@@ -130,10 +188,14 @@
   }
 
   function hideIn(host) {
-    if (!host) return;
-    host.classList.remove("is-loading-host");
-    var layer = childByClass(host, "panel-loading");
-    if (layer) layer.hidden = true;
+    if (host) {
+      host.classList.remove("is-loading-host");
+      var layer = childByClass(host, "panel-loading");
+      if (layer) layer.hidden = true;
+    }
+    var overlay = document.getElementById("boot-overlay");
+    if (overlay && !overlay.hidden) return;
+    endBusy();
   }
 
   function childByClass(host, className) {
@@ -339,6 +401,11 @@
     hide: hideBoot,
     showIn: showIn,
     hideIn: hideIn
+  };
+  global.SqlBusy = {
+    start: startBusy,
+    end: endBusy,
+    mark: markBusy
   };
   global.SqlSelect = {
     mount: mountSelect

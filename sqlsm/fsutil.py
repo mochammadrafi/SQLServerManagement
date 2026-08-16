@@ -2,6 +2,8 @@
 import os
 import re
 import string
+import subprocess
+import sys
 
 from sqlsm.client import ClientError
 
@@ -13,6 +15,66 @@ def default_data_folder():
     if os.name == "nt":
         return "C:\\SQLSM-Data"
     return os.path.join(os.path.expanduser("~"), "sqlsm-data")
+
+
+def existing_start_dir(path=""):
+    # type: (str) -> str
+    text = (path or "").strip()
+    if text and os.path.isdir(text):
+        return os.path.abspath(text)
+    fallback = default_data_folder()
+    try:
+        if not os.path.isdir(fallback):
+            os.makedirs(fallback)
+        return os.path.abspath(fallback)
+    except Exception:
+        home = os.path.expanduser("~")
+        if os.path.isdir(home):
+            return home
+        return os.getcwd()
+
+
+def pick_folder(start=""):
+    # type: (str) -> dict
+    start = existing_start_dir(start)
+    if sys.platform == "darwin":
+        script = (
+            'POSIX path of (choose folder with prompt "Pilih folder tujuan" '
+            'default location POSIX file "%s")' % start.replace('"', '\\"')
+        )
+        try:
+            raw = subprocess.check_output(["osascript", "-e", script], stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError:
+            raise ClientError("Pemilihan folder dibatalkan.")
+        path = raw.decode("utf-8", "replace").strip()
+        if not path:
+            raise ClientError("Pemilihan folder dibatalkan.")
+        return {"path": os.path.abspath(path)}
+    if os.name == "nt":
+        ps = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "$d.Description = 'Pilih folder tujuan'; "
+            "$d.ShowNewFolderButton = $true; "
+            "$d.SelectedPath = '%s'; "
+            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
+            "Write-Output $d.SelectedPath } else { exit 2 }"
+        ) % start.replace("'", "''")
+        try:
+            raw = subprocess.check_output(
+                ["powershell", "-STA", "-NoProfile", "-Command", ps],
+                stderr=subprocess.STDOUT,
+            )
+        except (subprocess.CalledProcessError, OSError):
+            raise ClientError("Pemilihan folder dibatalkan.")
+        lines = [line.strip() for line in raw.decode("utf-8", "replace").splitlines() if line.strip()]
+        if not lines:
+            raise ClientError("Pemilihan folder dibatalkan.")
+        return {"path": os.path.abspath(lines[-1])}
+    raise ClientError(
+        "Dialog folder tidak tersedia.",
+        "Ketik path foldernya langsung di kotak, misalnya %s" % start,
+    )
 
 
 def safe_name(name):
@@ -61,7 +123,7 @@ def list_folders(path):
         text = os.path.expanduser("~")
     folder = normalize_dir(text)
     if not os.path.isdir(folder):
-        raise ClientError("Folder tidak ditemukan.", folder)
+        folder = existing_start_dir("")
     parent = os.path.dirname(folder.rstrip("\\/"))
     if os.name == "nt" and len(folder) <= 3 and folder[1:3] == ":\\":
         parent = ""
