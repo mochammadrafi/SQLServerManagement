@@ -153,7 +153,8 @@ def json_safe(value):
 
 _WHERE_BAD = re.compile(
     r";|--|/\*|\bGO\b|\b(INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|TRUNCATE|"
-    r"EXEC|EXECUTE|GRANT|REVOKE|BACKUP|RESTORE|SHUTDOWN|XP_|SP_CONFIGURE)\b",
+    r"EXEC|EXECUTE|GRANT|REVOKE|BACKUP|RESTORE|SHUTDOWN|XP_|SP_CONFIGURE|"
+    r"SELECT|UNION|OPENROWSET|OPENDATASOURCE|WAITFOR|OPENQUERY)\b",
     re.I,
 )
 
@@ -261,8 +262,22 @@ _TRANSIENT = (
 )
 
 
+def is_cancelled(exc):
+    # type: (Any) -> bool
+    text = str(exc or "").lower()
+    return (
+        "dibatalkan" in text
+        or "cancelled" in text
+        or "canceled" in text
+        or "hy008" in text
+        or "operation canceled" in text
+    )
+
+
 def is_transient(exc):
     # type: (Any) -> bool
+    if is_cancelled(exc):
+        return False
     if isinstance(exc, ClientError) and getattr(exc, "retryable", False):
         return True
     text = str(exc or "").lower()
@@ -305,6 +320,8 @@ def explain_error(exc):
         )
     elif "ssl" in lower or "certificate" in lower or "encrypt" in lower:
         hint = "Matikan opsi Enkripsi untuk SQL Server 2012, atau pasang sertifikat TLS di server."
+    elif is_cancelled(exc):
+        hint = "Perintah dihentikan. Server tidak lagi menjalankan query itu."
     elif is_transient(exc):
         hint = "Sesi terputus atau masih sibuk. Aplikasi menyambung ulang otomatis; coba lagi jika masih gagal."
     elif "driver" in lower and "not found" in lower:
@@ -320,6 +337,9 @@ class _LiveConn(object):
         self.backend = backend
         self.driver_name = driver_name
         self.busy = False
+        self.cursor = None
+        self.spid = None
+        self.cancel_event = threading.Event()
 
 
 class SqlServerClient(object):
@@ -489,10 +509,17 @@ class SqlServerClient(object):
                 for item in self._pool:
                     if item.raw is not None and not item.busy:
                         item.busy = True
+                        item.cancel_event = threading.Event()
+                        item.cursor = None
+                        if item.spid is None:
+                            item.spid = self._spid(item.raw)
                         return item
                 if len(self._pool) < self._POOL_MAX:
                     item = self._open_live()
                     item.busy = True
+                    item.cancel_event = threading.Event()
+                    item.cursor = None
+                    item.spid = self._spid(item.raw)
                     self._pool.append(item)
                     self.backend = item.backend or self.backend
                     self.driver_name = item.driver_name or self.driver_name
@@ -527,12 +554,83 @@ class SqlServerClient(object):
         return raw.cursor()
 
     def _raise_sql(self, exc):
+        if is_cancelled(exc):
+            raise ClientError("Perintah dibatalkan.", "Server tidak lagi menjalankan query itu.")
         if isinstance(exc, ClientError):
             if not getattr(exc, "retryable", False) and is_transient(exc):
                 exc.retryable = True
             raise exc
         message, hint = explain_error(exc)
         raise ClientError(message, hint, retryable=is_transient(exc))
+
+    def _spid(self, raw):
+        cursor = None
+        try:
+            cursor = raw.cursor()
+            cursor.execute("SELECT @@SPID")
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return int(row[0])
+        except Exception:
+            return None
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+
+    def _throw_if_cancelled(self, item):
+        if item is not None and item.cancel_event.is_set():
+            raise ClientError("Perintah dibatalkan.", "Server tidak lagi menjalankan query itu.")
+
+    def cancel_running(self):
+        with self._lock:
+            targets = [item for item in self._pool if item.busy]
+        spids = []
+        for item in targets:
+            item.cancel_event.set()
+            if item.cursor is not None:
+                self._cancel_cursor(item.cursor)
+            if item.spid:
+                spids.append(item.spid)
+        killed = self._kill_spids(spids)
+        return {"cancelled": len(targets), "killed": killed}
+
+    def _kill_spids(self, spids):
+        unique = []
+        for spid in spids:
+            if spid not in unique:
+                unique.append(spid)
+        if not unique:
+            return 0
+        live = None
+        killed = 0
+        try:
+            live = self._open_live()
+            cursor = live.raw.cursor()
+            try:
+                for spid in unique:
+                    try:
+                        cursor.execute("KILL %d" % int(spid))
+                        killed += 1
+                    except Exception:
+                        continue
+            finally:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            if live is not None and live.raw is not None:
+                try:
+                    live.raw.close()
+                except Exception:
+                    pass
+        return killed
 
     def _cancel_cursor(self, cursor):
         try:
@@ -584,9 +682,13 @@ class SqlServerClient(object):
             item = self._checkout()
             discard = False
             try:
-                return self._execute_body(item.raw, sql, params=params, max_rows=max_rows, database=database)
+                self._throw_if_cancelled(item)
+                return self._execute_body(item, sql, params=params, max_rows=max_rows, database=database)
             except Exception as exc:
                 last = exc
+                if is_cancelled(exc) or item.cancel_event.is_set():
+                    discard = True
+                    self._raise_sql(ClientError("Perintah dibatalkan."))
                 discard = is_transient(exc)
                 if attempt == 0 and discard:
                     continue
@@ -595,19 +697,24 @@ class SqlServerClient(object):
                 self._checkin(item, discard=discard)
         self._raise_sql(last or ClientError("Gagal menjalankan SQL."))
 
-    def _execute_body(self, raw, sql, params=None, max_rows=1000, database=None):
-        cursor = self._cursor(raw)
+    def _execute_body(self, item, sql, params=None, max_rows=1000, database=None):
+        cursor = self._cursor(item.raw)
+        item.cursor = cursor
         cancel_leftover = False
         try:
+            self._throw_if_cancelled(item)
             self._use_database(cursor, database)
+            self._throw_if_cancelled(item)
             batches = split_batches(sql)
             result_sets = []  # type: List[Dict[str, Any]]
             messages = []  # type: List[str]
             for batch in batches:
+                self._throw_if_cancelled(item)
                 if params is not None and len(batches) == 1:
                     cursor.execute(batch, params)
                 else:
                     cursor.execute(self._raw_sql(batch))
+                self._throw_if_cancelled(item)
                 while True:
                     if cursor.description:
                         columns = [item[0] for item in cursor.description]
@@ -615,6 +722,7 @@ class SqlServerClient(object):
                         truncated = False
                         count = 0
                         while count < max_rows:
+                            self._throw_if_cancelled(item)
                             fetched = cursor.fetchmany(min(500, max_rows - count))
                             if not fetched:
                                 break
@@ -657,7 +765,8 @@ class SqlServerClient(object):
         except Exception as exc:
             self._raise_sql(exc)
         finally:
-            self._close_cursor(cursor, cancel=cancel_leftover)
+            item.cursor = None
+            self._close_cursor(cursor, cancel=cancel_leftover or item.cancel_event.is_set())
 
     def _nextset(self, cursor):
         try:
@@ -774,8 +883,8 @@ GROUP BY d.database_id, d.name
             except (TypeError, ValueError):
                 return None
 
-    def list_objects(self, database):
-        # type: (str) -> Dict[str, Any]
+    def list_objects(self, database, include_counts=False):
+        # type: (str, bool) -> Dict[str, Any]
         self._assert_db(database)
         db = qident(database)
         schema_sql = """
@@ -822,10 +931,11 @@ ORDER BY 1, 3, 2
             "function": "functions",
         }
         counts = {}  # type: Dict[Tuple[str, str], Any]
-        try:
-            counts = self.table_row_counts(database)
-        except Exception:
-            counts = {}
+        if include_counts:
+            try:
+                counts = self.table_row_counts(database)
+            except Exception:
+                counts = {}
         seen_schema = set()
         for item in self._as_dicts(data):
             bucket = key_map.get(item.get("object_type") or "")
@@ -1156,27 +1266,38 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
         item = self._checkout()
         discard = False
         cursor = self._cursor(item.raw)
+        item.cursor = cursor
+        if item.spid is None:
+            item.spid = self._spid(item.raw)
         try:
+            self._throw_if_cancelled(item)
             cursor.execute(self._raw_sql(sql))
+            self._throw_if_cancelled(item)
             if not cursor.description:
                 return
             while True:
+                self._throw_if_cancelled(item)
                 raw_rows = cursor.fetchmany(int(batch_size))
                 if not raw_rows:
                     break
                 yield raw_rows
         except Exception as exc:
-            discard = is_transient(exc)
+            discard = is_cancelled(exc) or is_transient(exc)
             if isinstance(exc, ClientError):
                 raise
             self._raise_sql(exc)
         finally:
-            self._close_cursor(cursor)
+            item.cursor = None
+            self._close_cursor(cursor, cancel=item.cancel_event.is_set())
             self._checkin(item, discard=discard)
 
-    def select_script(self, schema, table, page_size=200, keys=None):
-        # type: (str, str, int, Optional[List[str]]) -> str
-        sql = "SELECT TOP %s *\nFROM %s" % (int(page_size), qname(schema, table))
+    def select_script(self, schema, table, page_size=200, keys=None, database=None):
+        # type: (str, str, int, Optional[List[str]], Optional[str]) -> str
+        if database:
+            source = qname(database, schema, table)
+        else:
+            source = qname(schema, table)
+        sql = "SELECT TOP %s *\nFROM %s" % (int(page_size), source)
         if keys:
             sql += "\nORDER BY " + ", ".join(qident(key) for key in keys)
         return sql + ";"

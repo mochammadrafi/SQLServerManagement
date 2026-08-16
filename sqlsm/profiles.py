@@ -5,6 +5,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from sqlsm.crypto_util import decrypt_secret, encrypt_secret
+
 STORE_DIR = os.path.join(os.path.expanduser("~"), ".sqlsm")
 STORE_PATH = os.path.join(STORE_DIR, "connections.json")
 
@@ -49,6 +51,14 @@ def _key(item):
         str(item.get("username") or "").strip().lower(),
         str(item.get("database") or "master").strip().lower(),
     )
+
+
+def read_password(item):
+    # type: (Dict[str, Any]) -> str
+    raw = item.get("password") or ""
+    if not raw:
+        return ""
+    return decrypt_secret(str(raw))
 
 
 def public_profile(item):
@@ -113,14 +123,15 @@ def upsert_profile(payload, remember_password=False):
             break
     if match is None:
         incoming["id"] = uuid.uuid4().hex[:12]
-        if remember_password:
-            incoming["password"] = password
+        if remember_password and password:
+            incoming["password"] = encrypt_secret(password)
         items.insert(0, incoming)
         match = incoming
     else:
         match.update(incoming)
         if remember_password:
-            match["password"] = password
+            if password:
+                match["password"] = encrypt_secret(password)
         else:
             match.pop("password", None)
             match["remember_password"] = False

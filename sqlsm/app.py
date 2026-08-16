@@ -8,21 +8,24 @@ import uuid
 from typing import Any, Dict, Optional
 
 from flask import Flask, g, jsonify, redirect, render_template, request, send_file, session, url_for
+from itsdangerous import BadSignature, URLSafeSerializer
 
 from sqlsm.client import (
     ClientError,
     ConnectionConfig,
     SqlServerClient,
     connect_client,
+    is_cancelled,
     is_transient,
     list_odbc_drivers,
     pick_odbc_driver,
 )
 from sqlsm.export import cancel_job, get_job, list_jobs, start_backup, start_export, start_export_database
 from sqlsm.fsutil import default_data_folder, existing_start_dir, list_folders, pick_folder
-from sqlsm.profiles import STORE_DIR, delete_profile, get_profile, list_profiles, upsert_profile
+from sqlsm.profiles import STORE_DIR, delete_profile, get_profile, list_profiles, read_password, upsert_profile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+STORE_IDLE_SEC = int(os.environ.get("SQLSM_IDLE_SEC", "7200"))
 
 
 def _secret_key():
@@ -59,11 +62,42 @@ app.config["JSON_AS_ASCII"] = False
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.jinja_env.auto_reload = True
 app.jinja_env.cache = {}
 
 STORE = {}  # type: Dict[str, Dict[str, Any]]
 _STORE_LOCK = threading.RLock()
+_CSRF = URLSafeSerializer(app.secret_key, salt="sqlsm-csrf")
+
+
+def _csrf_token():
+    # type: () -> str
+    return _CSRF.dumps(_sid())
+
+
+def _touch_store():
+    sid = _sid()
+    with _STORE_LOCK:
+        store = STORE.get(sid)
+        if store is not None:
+            store["_last"] = time.time()
+
+
+def _purge_idle_stores():
+    now = time.time()
+    with _STORE_LOCK:
+        dead = []
+        for sid, store in list(STORE.items()):
+            last = float(store.get("_last") or now)
+            if now - last <= STORE_IDLE_SEC:
+                continue
+            for item in (store.get("connections") or {}).values():
+                _close_item(item)
+            dead.append(sid)
+        for sid in dead:
+            STORE.pop(sid, None)
 
 
 def _sid():
@@ -83,6 +117,7 @@ def _ensure_store():
         if not item:
             return None
         if item.get("connections") is not None:
+            item["_last"] = time.time()
             return item
         if item.get("cfg"):
             cid = uuid.uuid4().hex[:12]
@@ -99,6 +134,7 @@ def _ensure_store():
                 "active": cid,
             }
             STORE[sid] = migrated
+            migrated["_last"] = time.time()
             return migrated
         return None
 
@@ -175,11 +211,13 @@ def _close_item(item):
 def _error_payload(exc):
     # type: (BaseException) -> Any
     retryable = is_transient(exc)
+    cancelled = is_cancelled(exc)
     payload = {
         "ok": False,
         "error": str(exc),
         "hint": getattr(exc, "hint", None),
         "retryable": retryable,
+        "cancelled": cancelled,
     }
     if isinstance(exc, ClientError):
         return jsonify(payload), 503 if retryable else 400
@@ -189,6 +227,15 @@ def _error_payload(exc):
 @app.before_request
 def _bind_sid():
     g.sid = _sid()
+    _touch_store()
+    _purge_idle_stores()
+    if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path.startswith("/api/"):
+        token = request.headers.get("X-SQLSM-Token") or ""
+        try:
+            if _CSRF.loads(token) != _sid():
+                return jsonify({"ok": False, "error": "Permintaan tidak valid.", "hint": "Refresh halaman, lalu coba lagi."}), 403
+        except BadSignature:
+            return jsonify({"ok": False, "error": "Permintaan tidak valid.", "hint": "Refresh halaman, lalu coba lagi."}), 403
 
 
 @app.route("/")
@@ -222,6 +269,7 @@ def api_meta():
             "preferred_driver": pick_odbc_driver(drivers),
             "default_folder": existing_start_dir(default_data_folder()),
             "profiles": list_profiles(),
+            "csrf_token": _csrf_token(),
         }
     )
 
@@ -254,6 +302,7 @@ def api_session():
             "connections": connections,
             "backend": item.get("backend") or "",
             "driver_name": item.get("driver_name") or "",
+            "csrf_token": _csrf_token(),
         }
     )
 
@@ -268,8 +317,8 @@ def api_connect():
     password = str(payload.get("password") or "")
     if not password and payload.get("profile_id"):
         saved = get_profile(str(payload.get("profile_id")))
-        if saved and saved.get("password"):
-            password = str(saved.get("password") or "")
+        if saved:
+            password = read_password(saved)
     cfg = ConnectionConfig(
         server=str(payload.get("server") or "").strip(),
         port=port,
@@ -303,6 +352,7 @@ def api_connect():
         }
         store["active"] = cid
         item = store["connections"][cid]
+        store["_last"] = time.time()
     try:
         upsert_profile(
             {
@@ -336,40 +386,41 @@ def api_connect():
 def api_disconnect():
     payload = request.get_json(silent=True) or {}
     sid = _sid()
-    store = _ensure_store()
-    if not store:
-        return jsonify({"ok": True, "connected": False, "connections": []})
-    close_all = bool(payload.get("all"))
-    target = str(payload.get("id") or store.get("active") or "").strip()
-    remaining = store.get("connections") or {}
-    if close_all:
-        for item in list(remaining.values()):
-            _close_item(item)
-        remaining = {}
-    elif target and target in remaining:
-        _close_item(remaining[target])
-        remaining.pop(target, None)
-    store["connections"] = remaining
-    if remaining:
-        if store.get("active") not in remaining:
-            store["active"] = next(iter(remaining.keys()))
-        item = remaining[store["active"]]
-        return jsonify(
-            {
-                "ok": True,
-                "connected": True,
-                "connection": _public_connection(item),
-                "connection_id": item.get("id"),
-                "connections": [_public_connection(entry) for entry in remaining.values()],
-            }
-        )
-    for job in list_jobs(sid):
-        if job.get("status") in ("queued", "running", "cancelling"):
-            try:
-                cancel_job(sid, job["id"])
-            except Exception:
-                pass
     with _STORE_LOCK:
+        store = _ensure_store()
+        if not store:
+            return jsonify({"ok": True, "connected": False, "connections": []})
+        close_all = bool(payload.get("all"))
+        target = str(payload.get("id") or store.get("active") or "").strip()
+        remaining = dict(store.get("connections") or {})
+        if close_all:
+            for item in list(remaining.values()):
+                _close_item(item)
+            remaining = {}
+        elif target and target in remaining:
+            _close_item(remaining[target])
+            remaining.pop(target, None)
+        store["connections"] = remaining
+        if remaining:
+            if store.get("active") not in remaining:
+                store["active"] = next(iter(remaining.keys()))
+            item = remaining[store["active"]]
+            store["_last"] = time.time()
+            return jsonify(
+                {
+                    "ok": True,
+                    "connected": True,
+                    "connection": _public_connection(item),
+                    "connection_id": item.get("id"),
+                    "connections": [_public_connection(entry) for entry in remaining.values()],
+                }
+            )
+        for job in list_jobs(sid):
+            if job.get("status") in ("queued", "running", "cancelling"):
+                try:
+                    cancel_job(sid, job["id"])
+                except Exception:
+                    pass
         STORE.pop(sid, None)
     return jsonify({"ok": True, "connected": False, "connections": []})
 
@@ -400,15 +451,17 @@ def api_server():
     try:
         client = _client()
         sessions = []
+        sessions_error = None
         try:
             sessions = client.list_sessions()
-        except Exception:
-            sessions = []
+        except Exception as exc:
+            sessions_error = str(exc)
         return jsonify(
             {
                 "ok": True,
                 "server": client.server_info(),
                 "sessions": sessions,
+                "sessions_error": sessions_error,
                 "backend": client.backend,
                 "driver_name": client.driver_name,
             }
@@ -428,8 +481,9 @@ def api_databases():
 @app.route("/api/objects")
 def api_objects():
     database = (request.args.get("database") or "").strip()
+    include_counts = (request.args.get("counts") or "").lower() in ("1", "true", "yes")
     try:
-        catalog = _client().list_objects(database)
+        catalog = _client().list_objects(database, include_counts=include_counts)
         return jsonify(
             {
                 "ok": True,
@@ -673,8 +727,11 @@ def api_preview():
     try:
         started = time.time()
         data = _client().preview_table(database, schema, table, top=top)
+        stats = _client().table_stats(database, schema, table)
         data["elapsed_ms"] = int((time.time() - started) * 1000)
-        data["sql"] = _client().select_script(schema, table)
+        data["sql"] = _client().select_script(
+            schema, table, database=database, keys=stats.get("keys"), page_size=top
+        )
         return jsonify({"ok": True, **data})
     except Exception as exc:
         return _error_payload(exc)
@@ -685,9 +742,23 @@ def api_script_select():
     schema = (request.args.get("schema") or "").strip()
     table = (request.args.get("table") or "").strip()
     try:
-        return jsonify({"ok": True, "sql": _client().select_script(schema, table)})
+        return jsonify({"ok": True, "sql": _client().select_script(schema, table, database=request.args.get("database") or None)})
     except Exception as exc:
         return _error_payload(exc)
+
+
+@app.route("/api/cancel", methods=["POST"])
+def api_cancel():
+    cancelled = 0
+    item = _active_item()
+    client = item.get("client") if item else None
+    if client is not None:
+        try:
+            result = client.cancel_running()
+            cancelled += int(result.get("cancelled") or 0)
+        except Exception:
+            pass
+    return jsonify({"ok": True, "cancelled": cancelled})
 
 
 @app.route("/api/query", methods=["POST"])
@@ -711,6 +782,8 @@ def api_query():
 def main():
     host = os.environ.get("SQLSM_HOST", "127.0.0.1")
     port = int(os.environ.get("SQLSM_PORT", "5050"))
+    if host not in ("127.0.0.1", "localhost", "::1") and os.environ.get("SQLSM_ALLOW_REMOTE") != "1":
+        print("PERINGATAN: SQLSM_HOST=%s bukan loopback. Set SQLSM_ALLOW_REMOTE=1 jika memang sengaja." % host)
     print("")
     print("SQL Server Management")
     print("Buka di browser: http://%s:%s" % (host, port))

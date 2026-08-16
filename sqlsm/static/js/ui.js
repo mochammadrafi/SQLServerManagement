@@ -99,47 +99,145 @@
     return overlay;
   }
 
-  var busyDepth = 0;
+  var bootDepth = 0;
+  var trackDepth = 0;
+  var panelDepth = 0;
+  var workAbort = null;
+  var csrfToken = "";
 
-  function ensureBusy() {
-    var strip = document.getElementById("busy-strip");
-    if (strip) return strip;
-    strip = document.createElement("div");
-    strip.id = "busy-strip";
-    strip.className = "busy-strip";
-    strip.hidden = true;
-    strip.innerHTML =
-      '<div class="busy-bar"></div>' +
-      '<div class="busy-copy"><strong id="busy-title">Memuat</strong>' +
-      '<span id="busy-text">Menunggu respons.</span></div>';
-    document.body.appendChild(strip);
-    return strip;
+  function setCsrfToken(token) {
+    csrfToken = token || "";
   }
 
-  function setBusyText(title, text) {
-    var heading = document.getElementById("busy-title");
-    var body = document.getElementById("busy-text");
+  function setStatus(title, meta) {
+    var status = document.getElementById("status-text");
+    var statusMeta = document.getElementById("status-meta");
+    if (status) status.textContent = title || "Siap";
+    if (statusMeta) statusMeta.textContent = meta || "";
+  }
+
+  function setStatusActive(on) {
+    var bar = document.getElementById("status-bar");
+    var spinner = document.getElementById("status-spinner");
+    if (bar) bar.classList.toggle("is-active", !!on);
+    if (spinner) spinner.hidden = !on;
+  }
+
+  function updateBootText(title, text) {
+    var heading = document.getElementById("boot-title");
+    var body = document.getElementById("boot-text");
     if (heading) heading.textContent = title || "Memuat";
     if (body) body.textContent = text || "";
-    var status = document.getElementById("status-text");
-    if (status) status.textContent = title || "Memuat";
-    var meta = document.getElementById("status-meta");
-    if (meta && text) meta.textContent = text;
   }
 
-  function startBusy(title, text) {
-    busyDepth = 1;
-    var strip = ensureBusy();
-    setBusyText(title, text);
-    strip.hidden = false;
-    document.body.classList.add("is-busy");
+  function bindBootCancel() {
+    var btn = document.getElementById("boot-cancel");
+    if (!btn || btn._sqlBound) return;
+    btn._sqlBound = true;
+    btn.addEventListener("click", function (event) {
+      event.preventDefault();
+      cancelWork(true);
+      hideAll();
+      setStatus("Dibatalkan", "");
+    });
   }
 
-  function endBusy() {
-    busyDepth = 0;
-    var strip = document.getElementById("busy-strip");
-    if (strip) strip.hidden = true;
-    document.body.classList.remove("is-busy");
+  function workSignal() {
+    return workAbort ? workAbort.signal : undefined;
+  }
+
+  function bindCancelButtons() {
+    var statusBtn = document.getElementById("btn-cancel-work");
+    if (statusBtn && !statusBtn._sqlBound) {
+      statusBtn._sqlBound = true;
+      statusBtn.addEventListener("click", function (event) {
+        event.preventDefault();
+        cancelWork(false);
+      });
+    }
+    var runBtn = document.getElementById("btn-cancel");
+    if (runBtn && !runBtn._sqlBound) {
+      runBtn._sqlBound = true;
+      runBtn.addEventListener("click", function (event) {
+        event.preventDefault();
+        cancelWork(false);
+      });
+    }
+  }
+
+  function setWorkCancelVisible(on) {
+    bindCancelButtons();
+    var statusBtn = document.getElementById("btn-cancel-work");
+    if (statusBtn) statusBtn.hidden = !on;
+    var sqlMode = document.getElementById("mode-sql");
+    var inSql = sqlMode && !sqlMode.hidden;
+    var runCancel = document.getElementById("btn-cancel");
+    if (runCancel) runCancel.hidden = !on || !inSql;
+    var run = document.getElementById("btn-run");
+    if (run) run.disabled = !!on && inSql;
+  }
+
+  function setHeaderLock(on) {
+    var ids = [
+      "conn-select",
+      "btn-new-conn",
+      "btn-disconnect",
+      "mode-browse-btn",
+      "mode-sql-btn",
+      "btn-jobs",
+      "btn-backup",
+      "btn-help"
+    ];
+    ids.forEach(function (id) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      if (on) {
+        el.disabled = true;
+        el.classList.add("is-busy");
+      } else {
+        el.disabled = false;
+        el.classList.remove("is-busy");
+      }
+    });
+  }
+
+  function cancelWork(fromBoot) {
+    setStatus("Membatalkan", "Menghentikan perintah di SQL Server.");
+    if (workAbort) {
+      try { workAbort.abort(); } catch (err) {}
+    }
+    if (!fromBoot) {
+      fetch("/api/cancel", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-SQLSM-Token": csrfToken },
+        body: "{}"
+      }).catch(function () {});
+    }
+  }
+
+  function track(title, text) {
+    trackDepth++;
+    if (trackDepth === 1) {
+      workAbort = typeof AbortController !== "undefined" ? new AbortController() : null;
+      setStatus(title, text);
+      setHeaderLock(true);
+      setWorkCancelVisible(true);
+      setStatusActive(true);
+      document.body.classList.add("is-working");
+    } else {
+      setStatus(title, text);
+    }
+  }
+
+  function untrack() {
+    trackDepth = Math.max(0, trackDepth - 1);
+    if (bootDepth > 0 || trackDepth > 0 || panelDepth > 0) return;
+    workAbort = null;
+    setHeaderLock(false);
+    setWorkCancelVisible(false);
+    setStatusActive(false);
+    document.body.classList.remove("is-working");
   }
 
   function markBusy(el, on) {
@@ -154,25 +252,71 @@
   }
 
   function showBoot(title, text) {
-    startBusy(title, text);
-    var overlay = document.getElementById("boot-overlay");
-    if (!overlay || overlay.hidden) return;
-    var heading = document.getElementById("boot-title");
-    var body = document.getElementById("boot-text");
-    if (heading) heading.textContent = title || "Memuat";
-    if (body) body.textContent = text || "";
+    bootDepth++;
+    if (bootDepth === 1) {
+      workAbort = typeof AbortController !== "undefined" ? new AbortController() : null;
+      bindBootCancel();
+      setStatus(title, text);
+      setHeaderLock(true);
+      setWorkCancelVisible(true);
+      setStatusActive(true);
+      document.body.classList.add("is-booting");
+    } else {
+      setStatus(title, text);
+    }
+    var overlay = ensureBoot();
+    updateBootText(title, text);
     overlay.hidden = false;
+    overlay.removeAttribute("hidden");
   }
 
   function hideBoot() {
+    bootDepth = Math.max(0, bootDepth - 1);
+    if (bootDepth > 0) return;
     var overlay = document.getElementById("boot-overlay");
-    if (overlay) overlay.hidden = true;
-    endBusy();
+    if (overlay) {
+      overlay.hidden = true;
+      overlay.setAttribute("hidden", "");
+    }
+    document.body.classList.remove("is-booting");
+    untrack();
   }
 
-  function showIn(host, title, text) {
-    startBusy(title, text);
+  function hideAll() {
+    bootDepth = 0;
+    trackDepth = 0;
+    panelDepth = 0;
+    workAbort = null;
+    var overlay = document.getElementById("boot-overlay");
+    if (overlay) {
+      overlay.hidden = true;
+      overlay.setAttribute("hidden", "");
+    }
+    document.body.classList.remove("is-booting", "is-working");
+    setHeaderLock(false);
+    setWorkCancelVisible(false);
+    setStatusActive(false);
+    Array.prototype.forEach.call(document.querySelectorAll(".is-loading-host"), function (host) {
+      host.classList.remove("is-loading-host");
+      var layer = childByClass(host, "panel-loading");
+      if (layer) layer.hidden = true;
+    });
+  }
+
+  function showIn(host, title, text, opts) {
+    opts = opts || {};
     if (!host) return;
+    if (bootDepth > 0) {
+      updateBootText(title, text);
+      setStatus(title, text);
+      return;
+    }
+    panelDepth++;
+    if (opts.track !== false && bootDepth === 0 && trackDepth === 0) {
+      track(title, text);
+    } else {
+      setStatus(title, text);
+    }
     host.classList.add("is-loading-host");
     var layer = childByClass(host, "panel-loading");
     if (!layer) {
@@ -180,27 +324,35 @@
       layer.className = "panel-loading";
       host.appendChild(layer);
     }
+    var compact = host.classList.contains("explorer-body") ? " is-dark" : "";
+    layer.className = "panel-loading" + compact;
     layer.innerHTML =
-      '<div class="boot-spinner dark"></div>' +
-      "<h3>" + escapeHtml(title || "Memuat") + "</h3>" +
-      "<p>" + escapeHtml(text || "") + "</p>";
+      '<div class="panel-loading-inner">' +
+        '<div class="boot-spinner dark"></div>' +
+        "<h3>" + escapeHtml(title || "Memuat") + "</h3>" +
+        "<p>" + escapeHtml(text || "") + "</p>" +
+      "</div>";
     layer.hidden = false;
   }
 
   function hideIn(host) {
+    if (bootDepth > 0) return;
     if (host) {
       host.classList.remove("is-loading-host");
       var layer = childByClass(host, "panel-loading");
       if (layer) layer.hidden = true;
     }
-    var overlay = document.getElementById("boot-overlay");
-    if (overlay && !overlay.hidden) return;
-    endBusy();
+    panelDepth = Math.max(0, panelDepth - 1);
+    if (bootDepth > 0) return;
+    if (panelDepth > 0) return;
+    untrack();
   }
 
   function childByClass(host, className) {
     for (var i = 0; i < host.children.length; i++) {
-      if (host.children[i].className === className) return host.children[i];
+      if (host.children[i].classList && host.children[i].classList.contains(className)) {
+        return host.children[i];
+      }
     }
     return null;
   }
@@ -251,7 +403,30 @@
 
     function sync() {
       toggle.textContent = selectedLabel();
+      toggle.title = selectedLabel();
       toggle.classList.toggle("is-empty", !select.value);
+    }
+
+    function placeDrop() {
+      var rect = toggle.getBoundingClientRect();
+      var width = Math.max(rect.width, 220);
+      var left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
+      var below = window.innerHeight - rect.bottom - 12;
+      var above = rect.top - 12;
+      drop.style.position = "fixed";
+      drop.style.left = left + "px";
+      drop.style.width = width + "px";
+      drop.style.right = "auto";
+      drop.style.zIndex = "80";
+      if (below < 160 && above > below) {
+        drop.style.top = "auto";
+        drop.style.bottom = (window.innerHeight - rect.top + 4) + "px";
+        drop.style.maxHeight = Math.max(120, Math.min(280, above)) + "px";
+      } else {
+        drop.style.bottom = "auto";
+        drop.style.top = (rect.bottom + 4) + "px";
+        drop.style.maxHeight = Math.max(120, Math.min(280, below)) + "px";
+      }
     }
 
     function close() {
@@ -264,6 +439,7 @@
       wrap.classList.add("is-open");
       search.value = "";
       render("");
+      placeDrop();
       search.focus();
     }
 
@@ -364,8 +540,14 @@
       }
     });
     document.addEventListener("mousedown", function (event) {
-      if (!wrap.contains(event.target)) close();
+      if (!wrap.contains(event.target) && !drop.contains(event.target)) close();
     });
+    window.addEventListener("resize", function () {
+      if (!drop.hidden) placeDrop();
+    });
+    window.addEventListener("scroll", function () {
+      if (!drop.hidden) placeDrop();
+    }, true);
 
     var api = {
       sync: sync,
@@ -398,13 +580,16 @@
   };
   global.SqlLoading = {
     show: showBoot,
-    hide: hideBoot,
+    hide: hideAll,
     showIn: showIn,
-    hideIn: hideIn
+    hideIn: hideIn,
+    status: setStatus,
+    track: track,
+    untrack: untrack
   };
   global.SqlBusy = {
-    start: startBusy,
-    end: endBusy,
+    start: track,
+    end: untrack,
     mark: markBusy
   };
   global.SqlSelect = {
@@ -414,12 +599,20 @@
   function requestJson(url, options) {
     options = options || {};
     var retried = !!options._retried;
+    var background = !!options.background;
     var init = {};
     Object.keys(options).forEach(function (key) {
-      if (key !== "_retried") init[key] = options[key];
+      if (key !== "_retried" && key !== "background") init[key] = options[key];
     });
     init.credentials = init.credentials || "same-origin";
     init.headers = init.headers || {};
+    var method = (init.method || "GET").toUpperCase();
+    if (csrfToken && method !== "GET" && method !== "HEAD") {
+      init.headers["X-SQLSM-Token"] = csrfToken;
+    }
+    if (!init.signal && !background && url.indexOf("/api/cancel") === -1 && workAbort) {
+      init.signal = workAbort.signal;
+    }
     return fetch(url, init).then(function (res) {
       return res.text().then(function (text) {
         var data = {};
@@ -444,10 +637,25 @@
         }
         return data;
       });
+    }).catch(function (err) {
+      if (err && (err.name === "AbortError" || /abort/i.test(String(err)))) {
+        return { ok: false, error: "Perintah dibatalkan.", cancelled: true };
+      }
+      throw err;
     });
   }
 
-  global.SqlApi = {
-    request: requestJson
+  global.SqlWork = {
+    cancel: cancelWork,
+    signal: workSignal
   };
+  global.SqlApi = {
+    request: requestJson,
+    setCsrf: setCsrfToken
+  };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bindCancelButtons);
+  } else {
+    bindCancelButtons();
+  }
 })(window);

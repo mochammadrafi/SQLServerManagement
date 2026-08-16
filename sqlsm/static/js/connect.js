@@ -94,6 +94,7 @@
   window.SqlLoading.show("Memeriksa lingkungan", "Memeriksa driver ODBC, platform, dan kesiapan aplikasi.");
   window.SqlApi.request("/api/meta")
     .then(function (data) {
+      if (data.csrf_token && window.SqlApi.setCsrf) window.SqlApi.setCsrf(data.csrf_token);
       if (!data.windows) {
         document.getElementById("auth-windows").disabled = true;
         document.getElementById("auth-sql").checked = true;
@@ -109,7 +110,7 @@
       window.SqlLoading.hide();
     })
     .catch(function () {
-      driverNote.textContent = "";
+      showError("Tidak bisa memuat meta aplikasi.", "Pastikan Flask jalan, lalu refresh halaman.");
       window.SqlLoading.hide();
     });
 

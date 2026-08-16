@@ -61,6 +61,13 @@
     return Number(selected || 0);
   }
 
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
   function openDialog(ctx) {
     $("export-target").textContent = ctx.database + "." + ctx.schema + "." + ctx.table;
     var estimate = ctx.rowCount;
@@ -79,8 +86,8 @@
       var label = document.createElement("label");
       label.className = "choice tight";
       label.innerHTML = '<input type="checkbox" checked data-col="' +
-        String(col.name).replace(/"/g, "&quot;") + '"> <span>' +
-        String(col.name) + (col.data_type ? " <em>(" + col.data_type + ")</em>" : "") + "</span>";
+        escapeHtml(col.name) + '"> <span>' +
+        escapeHtml(col.name) + (col.data_type ? " <em>(" + escapeHtml(col.data_type) + ")</em>" : "") + "</span>";
       box.appendChild(label);
     });
     $("export-where").value = "";
@@ -203,7 +210,8 @@
     window.SqlLoading.showIn(
       $("db-export-modal").querySelector(".modal-card"),
       "Menyiapkan export database",
-      "Setiap tabel ditulis ke folder yang dipilih."
+      "Setiap tabel ditulis ke folder yang dipilih.",
+      { track: false }
     );
     api("/api/export/database", {
       method: "POST",
@@ -275,7 +283,8 @@
     window.SqlLoading.showIn(
       $("export-modal").querySelector(".modal-card"),
       "Menyiapkan export",
-      "Menulis ke folder yang dipilih, dipecah bertahap."
+      "Menulis ke folder yang dipilih, dipecah bertahap.",
+      { track: false }
     );
     api("/api/export", {
       method: "POST",
@@ -332,7 +341,8 @@
     window.SqlLoading.showIn(
       $("backup-modal").querySelector(".modal-card"),
       "Menyiapkan backup",
-      "SQL Server akan menulis file .bak ke folder yang dipilih."
+      "SQL Server akan menulis file .bak ke folder yang dipilih.",
+      { track: false }
     );
     api("/api/backup", {
       method: "POST",
@@ -379,7 +389,7 @@
 
   function loadFolder(path) {
     var card = $("folder-modal").querySelector(".modal-card");
-    window.SqlLoading.showIn(card, "Membaca folder", path || "Folder awal");
+    window.SqlLoading.showIn(card, "Membaca folder", path || "Folder awal", { track: false });
     api("/api/fs?path=" + encodeURIComponent(path || "")).then(function (data) {
       window.SqlLoading.hideIn(card);
       if (!data.ok) {
@@ -409,7 +419,7 @@
   }
 
   function refreshJobs() {
-    api("/api/exports").then(function (data) {
+    api("/api/exports", { background: true }).then(function (data) {
       if (!data.ok) return;
       renderJobs(data.jobs || []);
       updateBadge(data.jobs || []);
@@ -466,7 +476,7 @@
           (job.row_count_estimate != null ? " / " + formatCount(job.row_count_estimate) : "") + " baris" : "") +
         pct + " · " + formatBytes(job.bytes_written) + "</p>" +
         (job.folder ? '<p class="job-meta">' + job.folder + "</p>" : "") +
-        (job.error ? '<p class="form-error">' + job.error + (job.hint ? " — " + job.hint : "") + "</p>" : "") +
+        (job.error ? '<p class="form-error">' + escapeHtml(job.error) + (job.hint ? " — " + escapeHtml(job.hint) : "") + "</p>" : "") +
         '<div class="job-files">' + (parts || "<span class='job-meta'>Belum ada file siap.</span>") + "</div>" +
         (job.status === "running" || job.status === "queued" || job.status === "cancelling"
           ? '<button type="button" class="btn-secondary" data-cancel="' + job.id + '">Batalkan</button>'
@@ -479,7 +489,7 @@
     currentJobId = jobId;
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(function () {
-      api("/api/export/" + jobId).then(function (data) {
+      api("/api/export/" + jobId, { background: true }).then(function (data) {
         if (!data.ok) return;
         refreshJobs();
         if (data.job.status === "done" || data.job.status === "error" || data.job.status === "cancelled") {
@@ -555,7 +565,6 @@
     syncChunkMode();
     syncDbChunkMode();
     loadDefaultFolder();
-    refreshJobs();
   }
 
   global.SqlExport = {
@@ -564,6 +573,7 @@
     openBackup: openBackup,
     openJobs: openJobs,
     bind: bind,
+    refreshJobs: refreshJobs,
     formatCount: formatCount
   };
 })(window);

@@ -12,10 +12,11 @@ It is a local Flask app (Python 3.8) that opens in the browser. Use it when full
 - Fast row counts from partition stats (not `COUNT(*)`)
 - Keyset paging (PK / clustered / identity), virtualized result grid
 - Async CSV/gzip export in chunks, with progress, cancel, and per-part download
+- Database backup to `.bak` (async job; restore wizard not included yet)
 - Run SQL (F5 / Ctrl+Enter), including `GO` batches
 - Show server version, edition, collation, and active sessions
 
-The process listens on `127.0.0.1:5050` by default. Passwords stay in memory and are not written to disk.
+The process listens on `127.0.0.1:5050` by default. Passwords stay in memory unless you enable **Remember password** on connect (stored encrypted in `~/.sqlsm/connections.json` using the local app secret).
 
 ## Why this stack
 
@@ -99,7 +100,7 @@ Excel cannot open 100 million rows (limit 1,048,576). Use CSV/gzip. A full expor
 
 `DELETE` / `UPDATE` / `DROP` run as written. There is no undo.
 
-Export files are written under `.local/exports/` (or `SQLSM_EXPORT_DIR`). Keep disk free. Export uses a separate SQL connection and `NOLOCK` by default so the browse UI stays usable.
+Export files are written under the default data folder above (or `SQLSM_EXPORT_DIR`). Keep disk free. Export uses a separate SQL connection and `NOLOCK` by default so the browse UI stays usable.
 
 ## Environment
 
@@ -107,8 +108,10 @@ Export files are written under `.local/exports/` (or `SQLSM_EXPORT_DIR`). Keep d
 |---|---|---|
 | `SQLSM_HOST` | `127.0.0.1` | Bind address. Keep loopback on a server |
 | `SQLSM_PORT` | `5050` | HTTP port |
-| `SQLSM_SECRET` | random | Flask session key |
-| `SQLSM_EXPORT_DIR` | `.local/exports` | Folder for CSV/gzip parts |
+| `SQLSM_SECRET` | random file in `~/.sqlsm/secret` | Flask session key and password encryption |
+| `SQLSM_IDLE_SEC` | `7200` | Close idle SQL connections after N seconds |
+| `SQLSM_ALLOW_REMOTE` | unset | Set to `1` to allow non-loopback bind without startup warning |
+| `SQLSM_EXPORT_DIR` | `~/sqlsm-data` (macOS) / `C:\SQLSM-Data` (Windows) | Folder for CSV/gzip parts and backup files |
 
 ## Layout
 
@@ -128,6 +131,6 @@ sqlsm/static/          CSS / JS
 - Browse and ad-hoc query never materialize the full 100 million rows
 - Ad-hoc SELECT is capped at 1000 rows; use table pager + export for full data
 - Deep `OFFSET` on a heap (no PK/identity) is rejected past 100,000 rows
-- One export job at a time per session
-- No backup/restore wizard, job agent, or security editor yet
+- One export or backup job at a time per session
+- Restore from `.bak` wizard not included yet; no job agent or security editor
 - Do not expose the HTTP port to the network

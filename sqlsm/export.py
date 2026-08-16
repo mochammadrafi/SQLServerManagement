@@ -53,6 +53,16 @@ class ExportJob(object):
 
     def public(self):
         # type: () -> Dict[str, Any]
+        parts = []
+        for part in self.parts:
+            parts.append(
+                {
+                    "name": part.get("name"),
+                    "rows": part.get("rows"),
+                    "bytes": part.get("bytes"),
+                }
+            )
+        folder = self.folder or ""
         return {
             "id": self.id,
             "status": self.status,
@@ -62,7 +72,7 @@ class ExportJob(object):
             "columns": self.columns,
             "where": self.where,
             "kind": getattr(self, "kind", "export"),
-            "folder": self.folder,
+            "folder": os.path.basename(folder.rstrip("\\/")) if folder else "",
             "chunk_rows": self.chunk_rows,
             "chunk_bytes": self.chunk_bytes,
             "gzip": self.use_gzip,
@@ -70,7 +80,7 @@ class ExportJob(object):
             "row_count_estimate": self.row_count_estimate,
             "rows_written": self.rows_written,
             "bytes_written": self.bytes_written,
-            "parts": list(self.parts),
+            "parts": parts,
             "error": self.error,
             "hint": self.hint,
             "started_at": self.started_at,
@@ -114,6 +124,12 @@ def cancel_job(sid, job_id):
     # type: (str, str) -> ExportJob
     job = get_job(sid, job_id)
     job.cancel_event.set()
+    client = getattr(job, "_client", None)
+    if client is not None:
+        try:
+            client.cancel_running()
+        except Exception:
+            pass
     if job.status in ("queued", "running"):
         job.status = "cancelling"
         job.save_meta()
@@ -132,12 +148,8 @@ def start_export(sid, cfg, database, schema, table, columns, where="", chunk_row
         chunk_bytes = 0
     if chunk_bytes and chunk_bytes < 64 * 1024 * 1024:
         raise ClientError("Ukuran pecahan terlalu kecil.", "Minimum 64 MB supaya tidak menghasilkan ribuan file.")
-    active = [job for job in _JOBS.values() if job.sid == sid and job.status in ("queued", "running", "cancelling")]
-    if active:
-        raise ClientError(
-            "Masih ada export yang berjalan.",
-            "Tunggu selesai atau batalkan dulu. Satu export penuh 100 juta baris sudah membebani server.",
-        )
+    with _LOCK:
+        _assert_no_active(sid)
     probe_cfg = ConnectionConfig(**cfg.__dict__)
     probe = connect_client(probe_cfg)
     try:
@@ -176,12 +188,27 @@ def start_export(sid, cfg, database, schema, table, columns, where="", chunk_row
     )
     job._order_keys = keys  # type: ignore
     with _LOCK:
+        _assert_no_active(sid)
         _JOBS[job.id] = job
     job.save_meta()
     thread = threading.Thread(target=_run_job, args=(job,), name="export-" + job.id)
     thread.daemon = True
     thread.start()
     return job
+
+
+def _purge_jobs():
+    with _LOCK:
+        finished = [
+            (job_id, job)
+            for job_id, job in _JOBS.items()
+            if job.status in ("done", "error", "cancelled")
+        ]
+        if len(finished) <= 80:
+            return
+        finished.sort(key=lambda item: item[1].finished_at or "")
+        for job_id, _job in finished[:-80]:
+            _JOBS.pop(job_id, None)
 
 
 def _assert_no_active(sid):
@@ -207,10 +234,11 @@ def start_export_database(sid, cfg, database, tables=None, include_views=False, 
         chunk_bytes = 0
     if chunk_bytes and chunk_bytes < 64 * 1024 * 1024:
         raise ClientError("Ukuran pecahan terlalu kecil.", "Minimum 64 MB supaya tidak menghasilkan ribuan file.")
-    _assert_no_active(sid)
+    with _LOCK:
+        _assert_no_active(sid)
     probe = connect_client(ConnectionConfig(**cfg.__dict__))
     try:
-        catalog = probe.list_objects(database)
+        catalog = probe.list_objects(database, include_counts=True)
         available = []
         for item in catalog.get("objects", {}).get("tables") or []:
             available.append(item)
@@ -272,6 +300,7 @@ def start_export_database(sid, cfg, database, tables=None, include_views=False, 
         for item in picked
     ]
     with _LOCK:
+        _assert_no_active(sid)
         _JOBS[job.id] = job
     job.save_meta()
     thread = threading.Thread(target=_run_db_export, args=(job,), name="export-db-" + job.id)
@@ -290,6 +319,7 @@ def _run_db_export(job):
     client = None
     try:
         client = connect_client(export_cfg)
+        job._client = client
         for item in getattr(job, "_tables", []) or []:
             if job.cancel_event.is_set():
                 break
@@ -319,14 +349,18 @@ def _run_db_export(job):
         job.finished_at = _now()
         job.save_meta()
     except ClientError as exc:
-        job.status = "error"
-        job.error = str(exc)
-        job.hint = exc.hint
+        if job.cancel_event.is_set() or "dibatalkan" in str(exc).lower():
+            job.status = "cancelled"
+            job.error = None
+        else:
+            job.status = "error"
+            job.error = str(exc)
+            job.hint = exc.hint
         job.finished_at = _now()
         job.save_meta()
     except Exception as exc:
-        job.status = "error"
-        job.error = str(exc)
+        job.status = "cancelled" if job.cancel_event.is_set() else "error"
+        job.error = None if job.cancel_event.is_set() else str(exc)
         job.finished_at = _now()
         job.save_meta()
     finally:
@@ -335,6 +369,7 @@ def _run_db_export(job):
                 client.close()
             except Exception:
                 pass
+        _purge_jobs()
 
 
 def _export_current(job, client):
@@ -342,48 +377,63 @@ def _export_current(job, client):
     handle = None
     part_index = 0
     part_rows = 0
+    part_name = ""
     wrote_rows = 0
     order_keys = getattr(job, "_order_keys", None) or None
-    for raw_rows in client.iter_table_rows(
-        job.database,
-        job.schema,
-        job.table,
-        job.columns,
-        where=job.where,
-        order_keys=order_keys,
-        nolock=job.nolock,
-        batch_size=2000,
-    ):
-        if job.cancel_event.is_set():
-            return
-        for raw in raw_rows:
-            if writer is None:
-                part_index += 1
-                writer, handle, part_name = _open_part(job, part_index)
-                writer.writerow(job.columns)
-                part_rows = 0
-            writer.writerow([csv_value(value) for value in raw])
-            part_rows += 1
-            wrote_rows += 1
-            job.rows_written += 1
-            rotate = False
-            if job.chunk_rows and part_rows >= job.chunk_rows:
-                rotate = True
-            elif job.chunk_bytes and part_rows % 2000 == 0:
-                handle.flush()
-                if os.path.isfile(job._part_file) and os.path.getsize(job._part_file) >= job.chunk_bytes:
+    try:
+        for raw_rows in client.iter_table_rows(
+            job.database,
+            job.schema,
+            job.table,
+            job.columns,
+            where=job.where,
+            order_keys=order_keys,
+            nolock=job.nolock,
+            batch_size=2000,
+        ):
+            if job.cancel_event.is_set():
+                break
+            for raw in raw_rows:
+                if job.cancel_event.is_set():
+                    break
+                if writer is None:
+                    part_index += 1
+                    writer, handle, part_name = _open_part(job, part_index)
+                    writer.writerow(job.columns)
+                    part_rows = 0
+                writer.writerow([csv_value(value) for value in raw])
+                part_rows += 1
+                wrote_rows += 1
+                job.rows_written += 1
+                rotate = False
+                if job.chunk_rows and part_rows >= job.chunk_rows:
                     rotate = True
-            if rotate:
+                elif job.chunk_bytes and part_rows % 500 == 0:
+                    handle.flush()
+                    if os.path.isfile(job._part_file) and os.path.getsize(job._part_file) >= job.chunk_bytes:
+                        rotate = True
+                if rotate:
+                    _close_part(job, handle, part_name, part_rows)
+                    writer = None
+                    handle = None
+                    part_name = ""
+                    job.save_meta()
+        if writer is not None and not job.cancel_event.is_set():
+            _close_part(job, handle, part_name, part_rows)
+            writer = None
+            handle = None
+        if wrote_rows == 0 and not job.cancel_event.is_set():
+            writer, handle, part_name = _open_part(job, 1)
+            writer.writerow(job.columns)
+            _close_part(job, handle, part_name, 0)
+            writer = None
+            handle = None
+    finally:
+        if writer is not None and handle is not None:
+            if job.cancel_event.is_set():
+                _discard_open_part(handle, job._part_file)
+            else:
                 _close_part(job, handle, part_name, part_rows)
-                writer = None
-                handle = None
-                job.save_meta()
-    if writer is not None:
-        _close_part(job, handle, part_name, part_rows)
-    if wrote_rows == 0 and not job.cancel_event.is_set():
-        writer, handle, part_name = _open_part(job, 1)
-        writer.writerow(job.columns)
-        _close_part(job, handle, part_name, 0)
 
 
 def _run_job(job):
@@ -396,6 +446,7 @@ def _run_job(job):
     client = None
     try:
         client = connect_client(export_cfg)
+        job._client = client
         _export_current(job, client)
         if job.cancel_event.is_set():
             job.status = "cancelled"
@@ -404,14 +455,18 @@ def _run_job(job):
         job.finished_at = _now()
         job.save_meta()
     except ClientError as exc:
-        job.status = "error"
-        job.error = str(exc)
-        job.hint = exc.hint
+        if job.cancel_event.is_set() or "dibatalkan" in str(exc).lower():
+            job.status = "cancelled"
+            job.error = None
+        else:
+            job.status = "error"
+            job.error = str(exc)
+            job.hint = exc.hint
         job.finished_at = _now()
         job.save_meta()
     except Exception as exc:
-        job.status = "error"
-        job.error = str(exc)
+        job.status = "cancelled" if job.cancel_event.is_set() else "error"
+        job.error = None if job.cancel_event.is_set() else str(exc)
         job.finished_at = _now()
         job.save_meta()
     finally:
@@ -420,6 +475,7 @@ def _run_job(job):
                 client.close()
             except Exception:
                 pass
+        _purge_jobs()
 
 
 class _HandleStack(object):
@@ -466,12 +522,30 @@ def _close_part(job, handle, name, rows):
     job.parts.append({"name": name, "rows": rows, "bytes": size, "path": path})
 
 
+def _discard_open_part(handle, path):
+    # type: (Any, str) -> None
+    if handle is not None:
+        try:
+            handle.flush()
+            handle.close()
+        except Exception:
+            pass
+    if not path:
+        return
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 def start_backup(sid, cfg, database, folder="", chunk_bytes=0, compress=True):
     database = (database or "").strip()
     if not database:
         raise ClientError("Pilih database untuk backup.")
     dest = ensure_writable_dir(folder or EXPORT_ROOT)
-    _assert_no_active(sid)
+    with _LOCK:
+        _assert_no_active(sid)
     probe = connect_client(ConnectionConfig(**cfg.__dict__))
     size_bytes = 0
     try:
@@ -521,6 +595,7 @@ def start_backup(sid, cfg, database, folder="", chunk_bytes=0, compress=True):
     job._backup_files = files  # type: ignore
     job._backup_compress = bool(compress)  # type: ignore
     with _LOCK:
+        _assert_no_active(sid)
         _JOBS[job.id] = job
     job.save_meta()
     thread = threading.Thread(target=_run_backup, args=(job,), name="backup-" + job.id)
@@ -544,6 +619,7 @@ def _run_backup(job):
     client = None
     try:
         client = connect_client(cfg)
+        job._client = client
         client.execute(sql, max_rows=1, database="master")
         if job.cancel_event.is_set():
             job.status = "cancelled"
@@ -557,6 +633,12 @@ def _run_backup(job):
         job.finished_at = _now()
         job.save_meta()
     except ClientError as exc:
+        if job.cancel_event.is_set() or "dibatalkan" in str(exc).lower():
+            job.status = "cancelled"
+            job.error = None
+            job.finished_at = _now()
+            job.save_meta()
+            return
         if "COMPRESSION" in str(exc).upper() or "compress" in str(exc).lower():
             try:
                 sql = "BACKUP DATABASE %s TO %s WITH INIT, STATS = 10" % (qident(job.database), disks)
@@ -582,8 +664,12 @@ def _run_backup(job):
         job.finished_at = _now()
         job.save_meta()
     except Exception as exc:
-        job.status = "error"
-        job.error = str(exc)
+        if job.cancel_event.is_set() or "dibatalkan" in str(exc).lower():
+            job.status = "cancelled"
+            job.error = None
+        else:
+            job.status = "error"
+            job.error = str(exc)
         job.finished_at = _now()
         job.save_meta()
     finally:
@@ -592,3 +678,4 @@ def _run_backup(job):
                 client.close()
             except Exception:
                 pass
+        _purge_jobs()

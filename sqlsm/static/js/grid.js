@@ -13,6 +13,30 @@
     return String(value);
   }
 
+  function loadWidths(key, columns) {
+    if (!key) return columns.map(function () { return DEFAULT_COL; });
+    try {
+      var raw = sessionStorage.getItem("sqlsm:grid:" + key);
+      if (!raw) return columns.map(function () { return DEFAULT_COL; });
+      var saved = JSON.parse(raw);
+      if (!Array.isArray(saved) || saved.length !== columns.length) {
+        return columns.map(function () { return DEFAULT_COL; });
+      }
+      return saved.map(function (width) {
+        return Math.max(MIN_COL, Number(width) || DEFAULT_COL);
+      });
+    } catch (err) {
+      return columns.map(function () { return DEFAULT_COL; });
+    }
+  }
+
+  function saveWidths(key, widths) {
+    if (!key) return;
+    try {
+      sessionStorage.setItem("sqlsm:grid:" + key, JSON.stringify(widths));
+    } catch (err) {}
+  }
+
   function openDetail(title, value) {
     var modal = document.getElementById("detail-modal");
     var heading = document.getElementById("detail-title");
@@ -21,6 +45,7 @@
     heading.textContent = title || "Detail";
     body.textContent = isNull(value) ? "NULL" : String(value);
     modal.hidden = false;
+    modal.setAttribute("aria-hidden", "false");
   }
 
   function renderGrid(host, columns, rows, opts) {
@@ -31,7 +56,7 @@
       return;
     }
 
-    var widths = columns.map(function () { return DEFAULT_COL; });
+    var widths = loadWidths(opts.widthKey, columns);
     var root = document.createElement("div");
     root.className = "virt";
 
@@ -50,7 +75,7 @@
       grip.className = "col-resizer";
       cell.appendChild(label);
       cell.appendChild(grip);
-      bindResize(grip, index, widths, root);
+      bindResize(grip, index, widths, root, opts.widthKey);
       headInner.appendChild(cell);
     });
     head.appendChild(headInner);
@@ -90,6 +115,13 @@
 
     body.addEventListener("scroll", paint);
     paint();
+
+    if (typeof ResizeObserver !== "undefined") {
+      var ro = new ResizeObserver(function () { paint(); });
+      ro.observe(body);
+    } else {
+      window.addEventListener("resize", paint);
+    }
   }
 
   function rowEl(columns, row, rowIndex, widths, opts) {
@@ -107,9 +139,16 @@
       cell.style.width = widths[colIndex] + "px";
       cell.style.minWidth = widths[colIndex] + "px";
       cell.textContent = text(value);
-      cell.title = "Double-click untuk detail";
+      cell.title = "Double-click atau Enter untuk detail";
+      cell.tabIndex = colIndex === 0 ? 0 : -1;
       cell.addEventListener("dblclick", function () {
         openDetail(name, value);
+      });
+      cell.addEventListener("keydown", function (event) {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          openDetail(name, value);
+        }
       });
       el.appendChild(cell);
     });
@@ -125,7 +164,7 @@
     return el;
   }
 
-  function bindResize(grip, index, widths, root) {
+  function bindResize(grip, index, widths, root, widthKey) {
     grip.addEventListener("mousedown", function (event) {
       event.preventDefault();
       event.stopPropagation();
@@ -140,6 +179,7 @@
         });
       }
       function up() {
+        saveWidths(widthKey, widths);
         document.removeEventListener("mousemove", move);
         document.removeEventListener("mouseup", up);
       }

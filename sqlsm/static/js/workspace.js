@@ -30,6 +30,7 @@
   var btnExportDb = document.getElementById("btn-export-db");
   var btnBackupHere = document.getElementById("btn-backup-here");
   var btnOpenSql = document.getElementById("btn-open-sql");
+  var btnScript = document.getElementById("btn-script");
 
   function api(url, options) {
     return window.SqlApi.request(url, options);
@@ -44,10 +45,33 @@
     return state.mode === "sql" ? resultBody : browseBody;
   }
 
-  function showError(err, hint) {
+  var switchSeq = 0;
+
+  function showError(err, hint, opts) {
+    opts = opts || {};
+    var cancelled = !!opts.cancelled || /dibatalkan/i.test(String(err || ""));
     var pane = activePane();
     window.SqlLoading.hideIn(pane);
     window.SqlLoading.hide();
+    clearBusyMarks();
+    if (cancelled) {
+      if (state.mode === "browse" && state.table && state.table.page) {
+        renderTableViewer();
+        setStatus("Dibatalkan", "");
+        return;
+      }
+      if (state.mode === "sql") {
+        resultBody.className = "result-body";
+        resultTabs.innerHTML = "";
+      } else {
+        browseBody.className = "browse-body";
+      }
+      pane.innerHTML =
+        '<div class="empty-state"><h3>Dibatalkan</h3>' +
+        "<p>Perintah dihentikan. Jalankan lagi jika masih diperlukan.</p></div>";
+      setStatus("Dibatalkan", "");
+      return;
+    }
     if (state.mode === "sql") {
       resultBody.className = "result-body";
       resultTabs.innerHTML = "";
@@ -120,6 +144,7 @@
     btnExport.hidden = !hasTable;
     btnExport.disabled = !hasTable;
     btnOpenSql.hidden = !hasTable;
+    if (btnScript) btnScript.hidden = !hasTable;
     btnExportDb.hidden = view !== "database";
     btnBackupHere.hidden = !hasDb;
   }
@@ -160,7 +185,12 @@
   }
 
   function openTableExport(database, schema, table, rowCount) {
-    window.SqlLoading.showIn(browseBody, "Menyiapkan export", schema + "." + table);
+    window.SqlLoading.showIn(
+      browseBody,
+      "Menyiapkan export",
+      schema + "." + table,
+      { track: false }
+    );
     api("/api/columns?database=" + encodeURIComponent(database) +
       "&schema=" + encodeURIComponent(schema) +
       "&table=" + encodeURIComponent(table)).then(function (data) {
@@ -190,12 +220,13 @@
   function loadSession() {
     window.SqlLoading.show("Memeriksa sesi", "Memeriksa koneksi SQL Server dan sesi yang sedang aktif.");
     return api("/api/session").then(function (data) {
+      if (data.csrf_token && window.SqlApi.setCsrf) window.SqlApi.setCsrf(data.csrf_token);
       if (!data.connected) {
         window.location.href = "/";
         return;
       }
       applySession(data);
-      window.SqlLoading.show("Memuat database", "Mengambil daftar database dari SQL Server.");
+      window.SqlLoading.status("Memuat database", "Mengambil daftar database dari SQL Server.");
       return loadDatabases();
     });
   }
@@ -235,11 +266,17 @@
   }
 
   function loadDatabases() {
-    window.SqlLoading.showIn(explorerBody, "Memuat database", "Mengambil daftar database dari SQL Server.");
+    window.SqlLoading.showIn(
+      explorerBody,
+      "Memuat database",
+      "Mengambil daftar database dari SQL Server.",
+      { track: false }
+    );
     return api("/api/databases").then(function (data) {
       window.SqlLoading.hideIn(explorerBody);
       if (!data.ok) {
         window.SqlLoading.hide();
+        setStatus("Gagal memuat database", data.error || "");
         explorerBody.innerHTML = '<p class="empty-inline">' + escapeHtml(data.error) + "</p>";
         return;
       }
@@ -426,22 +463,43 @@
     return api("/api/objects?database=" + encodeURIComponent(name)).then(function (data) {
       window.SqlLoading.hideIn(explorerBody);
       if (!data.ok) {
-        explorerBody.innerHTML = '<p class="empty-inline">' +
-          escapeHtml(data.error || "Gagal memuat objek") +
-          (data.hint ? " — " + escapeHtml(data.hint) : "") + "</p>";
         throw new Error(data.error || "Gagal memuat objek");
       }
       state.catalog[name] = {
         schemas: data.schemas || [],
-        objects: data.objects || {}
+        objects: data.objects || {},
+        _counts: false
       };
+      return state.catalog[name];
+    }).catch(function (err) {
+      window.SqlLoading.hideIn(explorerBody);
+      setStatus("Gagal memuat objek", String(err && err.message ? err.message : err));
+      throw err;
+    });
+  }
+
+  function loadCatalogCounts(name) {
+    var catalog = state.catalog[name];
+    if (!catalog || catalog._counts) return Promise.resolve(catalog);
+    return api("/api/objects?database=" + encodeURIComponent(name) + "&counts=1").then(function (data) {
+      if (!data.ok || !state.catalog[name]) return catalog;
+      ["tables", "views"].forEach(function (key) {
+        var map = {};
+        (data.objects[key] || []).forEach(function (item) {
+          map[item.schema + "\0" + item.name] = item.row_count;
+        });
+        (state.catalog[name].objects[key] || []).forEach(function (item) {
+          var count = map[item.schema + "\0" + item.name];
+          if (count != null) item.row_count = count;
+        });
+      });
+      state.catalog[name]._counts = true;
       return state.catalog[name];
     });
   }
 
   function loadServerOverview() {
-    window.SqlLoading.show("Memuat informasi server", "Mengambil versi, edisi, collation, dan sesi aktif.");
-    setStatus("Memuat informasi server...", "");
+    window.SqlLoading.status("Memuat informasi server", "Mengambil versi, edisi, collation, dan sesi aktif.");
     return api("/api/server").then(function (data) {
       if (!data.ok) {
         showError(data.error, data.hint);
@@ -449,8 +507,11 @@
       }
       state.server = data;
       showHome();
-      setStatus("Siap", data.driver_name || "");
       window.SqlLoading.hide();
+      setStatus("Siap", data.driver_name || "");
+      if (window.SqlExport && window.SqlExport.refreshJobs) {
+        window.SqlExport.refreshJobs();
+      }
     });
   }
 
@@ -556,6 +617,8 @@
     state.selectedRow = null;
     syncBrowseActions();
     selectDatabase(name, true).then(function () {
+      return loadCatalogCounts(name);
+    }).then(function () {
       if (state.catalog[name]) renderDatabasePage(name);
     }).catch(function (err) {
       showError(String(err && err.message ? err.message : err));
@@ -695,7 +758,7 @@
           row.textContent = entry.item.schema + "." + entry.item.name +
             (entry.kind === "functions" ? " · fungsi" : " · prosedur");
           row.addEventListener("click", function () {
-            openProcInSql(name, entry.item.schema, entry.item.name);
+            openProcInSql(name, entry.item.schema, entry.item.name, entry.kind);
           });
           list.appendChild(row);
         });
@@ -712,9 +775,13 @@
     }
   }
 
-  function openProcInSql(database, schema, name) {
+  function openProcInSql(database, schema, name, kind) {
     selectDatabase(database, false);
-    editor.value = "EXEC " + bracket(schema) + "." + bracket(name) + ";";
+    if (kind === "functions") {
+      editor.value = "SELECT * FROM " + bracket(schema) + "." + bracket(name) + "();";
+    } else {
+      editor.value = "EXEC " + bracket(schema) + "." + bracket(name) + ";";
+    }
     setMode("sql");
     editor.focus();
     setStatus("Skrip prosedur disiapkan", schema + "." + name);
@@ -772,6 +839,7 @@
       state.table.paging = stats.paging;
       editor.value = "SELECT TOP 200 *\nFROM " + bracket(schema) + "." + bracket(table) +
         (state.table.keys.length ? "\nORDER BY " + state.table.keys.map(bracket).join(", ") : "") + ";";
+      window.SqlLoading.hideIn(browseBody);
       return loadTablePage();
     }).catch(function (err) {
       window.SqlLoading.hideIn(browseBody);
@@ -799,7 +867,10 @@
     window.SqlLoading.showIn(browseBody, "Memuat halaman", "Mengambil satu halaman dari " + t.schema + "." + t.name + ".");
     return api(tablePageUrl(after, t.seek, t.offset)).then(function (page) {
       window.SqlLoading.hideIn(browseBody);
-      if (!page.ok) return showError(page.error, page.hint);
+      if (!page.ok) {
+        if (page.cancelled) return showError(page.error, page.hint, { cancelled: true });
+        return showError(page.error, page.hint);
+      }
       t.page = page;
       t.lastKey = page.last_key;
       t.paging = page.paging;
@@ -864,6 +935,7 @@
     renderRowViewer(page);
 
     var gridOpts = {
+      widthKey: t.database + "." + t.schema + "." + t.name,
       truncated: page.has_more,
       truncatedText: "Satu halaman saja. Berikutnya atau Export untuk data lain.",
       selectedRow: state.selectedRow,
@@ -883,7 +955,14 @@
       loadTablePage();
     });
     document.getElementById("page-prev").addEventListener("click", function () {
-      if (!t.afterStack.length && !t.seek) return;
+      if (t.seek) {
+        t.seek = null;
+        t.afterStack = [];
+        t.offset = 0;
+        loadTablePage();
+        return;
+      }
+      if (!t.afterStack.length && !t.offset) return;
       if (t.paging === "offset") {
         t.offset = Math.max(0, t.offset - t.pageSize);
       } else {
@@ -989,6 +1068,10 @@
       return;
     }
     var unbounded = /select\s+\*\s+from/i.test(sql) && !/\btop\s+\d+/i.test(sql) && !/\boffset\s+\d+/i.test(sql);
+    var dml = /\b(insert|update|delete|merge|drop|alter|truncate|backup|restore|exec|execute)\b/i.test(sql);
+    if (dml && !window.confirm("Perintah ini mengubah data atau objek di SQL Server. Tidak ada undo. Lanjut?")) {
+      return;
+    }
     if (unbounded && !window.confirm("Query ini tanpa TOP/OFFSET. Aplikasi hanya menampilkan 1000 baris pertama. Untuk 100 juta baris, pakai pager tabel atau Export. Lanjut?")) {
       return;
     }
@@ -1004,10 +1087,13 @@
         max_rows: 1000
       })
     }).then(function (data) {
-      if (!data.ok) return showError(data.error, data.hint);
+      if (!data.ok) {
+        if (data.cancelled) return showError(data.error, data.hint, { cancelled: true });
+        return showError(data.error, data.hint);
+      }
       renderQueryResult(data);
     }).catch(function (err) {
-      showError(String(err));
+      showError(String(err && err.message ? err.message : err));
     });
   }
 
@@ -1113,6 +1199,21 @@
     editor.focus();
     setStatus("Query baru", currentDb());
   });
+  if (btnScript) {
+    btnScript.addEventListener("click", function () {
+      var t = state.table;
+      if (!t) return;
+      api("/api/script/select?database=" + encodeURIComponent(t.database) +
+        "&schema=" + encodeURIComponent(t.schema) +
+        "&table=" + encodeURIComponent(t.name)).then(function (data) {
+        if (!data.ok) return showError(data.error, data.hint);
+        editor.value = data.sql || "";
+        setMode("sql");
+        editor.focus();
+        setStatus("Script SELECT", t.schema + "." + t.name);
+      });
+    });
+  }
   document.getElementById("btn-open-sql").addEventListener("click", function () {
     if (!state.table) return;
     setMode("sql");
@@ -1208,12 +1309,14 @@
     connSelect.addEventListener("change", function () {
       var id = connSelect.value;
       if (!id || (state.connection && id === state.connection.id)) return;
+      var seq = ++switchSeq;
       window.SqlLoading.show("Mengganti koneksi", "Memuat database dari koneksi yang dipilih.");
       api("/api/connections/switch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: id })
       }).then(function (data) {
+        if (seq !== switchSeq) return;
         if (!data.ok) {
           window.SqlLoading.hide();
           showError(data.error, data.hint);
@@ -1223,8 +1326,9 @@
         applySession(data);
         return loadDatabases();
       }).catch(function (err) {
+        if (seq !== switchSeq) return;
         window.SqlLoading.hide();
-        showError(String(err));
+        showError(String(err && err.message ? err.message : err));
       });
     });
   }
@@ -1243,12 +1347,20 @@
       resetWorkspace();
       applySession(data);
       return loadDatabases();
+    }).catch(function (err) {
+      window.SqlLoading.hide();
+      showError(String(err && err.message ? err.message : err));
     });
   });
   dbSelect.addEventListener("change", function () {
-    selectDatabase(dbSelect.value, true);
+    if (state.mode === "browse") selectDatabase(dbSelect.value, true);
+    else state.selectedDb = dbSelect.value;
   });
   document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") {
+      if (!detailModal.hidden) detailModal.hidden = true;
+      if (!helpModal.hidden) helpModal.hidden = true;
+    }
     if (state.mode !== "sql") return;
     if (event.key === "F5" || ((event.ctrlKey || event.metaKey) && event.key === "Enter")) {
       event.preventDefault();
