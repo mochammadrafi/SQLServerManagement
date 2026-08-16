@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SQL Server Management</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=3">
+</head>
+<body class="page-connect">
+  <div class="connect-shell">
+    <aside class="connect-aside">
+      <p class="brand-mark">SQL Server Management</p>
+      <h1>Kelola SQL Server di Windows Server 2012</h1>
+      <p class="lede">Alat awal untuk melihat database, tabel, dan menjalankan query tanpa SSMS yang berat.</p>
+      <ol class="steps">
+        <li><strong>Server</strong> — isi <code>localhost</code> jika SQL Server ada di mesin ini.</li>
+        <li><strong>Autentikasi</strong> — Windows Auth jika login Windows sudah punya akses; SQL Auth untuk user <code>sa</code> atau login SQL.</li>
+        <li><strong>Database</strong> — boleh <code>master</code> dulu, lalu pilih database lain setelah masuk.</li>
+      </ol>
+      <p class="aside-note">Jangan pakai Internet Explorer. Chrome 109 atau Firefox ESR cukup untuk Windows Server 2012.</p>
+    </aside>
+    <main class="connect-main">
+      <form id="connect-form" class="connect-card" autocomplete="off">
+        <h2>Hubungkan ke SQL Server</h2>
+        <p class="card-sub">Password tidak disimpan. Koneksi hanya di memori proses ini.</p>
+
+        <div class="field-row">
+          <label class="field">
+            <span>Server</span>
+            <input id="server" name="server" type="text" value="localhost" required>
+          </label>
+          <label class="field field-narrow">
+            <span>Port</span>
+            <input id="port" name="port" type="text" inputmode="numeric" value="1433" maxlength="5">
+          </label>
+        </div>
+
+        <label class="field">
+          <span>Instance (opsional)</span>
+          <input id="instance" name="instance" type="text" placeholder="SQLEXPRESS">
+        </label>
+
+        <fieldset class="field">
+          <legend>Autentikasi</legend>
+          <label class="choice">
+            <input type="radio" name="auth" value="windows" id="auth-windows">
+            <span>Windows Authentication</span>
+          </label>
+          <label class="choice">
+            <input type="radio" name="auth" value="sql" id="auth-sql" checked>
+            <span>SQL Server Authentication</span>
+          </label>
+        </fieldset>
+
+        <div id="sql-auth-fields">
+          <label class="field">
+            <span>Username</span>
+            <input id="username" name="username" type="text" value="sa">
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input id="password" name="password" type="password">
+          </label>
+        </div>
+
+        <label class="field">
+          <span>Database awal</span>
+          <select id="database">
+            <option value="master" selected>master</option>
+            <option value="msdb">msdb</option>
+            <option value="model">model</option>
+            <option value="tempdb">tempdb</option>
+          </select>
+        </label>
+
+        <label class="choice tight">
+          <input id="encrypt" name="encrypt" type="checkbox">
+          <span>Enkripsi TLS (biasanya mati untuk SQL Server 2012)</span>
+        </label>
+
+        <p id="form-error" class="form-error" hidden></p>
+        <p id="driver-note" class="driver-note"></p>
+
+        <button type="submit" class="btn-primary" id="connect-btn">Hubungkan</button>
+      </form>
+    </main>
+  </div>
+
+  <div id="boot-overlay" class="boot-overlay">
+    <div class="boot-panel">
+      <div class="boot-spinner"></div>
+      <p class="boot-kicker">SQL Server Management</p>
+      <h2 id="boot-title">Memeriksa lingkungan</h2>
+      <p id="boot-text">Memeriksa driver ODBC, platform, dan kesiapan aplikasi.</p>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/ui.js') }}?v=3"></script>
+  <script src="{{ url_for('static', filename='js/connect.js') }}?v=3"></script>
+</body>
+</html>

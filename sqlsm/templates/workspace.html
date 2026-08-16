@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SQL Server Management</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=3">
+</head>
+<body class="page-workspace">
+  <header class="app-header">
+    <div class="header-left">
+      <span class="brand-mark">SQL Server Management</span>
+      <span id="header-target" class="header-target"></span>
+    </div>
+    <div class="header-right">
+      <button type="button" class="btn-ghost" id="btn-jobs">Export <span id="export-badge" class="badge" hidden>0</span></button>
+      <button type="button" class="btn-ghost" id="btn-help">Bantuan</button>
+      <button type="button" class="btn-ghost" id="btn-disconnect">Putuskan</button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <aside class="explorer" id="explorer">
+      <div class="explorer-head">
+        <h2>Object Explorer</h2>
+        <button type="button" class="btn-tiny" id="btn-refresh">Muat ulang</button>
+      </div>
+      <div class="explorer-tools">
+        <input id="explorer-search" type="text" placeholder="Cari database / schema / tabel">
+        <label class="choice tight explorer-check">
+          <input id="explorer-system" type="checkbox">
+          <span>Tampilkan sistem</span>
+        </label>
+        <button type="button" class="btn-tiny" id="btn-load-all">Muat semua database</button>
+      </div>
+      <div id="explorer-body" class="explorer-body">
+        <p class="empty-inline">Memuat database...</p>
+      </div>
+    </aside>
+    <div class="splitter" id="splitter-x" data-split="x"></div>
+    <section class="work">
+      <div class="toolbar">
+        <label class="db-pick">
+          <span>Database</span>
+          <select id="db-select"></select>
+        </label>
+        <button type="button" class="btn-primary" id="btn-run">Jalankan</button>
+        <button type="button" class="btn-secondary" id="btn-new">Query baru</button>
+        <button type="button" class="btn-secondary" id="btn-export" disabled>Export tabel</button>
+        <button type="button" class="btn-secondary" id="btn-backup">Backup database</button>
+        <span class="hint-inline">F5 atau Ctrl+Enter. Tabel besar: pager + export, jangan SELECT *</span>
+      </div>
+      <div class="work-split">
+        <div class="editor-wrap">
+          <textarea id="sql-editor" spellcheck="false" placeholder="Tulis SQL di sini. Contoh: SELECT TOP 100 * FROM sys.databases;"></textarea>
+        </div>
+        <div class="splitter horizontal" id="splitter-y" data-split="y"></div>
+        <div class="results-wrap">
+          <div class="result-tabs" id="result-tabs"></div>
+          <div class="result-body" id="result-body">
+            <div class="empty-state">
+              <h3>Belum ada hasil</h3>
+              <p>Pilih tabel di kiri untuk melihat data, atau jalankan query SQL.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <footer class="status-bar">
+    <span id="status-text">Siap</span>
+    <span id="status-meta"></span>
+  </footer>
+
+  <div id="detail-modal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3 id="detail-title">Detail sel</h3>
+        <button type="button" class="btn-ghost" id="detail-close">Tutup</button>
+      </div>
+      <pre id="detail-body" class="detail-body"></pre>
+    </div>
+  </div>
+
+  <div id="help-modal" class="modal" hidden>
+    <div class="modal-card modal-wide">
+      <div class="modal-head">
+        <h3>Cara memakai</h3>
+        <button type="button" class="btn-ghost" id="help-close">Tutup</button>
+      </div>
+      <div class="help-body">
+        <h4>Tabel besar (100 juta+ baris)</h4>
+        <p>Aplikasi tidak pernah memuat seluruh tabel. Yang tampil hanya satu halaman (100–1000 baris) lewat keyset paging. Jumlah baris diambil dari statistik partisi, bukan <code>COUNT(*)</code>.</p>
+        <h4>Export / backup</h4>
+        <p>Pilih folder tujuan di server. Export CSV bisa dipecah per ukuran (default 10 GB) atau per baris. Backup database menulis file .bak ke folder yang sama; pecahan 10 GB memakai beberapa file stripe SQL Server.</p>
+        <h4>Query</h4>
+        <p>Jangan <code>SELECT *</code> tanpa <code>TOP</code> pada tabel besar. Hasil query ad-hoc tetap dipotong 1000 baris. Batch <code>GO</code> didukung. F5 / Ctrl+Enter menjalankan SQL.</p>
+        <h4>Hati-hati</h4>
+        <p><code>DELETE</code> / <code>UPDATE</code> / <code>DROP</code> jalan apa adanya. Tidak ada undo.</p>
+      </div>
+    </div>
+  </div>
+
+  <div id="export-modal" class="modal" hidden>
+    <div class="modal-card modal-wide">
+      <div class="modal-head">
+        <h3>Export <span id="export-target"></span></h3>
+        <button type="button" class="btn-ghost" id="export-close">Tutup</button>
+      </div>
+      <div class="help-body">
+        <p id="export-warn" class="form-error" hidden></p>
+        <div class="export-actions">
+          <button type="button" class="btn-tiny" id="export-all">Pilih semua kolom</button>
+          <button type="button" class="btn-tiny" id="export-none">Kosongkan</button>
+        </div>
+        <div id="export-columns" class="export-columns"></div>
+        <label class="field">
+          <span>WHERE (opsional)</span>
+          <input id="export-where" type="text" placeholder="CreatedAt >= '2024-01-01' AND Status = 1">
+        </label>
+        <label class="field">
+          <span>Folder tujuan</span>
+          <div class="field-row">
+            <input id="export-folder" type="text" placeholder="C:\SQLSM-Data">
+            <button type="button" class="btn-secondary" id="export-browse">Pilih folder</button>
+          </div>
+        </label>
+        <label class="field">
+          <span>Pecah file</span>
+          <select id="export-chunk-mode">
+            <option value="size" selected>Per ukuran file</option>
+            <option value="rows">Per jumlah baris</option>
+            <option value="none">Satu file</option>
+          </select>
+        </label>
+        <label class="field" id="export-chunk-size-wrap">
+          <span>Ukuran tiap file</span>
+          <select id="export-chunk-size">
+            <option value="1073741824">1 GB</option>
+            <option value="2147483648">2 GB</option>
+            <option value="5368709120">5 GB</option>
+            <option value="10737418240" selected>10 GB</option>
+            <option value="21474836480">20 GB</option>
+            <option value="custom">Kustom (GB)</option>
+          </select>
+        </label>
+        <label class="field" id="export-chunk-custom-wrap" hidden>
+          <span>Ukuran kustom (GB)</span>
+          <input id="export-chunk-custom" type="text" inputmode="numeric" value="10">
+        </label>
+        <label class="field" id="export-chunk-rows-wrap" hidden>
+          <span>Baris tiap file</span>
+          <select id="export-chunk">
+            <option value="500000">500.000 baris</option>
+            <option value="1000000" selected>1.000.000 baris</option>
+            <option value="2000000">2.000.000 baris</option>
+          </select>
+        </label>
+        <label class="choice tight"><input id="export-gzip" type="checkbox" checked> <span>Kompres gzip (.csv.gz)</span></label>
+        <label class="choice tight"><input id="export-nolock" type="checkbox" checked> <span>NOLOCK / read uncommitted (jangan kunci tabel produksi)</span></label>
+        <p id="export-error" class="form-error" hidden></p>
+        <button type="button" class="btn-primary" id="export-start">Mulai export</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="backup-modal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>Backup database</h3>
+        <button type="button" class="btn-ghost" id="backup-close">Tutup</button>
+      </div>
+      <div class="help-body">
+        <p class="card-sub">File .bak ditulis oleh layanan SQL Server. Pilih folder lokal yang bisa diakses akun SQL Server.</p>
+        <label class="field">
+          <span>Database</span>
+          <select id="backup-database"></select>
+        </label>
+        <label class="field">
+          <span>Folder tujuan</span>
+          <div class="field-row">
+            <input id="backup-folder" type="text" placeholder="C:\SQLSM-Data">
+            <button type="button" class="btn-secondary" id="backup-browse">Pilih folder</button>
+          </div>
+        </label>
+        <label class="field">
+          <span>Pecah file</span>
+          <select id="backup-chunk-size">
+            <option value="5368709120">Per 5 GB</option>
+            <option value="10737418240" selected>Per 10 GB</option>
+            <option value="21474836480">Per 20 GB</option>
+            <option value="0">Satu file</option>
+          </select>
+        </label>
+        <label class="choice tight"><input id="backup-compress" type="checkbox" checked> <span>Kompresi backup (jika edisi SQL Server mendukung)</span></label>
+        <p id="backup-error" class="form-error" hidden></p>
+        <button type="button" class="btn-primary" id="backup-start">Mulai backup</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="folder-modal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>Pilih folder</h3>
+        <button type="button" class="btn-ghost" id="folder-close">Tutup</button>
+      </div>
+      <div class="help-body">
+        <div class="folder-nav">
+          <button type="button" class="btn-tiny" id="folder-up">Naik</button>
+          <span id="folder-path" class="folder-path"></span>
+        </div>
+        <div id="folder-list" class="folder-list"></div>
+        <button type="button" class="btn-primary" id="folder-use">Pakai folder ini</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="jobs-modal" class="modal" hidden>
+    <div class="modal-card modal-wide">
+      <div class="modal-head">
+        <h3>Job export</h3>
+        <button type="button" class="btn-ghost" id="jobs-close">Tutup</button>
+      </div>
+      <div id="jobs-body" class="jobs-body"></div>
+    </div>
+  </div>
+
+  <div id="boot-overlay" class="boot-overlay">
+    <div class="boot-panel">
+      <div class="boot-spinner"></div>
+      <p class="boot-kicker">SQL Server Management</p>
+      <h2 id="boot-title">Memeriksa sesi</h2>
+      <p id="boot-text">Memeriksa koneksi SQL Server dan sesi yang sedang aktif.</p>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/ui.js') }}?v=3"></script>
+  <script src="{{ url_for('static', filename='js/grid.js') }}?v=3"></script>
+  <script src="{{ url_for('static', filename='js/export.js') }}?v=3"></script>
+  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=3"></script>
+</body>
+</html>
