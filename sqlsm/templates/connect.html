@@ -5,7 +5,7 @@
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SQL Server Management</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=8">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=9">
 </head>
 <body class="page-connect">
   <div class="connect-shell">
@@ -23,7 +23,8 @@
     <main class="connect-main">
       <form id="connect-form" class="connect-card" autocomplete="off">
         <h2>Hubungkan ke SQL Server</h2>
-        <p class="card-sub">Password tidak disimpan. Bisa menambah beberapa koneksi sekaligus dari workspace.</p>
+        <p class="card-sub">Profil tersimpan di komputer ini, di luar repo. Git pull tidak menghapusnya.</p>
+        <div id="saved-profiles" class="saved-profiles" hidden></div>
 
         <div class="field-row">
           <label class="field">
@@ -62,6 +63,10 @@
             <span>Password</span>
             <input id="password" name="password" type="password">
           </label>
+          <label class="choice tight">
+            <input id="remember-password" type="checkbox">
+            <span>Ingat password di komputer ini</span>
+          </label>
         </div>
 
         <label class="field">
@@ -96,7 +101,7 @@
     </div>
   </div>
 
-  <script src="{{ url_for('static', filename='js/ui.js') }}?v=8"></script>
-  <script src="{{ url_for('static', filename='js/connect.js') }}?v=8"></script>
+  <script src="{{ url_for('static', filename='js/ui.js') }}?v=9"></script>
+  <script src="{{ url_for('static', filename='js/connect.js') }}?v=9"></script>
 </body>
 </html>

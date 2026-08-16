@@ -163,6 +163,34 @@ code {
   max-width: 460px;
 }
 .connect-card h2 { margin: 0 0 6px; font-size: 22px; }
+.saved-profiles { margin: 0 0 18px; }
+.saved-profiles h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 650;
+}
+.saved-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 8px;
+}
+.saved-item button.saved-pick {
+  flex: 1;
+  text-align: left;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+.saved-item button.saved-pick:hover { border-color: #93c5fd; background: #f8fbff; }
+.saved-item strong { display: block; font-size: 14px; }
+.saved-item span { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+.saved-item .btn-tiny { flex: 0 0 auto; }
 .card-sub { margin: 0 0 22px; color: var(--muted); }
 
 .field { display: block; margin-bottom: 14px; }

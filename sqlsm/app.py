@@ -18,6 +18,7 @@ from sqlsm.client import (
 )
 from sqlsm.export import cancel_job, get_job, list_jobs, start_backup, start_export, start_export_database
 from sqlsm.fsutil import default_data_folder, existing_start_dir, list_folders, pick_folder
+from sqlsm.profiles import delete_profile, get_profile, list_profiles, upsert_profile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 app = Flask(
@@ -177,8 +178,21 @@ def api_meta():
             "odbc_drivers": drivers,
             "preferred_driver": pick_odbc_driver(drivers),
             "default_folder": existing_start_dir(default_data_folder()),
+            "profiles": list_profiles(),
         }
     )
+
+
+@app.route("/api/profiles")
+def api_profiles():
+    return jsonify({"ok": True, "profiles": list_profiles()})
+
+
+@app.route("/api/profiles/<profile_id>", methods=["DELETE"])
+def api_profiles_delete(profile_id):
+    if not delete_profile(profile_id):
+        return _error_payload(ClientError("Profil koneksi tidak ditemukan."))
+    return jsonify({"ok": True, "profiles": list_profiles()})
 
 
 @app.route("/api/session")
@@ -208,13 +222,18 @@ def api_connect():
         port = int(payload.get("port") or 1433)
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "Port tidak valid.", "hint": "Port default SQL Server adalah 1433."}), 400
+    password = str(payload.get("password") or "")
+    if not password and payload.get("profile_id"):
+        saved = get_profile(str(payload.get("profile_id")))
+        if saved and saved.get("password"):
+            password = str(saved.get("password") or "")
     cfg = ConnectionConfig(
         server=str(payload.get("server") or "").strip(),
         port=port,
         instance=str(payload.get("instance") or "").strip(),
         auth="windows" if payload.get("auth") == "windows" else "sql",
         username=str(payload.get("username") or "").strip(),
-        password=str(payload.get("password") or ""),
+        password=password,
         database=str(payload.get("database") or "master").strip() or "master",
         encrypt=bool(payload.get("encrypt")),
     )
@@ -240,6 +259,22 @@ def api_connect():
     }
     store["active"] = cid
     item = store["connections"][cid]
+    try:
+        upsert_profile(
+            {
+                "server": cfg.server,
+                "port": cfg.port,
+                "instance": cfg.instance,
+                "auth": cfg.auth,
+                "username": cfg.username,
+                "password": cfg.password,
+                "database": cfg.database,
+                "encrypt": cfg.encrypt,
+            },
+            remember_password=bool(payload.get("remember_password")),
+        )
+    except Exception:
+        pass
     return jsonify(
         {
             "ok": True,

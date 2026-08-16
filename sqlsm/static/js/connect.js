@@ -4,8 +4,10 @@
   var sqlFields = document.getElementById("sql-auth-fields");
   var driverNote = document.getElementById("driver-note");
   var connectBtn = document.getElementById("connect-btn");
+  var savedBox = document.getElementById("saved-profiles");
+  var selectedProfileId = "";
   var portInput = window.SqlFormat.bindInput(document.getElementById("port"), { min: 1, max: 65535 });
-  window.SqlSelect.mount(document.getElementById("database"), {
+  var dbSelect = window.SqlSelect.mount(document.getElementById("database"), {
     placeholder: "Cari atau ketik nama database",
     allowCustom: true
   });
@@ -18,6 +20,73 @@
   function setAuthMode() {
     var windows = document.getElementById("auth-windows").checked;
     sqlFields.hidden = windows;
+  }
+
+  function fillForm(profile) {
+    document.getElementById("server").value = profile.server || "localhost";
+    portInput.set(profile.port || 1433);
+    document.getElementById("instance").value = profile.instance || "";
+    document.getElementById("auth-windows").checked = profile.auth === "windows";
+    document.getElementById("auth-sql").checked = profile.auth !== "windows";
+    document.getElementById("username").value = profile.username || "sa";
+    document.getElementById("password").value = "";
+    document.getElementById("password").placeholder = profile.has_password ? "Tersimpan di komputer ini" : "";
+    document.getElementById("remember-password").checked = !!profile.remember_password;
+    document.getElementById("encrypt").checked = !!profile.encrypt;
+    if (dbSelect && dbSelect.setValue) dbSelect.setValue(profile.database || "master");
+    else document.getElementById("database").value = profile.database || "master";
+    selectedProfileId = profile.id || "";
+    setAuthMode();
+  }
+
+  function renderProfiles(profiles) {
+    if (!savedBox) return;
+    if (!profiles || !profiles.length) {
+      savedBox.hidden = true;
+      savedBox.innerHTML = "";
+      return;
+    }
+    savedBox.hidden = false;
+    savedBox.innerHTML = "<h3>Koneksi tersimpan</h3>";
+    profiles.forEach(function (profile) {
+      var row = document.createElement("div");
+      row.className = "saved-item";
+      var pick = document.createElement("button");
+      pick.type = "button";
+      pick.className = "saved-pick";
+      pick.innerHTML = "<strong>" + escapeHtml(profile.label) + "</strong><span>" +
+        escapeHtml(profile.has_password || profile.auth === "windows" ? "Klik untuk menghubungkan" : "Klik, lalu isi password") +
+        "</span>";
+      pick.addEventListener("click", function () {
+        fillForm(profile);
+        if (profile.auth === "windows" || profile.has_password) {
+          form.requestSubmit ? form.requestSubmit() : connectBtn.click();
+        } else {
+          document.getElementById("password").focus();
+        }
+      });
+      var remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn-tiny";
+      remove.textContent = "Hapus";
+      remove.addEventListener("click", function () {
+        fetch("/api/profiles/" + encodeURIComponent(profile.id), { method: "DELETE" })
+          .then(function (res) { return res.json(); })
+          .then(function (data) {
+            if (data.ok) renderProfiles(data.profiles || []);
+          });
+      });
+      row.appendChild(pick);
+      row.appendChild(remove);
+      savedBox.appendChild(row);
+    });
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
   }
 
   document.getElementById("auth-windows").addEventListener("change", setAuthMode);
@@ -37,6 +106,8 @@
       } else {
         driverNote.textContent = "ODBC SQL Server belum terdeteksi. SQL Authentication tetap bisa dipakai lewat pymssql.";
       }
+      renderProfiles(data.profiles || []);
+      if (data.profiles && data.profiles.length) fillForm(data.profiles[0]);
       window.SqlLoading.hide();
     })
     .catch(function () {
@@ -66,7 +137,9 @@
       username: document.getElementById("username").value,
       password: document.getElementById("password").value,
       database: document.getElementById("database").value || "master",
-      encrypt: document.getElementById("encrypt").checked
+      encrypt: document.getElementById("encrypt").checked,
+      remember_password: document.getElementById("remember-password").checked,
+      profile_id: selectedProfileId
     };
 
     fetch("/api/connect", {
