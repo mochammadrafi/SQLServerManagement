@@ -256,8 +256,18 @@ def explain_error(exc):
             "Server tidak terjangkau. Pastikan SQL Server jalan, TCP 1433 terbuka, "
             "dan SQL Server Browser hidup jika memakai instance (contoh SQLEXPRESS)."
         )
-    elif "timeout" in lower or "timed out" in lower:
+    elif "hyt00" in lower or "query timeout" in lower or "timeout expired" in lower:
+        hint = (
+            "Query timeout, bukan gagal login. Server sibuk atau katalognya berat. "
+            "Coba lagi; daftar database tetap bisa dibuka tanpa hitung ukuran file."
+        )
+    elif "login timeout" in lower or "connection timeout" in lower:
         hint = "Koneksi timeout. Cek firewall, IP, port, atau nama instance."
+    elif "timeout" in lower or "timed out" in lower:
+        hint = (
+            "Timeout. Jika teksnya Query timeout expired, server lambat — bukan firewall. "
+            "Jika Login timeout, cek IP, port, dan instance."
+        )
     elif "ssl" in lower or "certificate" in lower or "encrypt" in lower:
         hint = "Matikan opsi Enkripsi untuk SQL Server 2012, atau pasang sertifikat TLS di server."
     elif "driver" in lower and "not found" in lower:
@@ -348,7 +358,7 @@ class SqlServerClient(object):
         except Exception as exc:
             message, hint = explain_error(exc)
             raise ClientError(message, hint)
-        timeout = int(getattr(self.cfg, "query_timeout", 60) or 0)
+        timeout = int(getattr(self.cfg, "query_timeout", 300) or 0)
         self._conn.timeout = timeout
         self.backend = "pyodbc"
         self.driver_name = driver
@@ -384,7 +394,7 @@ class SqlServerClient(object):
             "password": self.cfg.password or "",
             "database": self.cfg.database or "master",
             "login_timeout": int(self.cfg.login_timeout),
-            "timeout": int(getattr(self.cfg, "query_timeout", 60) or 0),
+            "timeout": int(getattr(self.cfg, "query_timeout", 300) or 0),
             "charset": "UTF-8",
         }
         try:
@@ -516,18 +526,25 @@ SELECT
     d.state_desc,
     d.compatibility_level,
     d.collation_name,
-    d.recovery_model_desc,
-    CAST(ISNULL(size_mb.size_mb, 0) AS decimal(18, 2)) AS size_mb
+    d.recovery_model_desc
 FROM sys.databases AS d
-LEFT JOIN (
-    SELECT database_id, SUM(size) * 8.0 / 1024 AS size_mb
-    FROM sys.master_files
-    GROUP BY database_id
-) AS size_mb ON size_mb.database_id = d.database_id
 ORDER BY d.name
 """
-        data = self.execute(sql, max_rows=5000)
-        return self._as_dicts(data)
+        rows = self._as_dicts(self.execute(sql, max_rows=5000))
+        sizes = {}  # type: Dict[Any, Any]
+        try:
+            size_sql = """
+SELECT database_id, CAST(SUM(size) * 8.0 / 1024 AS decimal(18, 2)) AS size_mb
+FROM sys.master_files
+GROUP BY database_id
+"""
+            for item in self._as_dicts(self.execute(size_sql, max_rows=5000)):
+                sizes[item.get("database_id")] = item.get("size_mb")
+        except Exception:
+            sizes = {}
+        for row in rows:
+            row["size_mb"] = sizes.get(row.get("database_id"))
+        return rows
 
     def list_objects(self, database):
         # type: (str) -> Dict[str, Any]
@@ -542,7 +559,7 @@ SELECT
             'db_backupoperator', 'db_datareader', 'db_datawriter',
             'db_denydatareader', 'db_denydatawriter'
         ) THEN 1 ELSE 0
-    END AS is_system
+                    END AS is_system
 FROM sys.schemas AS s
 ORDER BY s.name
 """

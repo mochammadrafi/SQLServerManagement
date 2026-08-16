@@ -83,7 +83,7 @@
       windowEl.style.transform = "translateY(" + (start * ROW_H) + "px)";
       windowEl.innerHTML = "";
       for (var i = start; i < end; i++) {
-        windowEl.appendChild(rowEl(columns, rows[i], i, widths));
+        windowEl.appendChild(rowEl(columns, rows[i], i, widths, opts));
       }
       head.scrollLeft = body.scrollLeft;
     }
@@ -92,10 +92,14 @@
     paint();
   }
 
-  function rowEl(columns, row, rowIndex, widths) {
+  function rowEl(columns, row, rowIndex, widths, opts) {
     var el = document.createElement("div");
-    el.className = "virt-row";
+    el.className = "virt-row" + (opts && opts.selectedRow === rowIndex ? " is-selected" : "");
+    el.setAttribute("data-row", String(rowIndex));
     el.style.height = ROW_H + "px";
+    el.addEventListener("click", function () {
+      if (opts && opts.onRowClick) opts.onRowClick(row, rowIndex, columns);
+    });
     columns.forEach(function (name, colIndex) {
       var value = row[colIndex];
       var cell = document.createElement("div");

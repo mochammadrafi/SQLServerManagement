@@ -16,7 +16,7 @@ from sqlsm.client import (
     list_odbc_drivers,
     pick_odbc_driver,
 )
-from sqlsm.export import cancel_job, get_job, list_jobs, start_backup, start_export
+from sqlsm.export import cancel_job, get_job, list_jobs, start_backup, start_export, start_export_database
 from sqlsm.fsutil import default_data_folder, list_folders
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -45,21 +45,94 @@ def _sid():
     return token
 
 
+def _ensure_store():
+    # type: () -> Optional[Dict[str, Any]]
+    sid = _sid()
+    item = STORE.get(sid)
+    if not item:
+        return None
+    if item.get("connections") is not None:
+        return item
+    if item.get("cfg"):
+        cid = uuid.uuid4().hex[:12]
+        migrated = {
+            "connections": {
+                cid: {
+                    "id": cid,
+                    "cfg": item["cfg"],
+                    "client": item.get("client"),
+                    "backend": item.get("backend") or "",
+                    "driver_name": item.get("driver_name") or "",
+                }
+            },
+            "active": cid,
+        }
+        STORE[sid] = migrated
+        return migrated
+    return None
+
+
 def _store():
     # type: () -> Optional[Dict[str, Any]]
-    return STORE.get(_sid())
+    return _ensure_store()
+
+
+def _has_connections():
+    # type: () -> bool
+    store = _ensure_store()
+    return bool(store and store.get("connections"))
+
+
+def _active_item():
+    # type: () -> Optional[Dict[str, Any]]
+    store = _ensure_store()
+    if not store:
+        return None
+    return (store.get("connections") or {}).get(store.get("active"))
+
+
+def _public_connection(item):
+    # type: (Dict[str, Any]) -> Dict[str, Any]
+    cfg = item["cfg"]  # type: ConnectionConfig
+    data = cfg.public_dict()
+    data["id"] = item.get("id")
+    data["backend"] = item.get("backend") or ""
+    data["driver_name"] = item.get("driver_name") or ""
+    data["label"] = "%s · %s" % (
+        data.get("display_server") or data.get("server"),
+        data.get("database") or "master",
+    )
+    if data.get("auth") == "sql" and data.get("username"):
+        data["label"] += " · " + data["username"]
+    elif data.get("auth") == "windows":
+        data["label"] += " · Windows"
+    return data
 
 
 def _client():
     # type: () -> SqlServerClient
-    item = _store()
+    item = _active_item()
     if not item:
         raise ClientError("Belum terhubung ke SQL Server.", "Buka halaman koneksi dan isi data server.")
     client = item.get("client")
     if client is None:
         client = connect_client(item["cfg"])
         item["client"] = client
+        item["backend"] = client.backend
+        item["driver_name"] = client.driver_name
     return client
+
+
+def _close_item(item):
+    # type: (Dict[str, Any]) -> None
+    client = item.get("client")
+    if client is None:
+        return
+    try:
+        client.close()
+    except Exception:
+        pass
+    item["client"] = None
 
 
 def _error_payload(exc):
@@ -75,15 +148,20 @@ def _bind_sid():
 
 
 @app.route("/")
-def connect_page():
-    if _store():
+def home_page():
+    if _has_connections():
         return redirect(url_for("workspace_page"))
+    return render_template("connect.html")
+
+
+@app.route("/connect")
+def connect_page():
     return render_template("connect.html")
 
 
 @app.route("/workspace")
 def workspace_page():
-    if not _store():
+    if not _has_connections():
         return redirect(url_for("connect_page"))
     return render_template("workspace.html")
 
@@ -105,15 +183,18 @@ def api_meta():
 
 @app.route("/api/session")
 def api_session():
-    item = _store()
-    if not item:
-        return jsonify({"ok": True, "connected": False})
-    cfg = item["cfg"]  # type: ConnectionConfig
+    store = _ensure_store()
+    item = _active_item()
+    if not store or not item:
+        return jsonify({"ok": True, "connected": False, "connections": []})
+    connections = [_public_connection(entry) for entry in (store.get("connections") or {}).values()]
     return jsonify(
         {
             "ok": True,
             "connected": True,
-            "connection": cfg.public_dict(),
+            "connection": _public_connection(item),
+            "connection_id": item.get("id"),
+            "connections": connections,
             "backend": item.get("backend") or "",
             "driver_name": item.get("driver_name") or "",
         }
@@ -144,22 +225,27 @@ def api_connect():
         return _error_payload(exc)
     except Exception as exc:
         return _error_payload(exc)
-    old = _store()
-    if old and old.get("client"):
-        try:
-            old["client"].close()
-        except Exception:
-            pass
-    STORE[_sid()] = {
+    sid = _sid()
+    store = _ensure_store()
+    if store is None:
+        store = {"connections": {}, "active": None}
+        STORE[sid] = store
+    cid = uuid.uuid4().hex[:12]
+    store["connections"][cid] = {
+        "id": cid,
         "cfg": cfg,
         "client": client,
         "backend": client.backend,
         "driver_name": client.driver_name,
     }
+    store["active"] = cid
+    item = store["connections"][cid]
     return jsonify(
         {
             "ok": True,
-            "connection": cfg.public_dict(),
+            "connection": _public_connection(item),
+            "connection_id": cid,
+            "connections": [_public_connection(entry) for entry in store["connections"].values()],
             "server": info,
             "backend": client.backend,
             "driver_name": client.driver_name,
@@ -169,31 +255,80 @@ def api_connect():
 
 @app.route("/api/disconnect", methods=["POST"])
 def api_disconnect():
+    payload = request.get_json(silent=True) or {}
     sid = _sid()
+    store = _ensure_store()
+    if not store:
+        return jsonify({"ok": True, "connected": False, "connections": []})
+    close_all = bool(payload.get("all"))
+    target = str(payload.get("id") or store.get("active") or "").strip()
+    remaining = store.get("connections") or {}
+    if close_all:
+        for item in list(remaining.values()):
+            _close_item(item)
+        remaining = {}
+    elif target and target in remaining:
+        _close_item(remaining[target])
+        remaining.pop(target, None)
+    store["connections"] = remaining
+    if remaining:
+        if store.get("active") not in remaining:
+            store["active"] = next(iter(remaining.keys()))
+        item = remaining[store["active"]]
+        return jsonify(
+            {
+                "ok": True,
+                "connected": True,
+                "connection": _public_connection(item),
+                "connection_id": item.get("id"),
+                "connections": [_public_connection(entry) for entry in remaining.values()],
+            }
+        )
     for job in list_jobs(sid):
         if job.get("status") in ("queued", "running", "cancelling"):
             try:
                 cancel_job(sid, job["id"])
             except Exception:
                 pass
-    item = STORE.pop(sid, None)
-    if item and item.get("client"):
-        try:
-            item["client"].close()
-        except Exception:
-            pass
-    return jsonify({"ok": True})
+    STORE.pop(sid, None)
+    return jsonify({"ok": True, "connected": False, "connections": []})
+
+
+@app.route("/api/connections/switch", methods=["POST"])
+def api_connections_switch():
+    payload = request.get_json(silent=True) or {}
+    cid = str(payload.get("id") or "").strip()
+    store = _ensure_store()
+    if not store or cid not in (store.get("connections") or {}):
+        return _error_payload(ClientError("Koneksi tidak ditemukan.", "Pilih koneksi yang masih aktif, atau buat yang baru."))
+    store["active"] = cid
+    item = store["connections"][cid]
+    return jsonify(
+        {
+            "ok": True,
+            "connection": _public_connection(item),
+            "connection_id": cid,
+            "connections": [_public_connection(entry) for entry in store["connections"].values()],
+            "backend": item.get("backend") or "",
+            "driver_name": item.get("driver_name") or "",
+        }
+    )
 
 
 @app.route("/api/server")
 def api_server():
     try:
         client = _client()
+        sessions = []
+        try:
+            sessions = client.list_sessions()
+        except Exception:
+            sessions = []
         return jsonify(
             {
                 "ok": True,
                 "server": client.server_info(),
-                "sessions": client.list_sessions(),
+                "sessions": sessions,
                 "backend": client.backend,
                 "driver_name": client.driver_name,
             }
@@ -301,7 +436,7 @@ def api_table_page():
 @app.route("/api/export", methods=["POST"])
 def api_export_start():
     payload = request.get_json(silent=True) or {}
-    item = _store()
+    item = _active_item()
     if not item:
         return _error_payload(ClientError("Belum terhubung ke SQL Server."))
     try:
@@ -321,6 +456,47 @@ def api_export_start():
             table=str(payload.get("table") or "").strip(),
             columns=list(payload.get("columns") or []),
             where=str(payload.get("where") or ""),
+            chunk_rows=chunk_rows,
+            chunk_bytes=chunk_bytes,
+            use_gzip=bool(payload.get("gzip", True)),
+            nolock=bool(payload.get("nolock", True)),
+            folder=str(payload.get("folder") or ""),
+        )
+        return jsonify({"ok": True, "job": job.public()})
+    except Exception as exc:
+        return _error_payload(exc)
+
+
+@app.route("/api/export/database", methods=["POST"])
+def api_export_database():
+    payload = request.get_json(silent=True) or {}
+    item = _active_item()
+    if not item:
+        return _error_payload(ClientError("Belum terhubung ke SQL Server."))
+    try:
+        chunk_rows = int(payload.get("chunk_rows") or 0)
+    except (TypeError, ValueError):
+        chunk_rows = 0
+    try:
+        chunk_bytes = int(payload.get("chunk_bytes") or 0)
+    except (TypeError, ValueError):
+        chunk_bytes = 0
+    tables = []
+    for entry in payload.get("tables") or []:
+        if not isinstance(entry, dict):
+            continue
+        schema = str(entry.get("schema") or "").strip()
+        name = str(entry.get("name") or "").strip()
+        if schema and name:
+            tables.append({"schema": schema, "name": name})
+    try:
+        job = start_export_database(
+            sid=_sid(),
+            cfg=item["cfg"],
+            database=str(payload.get("database") or "").strip(),
+            tables=tables,
+            include_views=bool(payload.get("include_views")),
+            include_system=bool(payload.get("include_system")),
             chunk_rows=chunk_rows,
             chunk_bytes=chunk_bytes,
             use_gzip=bool(payload.get("gzip", True)),
@@ -375,7 +551,7 @@ def api_fs():
 @app.route("/api/backup", methods=["POST"])
 def api_backup_start():
     payload = request.get_json(silent=True) or {}
-    item = _store()
+    item = _active_item()
     if not item:
         return _error_payload(ClientError("Belum terhubung ke SQL Server."))
     try:
