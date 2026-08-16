@@ -70,8 +70,7 @@
       remove.className = "btn-tiny";
       remove.textContent = "Hapus";
       remove.addEventListener("click", function () {
-        fetch("/api/profiles/" + encodeURIComponent(profile.id), { method: "DELETE" })
-          .then(function (res) { return res.json(); })
+        window.SqlApi.request("/api/profiles/" + encodeURIComponent(profile.id), { method: "DELETE" })
           .then(function (data) {
             if (data.ok) renderProfiles(data.profiles || []);
           });
@@ -93,8 +92,7 @@
   document.getElementById("auth-sql").addEventListener("change", setAuthMode);
 
   window.SqlLoading.show("Memeriksa lingkungan", "Memeriksa driver ODBC, platform, dan kesiapan aplikasi.");
-  fetch("/api/meta")
-    .then(function (res) { return res.json(); })
+  window.SqlApi.request("/api/meta")
     .then(function (data) {
       if (!data.windows) {
         document.getElementById("auth-windows").disabled = true;
@@ -142,17 +140,16 @@
       profile_id: selectedProfileId
     };
 
-    fetch("/api/connect", {
+    window.SqlApi.request("/api/connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     })
-      .then(function (res) { return res.json().then(function (data) { return { res: res, data: data }; }); })
-      .then(function (pack) {
-        if (!pack.data.ok) {
+      .then(function (data) {
+        if (!data.ok) {
           window.SqlLoading.hide();
           connectBtn.disabled = false;
-          showError(pack.data.error || "Koneksi gagal.", pack.data.hint);
+          showError(data.error || "Koneksi gagal.", data.hint);
           return;
         }
         window.SqlLoading.show("Terhubung", "Membuka workspace dan memeriksa sesi.");

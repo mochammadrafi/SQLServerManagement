@@ -5,7 +5,10 @@
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SQL Server Management</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=8">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=12">
 </head>
 <body class="page-workspace">
   <div id="busy-strip" class="busy-strip" hidden>
@@ -18,7 +21,7 @@
   <header class="app-header">
     <div class="header-left">
       <button type="button" class="btn-ghost header-menu" id="btn-explorer" aria-label="Tampilkan daftar database">Menu</button>
-      <span class="brand-mark">SQL Server Management</span>
+      <span class="brand-kicker">SQL Server Management</span>
       <div class="conn-switch">
         <select id="conn-select"></select>
         <button type="button" class="btn-ghost" id="btn-new-conn">Koneksi baru</button>
@@ -131,7 +134,7 @@
         <h4>Tabel besar (100 juta+ baris)</h4>
         <p>Aplikasi tidak pernah memuat seluruh tabel. Yang tampil hanya satu halaman (100–1000 baris). Jumlah baris diambil dari statistik partisi, bukan <code>COUNT(*)</code>.</p>
         <h4>Export / backup</h4>
-        <p>Dari kartu database: Backup (.bak) atau Export semua tabel (CSV). Dari kartu tabel: Export tabel itu saja. <strong>Pilih folder...</strong> membuka dialog folder Windows/macOS seperti aplikasi biasa. File .bak harus ke folder yang bisa ditulis akun SQL Server.</p>
+        <p>Dari kartu database: Backup (.bak) atau Export semua tabel (CSV). Dari kartu tabel: Export tabel itu saja. <strong>Pilih folder...</strong> membuka pemilih folder di dalam aplikasi. File .bak harus ke folder yang bisa ditulis akun SQL Server.</p>
         <h4>SQL</h4>
         <p>Mode SQL untuk query ad-hoc. Jangan <code>SELECT *</code> tanpa <code>TOP</code> pada tabel besar. Hasil dipotong 1000 baris. F5 / Ctrl+Enter menjalankan SQL.</p>
         <h4>Hati-hati</h4>
@@ -298,6 +301,24 @@
     </div>
   </div>
 
+  <div id="folder-modal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>Pilih folder</h3>
+        <button type="button" class="btn-ghost" id="folder-close">Tutup</button>
+      </div>
+      <div class="help-body">
+        <div class="folder-nav">
+          <button type="button" class="btn-tiny" id="folder-up">Naik</button>
+          <span id="folder-path" class="folder-path"></span>
+        </div>
+        <div id="folder-shortcuts" class="folder-shortcuts"></div>
+        <div id="folder-list" class="folder-list"></div>
+        <button type="button" class="btn-primary" id="folder-use">Pakai folder ini</button>
+      </div>
+    </div>
+  </div>
+
   <div id="jobs-modal" class="modal" hidden>
     <div class="modal-card modal-wide">
       <div class="modal-head">
@@ -311,15 +332,15 @@
   <div id="boot-overlay" class="boot-overlay">
     <div class="boot-panel">
       <div class="boot-spinner"></div>
-      <p class="boot-kicker">SQL Server Management</p>
+      <p class="brand-kicker">SQL Server Management</p>
       <h2 id="boot-title">Memeriksa sesi</h2>
       <p id="boot-text">Memeriksa koneksi SQL Server dan sesi yang sedang aktif.</p>
     </div>
   </div>
 
-  <script src="{{ url_for('static', filename='js/ui.js') }}?v=8"></script>
-  <script src="{{ url_for('static', filename='js/grid.js') }}?v=8"></script>
-  <script src="{{ url_for('static', filename='js/export.js') }}?v=8"></script>
-  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=8"></script>
+  <script src="{{ url_for('static', filename='js/ui.js') }}?v=12"></script>
+  <script src="{{ url_for('static', filename='js/grid.js') }}?v=12"></script>
+  <script src="{{ url_for('static', filename='js/export.js') }}?v=12"></script>
+  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=12"></script>
 </body>
 </html>

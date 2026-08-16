@@ -1,6 +1,8 @@
 (function (global) {
   var pollTimer = null;
   var currentJobId = null;
+  var folderTarget = null;
+  var folderPath = "";
   var defaultFolder = "";
 
   function $(id) {
@@ -8,11 +10,7 @@
   }
 
   function api(url, options) {
-    return fetch(url, options).then(function (res) {
-      return res.json().then(function (data) {
-        return data;
-      });
-    });
+    return window.SqlApi.request(url, options);
   }
 
   function formatCount(n) {
@@ -361,31 +359,47 @@
   }
 
   function openFolderPicker(inputId) {
-    var btn = document.activeElement;
-    var input = $(inputId);
-    if (window.SqlBusy) window.SqlBusy.mark(btn, true);
-    window.SqlLoading.show(
-      "Pilih folder",
-      "Dialog folder sistem sudah terbuka. Kalau tidak kelihatan, cek di belakang jendela browser."
-    );
-    api("/api/fs/pick", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: (input && input.value) || defaultFolder || "" })
-    }).then(function (data) {
-      window.SqlLoading.hide();
-      if (window.SqlBusy) window.SqlBusy.mark(btn, false);
+    folderTarget = inputId;
+    var start = ($(inputId) && $(inputId).value) || defaultFolder || "";
+    $("folder-modal").hidden = false;
+    loadFolder(start);
+  }
+
+  function renderFolderEntries(host, entries, onClick) {
+    host.innerHTML = "";
+    (entries || []).forEach(function (entry) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = entry.kind === "shortcut" ? "btn-tiny" : "folder-item";
+      btn.textContent = (entry.kind === "drive" ? "Disk " : "") + entry.name;
+      btn.addEventListener("click", function () { onClick(entry.path); });
+      host.appendChild(btn);
+    });
+  }
+
+  function loadFolder(path) {
+    var card = $("folder-modal").querySelector(".modal-card");
+    window.SqlLoading.showIn(card, "Membaca folder", path || "Folder awal");
+    api("/api/fs?path=" + encodeURIComponent(path || "")).then(function (data) {
+      window.SqlLoading.hideIn(card);
       if (!data.ok) {
-        if (data.error && !/dibatalkan/i.test(data.error)) {
-          window.alert(data.error + (data.hint ? "\n" + data.hint : ""));
-        }
+        $("folder-list").innerHTML = '<p class="form-error">' +
+          (data.error || "Gagal membaca folder") +
+          (data.hint ? " — " + data.hint : "") + "</p>";
         return;
       }
-      if (input) input.value = data.path || defaultFolder;
+      folderPath = data.path || "";
+      $("folder-path").textContent = folderPath || "Pilih folder";
+      $("folder-up").disabled = !data.parent && data.path !== "";
+      $("folder-up").setAttribute("data-parent", data.parent || "");
+      renderFolderEntries($("folder-shortcuts"), data.shortcuts || [], loadFolder);
+      renderFolderEntries($("folder-list"), data.entries || [], loadFolder);
+      if (!(data.entries || []).length) {
+        $("folder-list").innerHTML = '<p class="empty-inline">Tidak ada subfolder. Pakai folder ini, atau naik dulu.</p>';
+      }
     }).catch(function (err) {
-      window.SqlLoading.hide();
-      if (window.SqlBusy) window.SqlBusy.mark(btn, false);
-      window.alert(String(err));
+      window.SqlLoading.hideIn(card);
+      $("folder-list").innerHTML = '<p class="form-error">' + String(err) + "</p>";
     });
   }
 
@@ -494,6 +508,20 @@
     $("db-export-close").addEventListener("click", function () { $("db-export-modal").hidden = true; });
     $("backup-close").addEventListener("click", function () { $("backup-modal").hidden = true; });
     $("jobs-close").addEventListener("click", function () { $("jobs-modal").hidden = true; });
+    if ($("folder-close")) {
+      $("folder-close").addEventListener("click", function () { $("folder-modal").hidden = true; });
+    }
+    if ($("folder-up")) {
+      $("folder-up").addEventListener("click", function () {
+        loadFolder($("folder-up").getAttribute("data-parent") || "");
+      });
+    }
+    if ($("folder-use")) {
+      $("folder-use").addEventListener("click", function () {
+        if (folderTarget) $(folderTarget).value = folderPath || defaultFolder;
+        $("folder-modal").hidden = true;
+      });
+    }
     $("export-start").addEventListener("click", startExport);
     $("db-export-start").addEventListener("click", startDatabaseExport);
     $("backup-start").addEventListener("click", startBackup);
@@ -519,7 +547,7 @@
       if (!id) return;
       api("/api/export/" + id + "/cancel", { method: "POST" }).then(refreshJobs);
     });
-    ["export-modal", "db-export-modal", "backup-modal", "jobs-modal"].forEach(function (id) {
+    ["export-modal", "db-export-modal", "backup-modal", "jobs-modal", "folder-modal"].forEach(function (id) {
       $(id).addEventListener("click", function (event) {
         if (event.target === $(id)) $(id).hidden = true;
       });

@@ -91,7 +91,7 @@
     overlay.innerHTML =
       '<div class="boot-panel">' +
         '<div class="boot-spinner"></div>' +
-        '<p class="boot-kicker">SQL Server Management</p>' +
+        '<p class="brand-kicker">SQL Server Management</p>' +
         '<h2 id="boot-title">Memuat</h2>' +
         '<p id="boot-text">Menyiapkan aplikasi.</p>' +
       "</div>";
@@ -409,5 +409,45 @@
   };
   global.SqlSelect = {
     mount: mountSelect
+  };
+
+  function requestJson(url, options) {
+    options = options || {};
+    var retried = !!options._retried;
+    var init = {};
+    Object.keys(options).forEach(function (key) {
+      if (key !== "_retried") init[key] = options[key];
+    });
+    init.credentials = init.credentials || "same-origin";
+    init.headers = init.headers || {};
+    return fetch(url, init).then(function (res) {
+      return res.text().then(function (text) {
+        var data = {};
+        if (text) {
+          try {
+            data = JSON.parse(text);
+          } catch (err) {
+            data = {
+              ok: false,
+              error: "Respons aplikasi tidak valid.",
+              hint: res.status >= 500 ? "Server aplikasi error. Cek terminal Flask." : "Refresh halaman, lalu coba lagi."
+            };
+          }
+        }
+        if (data && data.retryable && !retried) {
+          return requestJson(url, Object.assign({}, options, { _retried: true }));
+        }
+        if (res.status === 401 || (data && data.error && /Belum terhubung/i.test(data.error) && !data.retryable)) {
+          if (window.location.pathname !== "/" && window.location.pathname !== "/connect") {
+            window.location.href = "/";
+          }
+        }
+        return data;
+      });
+    });
+  }
+
+  global.SqlApi = {
+    request: requestJson
   };
 })(window);

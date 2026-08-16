@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -13,20 +14,47 @@ from sqlsm.client import (
     ConnectionConfig,
     SqlServerClient,
     connect_client,
+    is_transient,
     list_odbc_drivers,
     pick_odbc_driver,
 )
 from sqlsm.export import cancel_job, get_job, list_jobs, start_backup, start_export, start_export_database
 from sqlsm.fsutil import default_data_folder, existing_start_dir, list_folders, pick_folder
-from sqlsm.profiles import delete_profile, get_profile, list_profiles, upsert_profile
+from sqlsm.profiles import STORE_DIR, delete_profile, get_profile, list_profiles, upsert_profile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _secret_key():
+    env = os.environ.get("SQLSM_SECRET")
+    if env:
+        return env
+    path = os.path.join(STORE_DIR, "secret")
+    try:
+        if os.path.isfile(path):
+            raw = open(path, "rb").read().strip()
+            if raw:
+                return raw
+        if not os.path.isdir(STORE_DIR):
+            os.makedirs(STORE_DIR)
+        raw = os.urandom(32)
+        with open(path, "wb") as handle:
+            handle.write(raw)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+        return raw
+    except Exception:
+        return os.urandom(24)
+
+
 app = Flask(
     __name__,
     template_folder=os.path.join(ROOT, "templates"),
     static_folder=os.path.join(ROOT, "static"),
 )
-app.secret_key = os.environ.get("SQLSM_SECRET") or os.urandom(24)
+app.secret_key = _secret_key()
 app.config["JSON_AS_ASCII"] = False
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 app.config["TEMPLATES_AUTO_RELOAD"] = True
@@ -35,6 +63,7 @@ app.jinja_env.auto_reload = True
 app.jinja_env.cache = {}
 
 STORE = {}  # type: Dict[str, Dict[str, Any]]
+_STORE_LOCK = threading.RLock()
 
 
 def _sid():
@@ -49,28 +78,29 @@ def _sid():
 def _ensure_store():
     # type: () -> Optional[Dict[str, Any]]
     sid = _sid()
-    item = STORE.get(sid)
-    if not item:
+    with _STORE_LOCK:
+        item = STORE.get(sid)
+        if not item:
+            return None
+        if item.get("connections") is not None:
+            return item
+        if item.get("cfg"):
+            cid = uuid.uuid4().hex[:12]
+            migrated = {
+                "connections": {
+                    cid: {
+                        "id": cid,
+                        "cfg": item["cfg"],
+                        "client": item.get("client"),
+                        "backend": item.get("backend") or "",
+                        "driver_name": item.get("driver_name") or "",
+                    }
+                },
+                "active": cid,
+            }
+            STORE[sid] = migrated
+            return migrated
         return None
-    if item.get("connections") is not None:
-        return item
-    if item.get("cfg"):
-        cid = uuid.uuid4().hex[:12]
-        migrated = {
-            "connections": {
-                cid: {
-                    "id": cid,
-                    "cfg": item["cfg"],
-                    "client": item.get("client"),
-                    "backend": item.get("backend") or "",
-                    "driver_name": item.get("driver_name") or "",
-                }
-            },
-            "active": cid,
-        }
-        STORE[sid] = migrated
-        return migrated
-    return None
 
 
 def _store():
@@ -116,11 +146,17 @@ def _client():
     if not item:
         raise ClientError("Belum terhubung ke SQL Server.", "Buka halaman koneksi dan isi data server.")
     client = item.get("client")
-    if client is None:
-        client = connect_client(item["cfg"])
-        item["client"] = client
-        item["backend"] = client.backend
-        item["driver_name"] = client.driver_name
+    if client is not None and getattr(client, "is_open", lambda: False)():
+        return client
+    cfg = item["cfg"]
+    client = connect_client(cfg)
+    with _STORE_LOCK:
+        current = _active_item()
+        if current and current.get("cfg") is cfg:
+            current["client"] = client
+            current["backend"] = client.backend
+            current["driver_name"] = client.driver_name
+            return client
     return client
 
 
@@ -138,9 +174,16 @@ def _close_item(item):
 
 def _error_payload(exc):
     # type: (BaseException) -> Any
+    retryable = is_transient(exc)
+    payload = {
+        "ok": False,
+        "error": str(exc),
+        "hint": getattr(exc, "hint", None),
+        "retryable": retryable,
+    }
     if isinstance(exc, ClientError):
-        return jsonify({"ok": False, "error": str(exc), "hint": exc.hint}), 400
-    return jsonify({"ok": False, "error": str(exc), "hint": None}), 500
+        return jsonify(payload), 503 if retryable else 400
+    return jsonify(payload), 503 if retryable else 500
 
 
 @app.before_request
@@ -245,20 +288,21 @@ def api_connect():
     except Exception as exc:
         return _error_payload(exc)
     sid = _sid()
-    store = _ensure_store()
-    if store is None:
-        store = {"connections": {}, "active": None}
-        STORE[sid] = store
     cid = uuid.uuid4().hex[:12]
-    store["connections"][cid] = {
-        "id": cid,
-        "cfg": cfg,
-        "client": client,
-        "backend": client.backend,
-        "driver_name": client.driver_name,
-    }
-    store["active"] = cid
-    item = store["connections"][cid]
+    with _STORE_LOCK:
+        store = STORE.get(sid)
+        if store is None or store.get("connections") is None:
+            store = {"connections": {}, "active": None}
+            STORE[sid] = store
+        store["connections"][cid] = {
+            "id": cid,
+            "cfg": cfg,
+            "client": client,
+            "backend": client.backend,
+            "driver_name": client.driver_name,
+        }
+        store["active"] = cid
+        item = store["connections"][cid]
     try:
         upsert_profile(
             {
@@ -325,7 +369,8 @@ def api_disconnect():
                 cancel_job(sid, job["id"])
             except Exception:
                 pass
-    STORE.pop(sid, None)
+    with _STORE_LOCK:
+        STORE.pop(sid, None)
     return jsonify({"ok": True, "connected": False, "connections": []})
 
 

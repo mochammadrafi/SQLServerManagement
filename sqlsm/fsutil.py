@@ -109,23 +109,47 @@ def ensure_writable_dir(path):
     return folder
 
 
+def folder_shortcuts():
+    # type: () -> list
+    home = os.path.expanduser("~")
+    candidates = [
+        ("Home", home),
+        ("Desktop", os.path.join(home, "Desktop")),
+        ("Documents", os.path.join(home, "Documents")),
+        ("Data app", default_data_folder()),
+    ]
+    if os.name == "nt":
+        for letter in string.ascii_uppercase:
+            root = letter + ":\\"
+            if os.path.isdir(root):
+                candidates.append(("Disk " + letter, root))
+    elif sys.platform == "darwin" and os.path.isdir("/Volumes"):
+        candidates.append(("Volumes", "/Volumes"))
+    items = []
+    seen = set()
+    for name, path in candidates:
+        path = os.path.abspath(os.path.expanduser(path))
+        if path in seen or not os.path.isdir(path):
+            continue
+        seen.add(path)
+        items.append({"name": name, "path": path, "kind": "shortcut"})
+    return items
+
+
 def list_folders(path):
     # type: (str) -> dict
     text = (path or "").strip()
     if os.name == "nt" and (not text or text == "\\"):
-        drives = []
-        for letter in string.ascii_uppercase:
-            root = letter + ":\\"
-            if os.path.isdir(root):
-                drives.append({"name": letter + ":", "path": root, "kind": "drive"})
-        return {"path": "", "parent": "", "entries": drives}
+        return {"path": "", "parent": "", "entries": folder_shortcuts()}
     if not text:
-        text = os.path.expanduser("~")
+        text = existing_start_dir("")
     folder = normalize_dir(text)
     if not os.path.isdir(folder):
         folder = existing_start_dir("")
     parent = os.path.dirname(folder.rstrip("\\/"))
     if os.name == "nt" and len(folder) <= 3 and folder[1:3] == ":\\":
+        parent = ""
+    if sys.platform != "win32" and folder == os.path.abspath("/"):
         parent = ""
     entries = []
     try:
@@ -133,7 +157,14 @@ def list_folders(path):
     except Exception as exc:
         raise ClientError("Tidak bisa membaca folder.", str(exc))
     for name in sorted(names, key=lambda item: item.lower()):
+        if name.startswith(".") and name not in (".", ".."):
+            continue
         full = os.path.join(folder, name)
         if os.path.isdir(full):
             entries.append({"name": name, "path": full, "kind": "dir"})
-    return {"path": folder, "parent": parent, "entries": entries}
+    return {
+        "path": folder,
+        "parent": parent,
+        "entries": entries,
+        "shortcuts": folder_shortcuts(),
+    }

@@ -32,14 +32,7 @@
   var btnOpenSql = document.getElementById("btn-open-sql");
 
   function api(url, options) {
-    return fetch(url, options).then(function (res) {
-      return res.json().then(function (data) {
-        if (res.status === 401 || (data && data.error && /Belum terhubung/i.test(data.error))) {
-          window.location.href = "/";
-        }
-        return data;
-      });
-    });
+    return window.SqlApi.request(url, options);
   }
 
   function setStatus(text, meta) {
@@ -433,7 +426,9 @@
     return api("/api/objects?database=" + encodeURIComponent(name)).then(function (data) {
       window.SqlLoading.hideIn(explorerBody);
       if (!data.ok) {
-        showError(data.error, data.hint);
+        explorerBody.innerHTML = '<p class="empty-inline">' +
+          escapeHtml(data.error || "Gagal memuat objek") +
+          (data.hint ? " — " + escapeHtml(data.hint) : "") + "</p>";
         throw new Error(data.error || "Gagal memuat objek");
       }
       state.catalog[name] = {
@@ -488,6 +483,7 @@
     });
     var html = '<div class="browse-page">';
     html += '<div class="page-hero"><div>';
+    html += '<p class="brand-kicker brand-kicker-ink">Katalog</p>';
     html += "<h3>Database</h3>";
     html += '<p class="browse-lead">Klik database untuk melihat tabel. Export atau backup bisa langsung dari kartu.</p>';
     html += "</div><div class=\"stat-pills\">";
@@ -584,6 +580,7 @@
     var viewCount = catalogObjects(name, "views").length;
     var html = '<div class="browse-page">';
     html += '<div class="page-hero"><div>';
+    html += '<p class="brand-kicker brand-kicker-ink">Database</p>';
     html += "<h3>" + escapeHtml(name) + "</h3>";
     html += '<p class="browse-lead">Klik tabel untuk melihat data. Export atau backup dari kartu dan toolbar.</p>';
     html += "</div><div class=\"stat-pills\">";

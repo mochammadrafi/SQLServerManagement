@@ -5,12 +5,15 @@
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SQL Server Management</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=9">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=12">
 </head>
 <body class="page-connect">
   <div class="connect-shell">
     <aside class="connect-aside">
-      <p class="brand-mark">SQL Server Management</p>
+      <p class="brand-kicker">SQL Server Management</p>
       <h1>Kelola SQL Server di Windows Server 2012</h1>
       <p class="lede">Alat awal untuk melihat database, tabel, dan menjalankan query tanpa SSMS yang berat.</p>
       <ol class="steps">
@@ -21,7 +24,8 @@
       <p class="aside-note">Jangan pakai Internet Explorer. Chrome 109 atau Firefox ESR cukup untuk Windows Server 2012.</p>
     </aside>
     <main class="connect-main">
-      <form id="connect-form" class="connect-card" autocomplete="off">
+      <form id="connect-form" class="connect-card corner-frame" autocomplete="off">
+        <p class="brand-kicker brand-kicker-ink">Koneksi</p>
         <h2>Hubungkan ke SQL Server</h2>
         <p class="card-sub">Profil tersimpan di komputer ini, di luar repo. Git pull tidak menghapusnya.</p>
         <div id="saved-profiles" class="saved-profiles" hidden></div>
@@ -95,13 +99,13 @@
   <div id="boot-overlay" class="boot-overlay">
     <div class="boot-panel">
       <div class="boot-spinner"></div>
-      <p class="boot-kicker">SQL Server Management</p>
+      <p class="brand-kicker">SQL Server Management</p>
       <h2 id="boot-title">Memeriksa lingkungan</h2>
       <p id="boot-text">Memeriksa driver ODBC, platform, dan kesiapan aplikasi.</p>
     </div>
   </div>
 
-  <script src="{{ url_for('static', filename='js/ui.js') }}?v=9"></script>
-  <script src="{{ url_for('static', filename='js/connect.js') }}?v=9"></script>
+  <script src="{{ url_for('static', filename='js/ui.js') }}?v=12"></script>
+  <script src="{{ url_for('static', filename='js/connect.js') }}?v=12"></script>
 </body>
 </html>

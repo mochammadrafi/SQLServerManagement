@@ -4,7 +4,10 @@ from __future__ import print_function
 import binascii
 import re
 import sys
-from datetime import date, datetime, time
+import threading
+import time
+from datetime import date, datetime
+from datetime import time as dt_time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
@@ -29,10 +32,11 @@ _IDENT = re.compile(r"^[\w.\- ]+$", re.UNICODE)
 
 
 class ClientError(Exception):
-    def __init__(self, message, hint=None):
-        # type: (str, Optional[str]) -> None
+    def __init__(self, message, hint=None, retryable=False):
+        # type: (str, Optional[str], bool) -> None
         super(ClientError, self).__init__(message)
         self.hint = hint
+        self.retryable = bool(retryable)
 
 
 @dataclass
@@ -46,7 +50,7 @@ class ConnectionConfig(object):
     database: str = "master"
     encrypt: bool = False
     login_timeout: int = 15
-    query_timeout: int = 60
+    query_timeout: int = 300
 
     def display_server(self):
         # type: () -> str
@@ -125,7 +129,7 @@ def json_safe(value):
         return value.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip("0").rstrip(".")
     if isinstance(value, date):
         return value.isoformat()
-    if isinstance(value, time):
+    if isinstance(value, dt_time):
         return value.isoformat()
     if isinstance(value, Decimal):
         return format(value, "f")
@@ -179,7 +183,7 @@ def csv_value(value):
         return value.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip("0").rstrip(".")
     if isinstance(value, date):
         return value.isoformat()
-    if isinstance(value, time):
+    if isinstance(value, dt_time):
         return value.isoformat()
     if isinstance(value, Decimal):
         return format(value, "f")
@@ -236,6 +240,37 @@ def pick_odbc_driver(drivers=None):
     return None
 
 
+_TRANSIENT = (
+    "busy with results",
+    "another command",
+    "communication link failure",
+    "physical connection is not usable",
+    "connection is not available",
+    "connection reset",
+    "broken pipe",
+    "08s01",
+    "08s02",
+    "10054",
+    "10053",
+    "tcp provider",
+    "server has gone away",
+    "not connected",
+    "connection is closed",
+    "connection broken",
+    "unable to reconnect",
+)
+
+
+def is_transient(exc):
+    # type: (Any) -> bool
+    if isinstance(exc, ClientError) and getattr(exc, "retryable", False):
+        return True
+    text = str(exc or "").lower()
+    if "login failed" in text or "login timeout" in text:
+        return False
+    return any(token in text for token in _TRANSIENT)
+
+
 def explain_error(exc):
     # type: (BaseException) -> Tuple[str, Optional[str]]
     text = str(exc).strip() or exc.__class__.__name__
@@ -270,6 +305,8 @@ def explain_error(exc):
         )
     elif "ssl" in lower or "certificate" in lower or "encrypt" in lower:
         hint = "Matikan opsi Enkripsi untuk SQL Server 2012, atau pasang sertifikat TLS di server."
+    elif is_transient(exc):
+        hint = "Sesi terputus atau masih sibuk. Aplikasi menyambung ulang otomatis; coba lagi jika masih gagal."
     elif "driver" in lower and "not found" in lower:
         hint = "Install ODBC Driver / SQL Server Native Client, atau pakai login SQL lewat pymssql."
     elif "adaptive server" in lower or "tds" in lower:
@@ -277,47 +314,75 @@ def explain_error(exc):
     return text, hint
 
 
+class _LiveConn(object):
+    def __init__(self, raw, backend, driver_name):
+        self.raw = raw
+        self.backend = backend
+        self.driver_name = driver_name
+        self.busy = False
+
+
 class SqlServerClient(object):
+    _POOL_MAX = 2
+    _CHECKOUT_SEC = 45
+
     def __init__(self, cfg):
         # type: (ConnectionConfig) -> None
         self.cfg = cfg
-        self._conn = None
+        self._lock = threading.RLock()
+        self._cv = threading.Condition(self._lock)
+        self._pool = []  # type: List[_LiveConn]
         self.backend = ""
         self.driver_name = ""
 
     def connect(self):
         # type: () -> None
+        with self._lock:
+            if any(item.raw is not None for item in self._pool):
+                return
+            live = self._open_live()
+            self._pool.append(live)
+            self.backend = live.backend
+            self.driver_name = live.driver_name
+
+    def close(self):
+        # type: () -> None
+        with self._lock:
+            items = list(self._pool)
+            self._pool = []
+            self._cv.notify_all()
+        for item in items:
+            try:
+                if item.raw is not None:
+                    item.raw.close()
+            except Exception:
+                pass
+            item.raw = None
+
+    def is_open(self):
+        with self._lock:
+            return any(item.raw is not None for item in self._pool)
+
+    def _open_live(self):
+        # type: () -> _LiveConn
         if self.cfg.auth == "windows":
             if sys.platform != "win32":
                 raise ClientError(
                     "Windows Authentication hanya tersedia di Windows.",
                     "Dari macOS/Linux pakai SQL Server Authentication (user SQL).",
                 )
-            self._connect_pyodbc()
-            return
+            return self._open_pyodbc()
         if sys.platform == "win32" and list_odbc_drivers():
             try:
-                self._connect_pyodbc()
-                return
+                return self._open_pyodbc()
             except ClientError:
                 raise
             except Exception:
-                self._connect_pymssql()
-                return
-        self._connect_pymssql()
+                return self._open_pymssql()
+        return self._open_pymssql()
 
-    def close(self):
-        # type: () -> None
-        conn = self._conn
-        self._conn = None
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _connect_pyodbc(self):
-        # type: () -> None
+    def _open_pyodbc(self):
+        # type: () -> _LiveConn
         try:
             import pyodbc  # type: ignore
         except Exception:
@@ -337,6 +402,7 @@ class SqlServerClient(object):
             "SERVER=%s" % server_address(self.cfg),
             "DATABASE=%s" % (self.cfg.database or "master"),
             "Connection Timeout=%s" % int(self.cfg.login_timeout),
+            "APP=SQLSM",
         ]
         if self.cfg.auth == "windows":
             parts.append("Trusted_Connection=yes")
@@ -347,6 +413,7 @@ class SqlServerClient(object):
             parts.append("PWD=%s" % (self.cfg.password or ""))
         modern_driver = driver.startswith("ODBC Driver") or "Native Client" in driver
         if modern_driver:
+            parts.append("MARS_Connection=yes")
             if self.cfg.encrypt:
                 parts.append("Encrypt=yes")
                 parts.append("TrustServerCertificate=yes")
@@ -354,14 +421,13 @@ class SqlServerClient(object):
                 parts.append("Encrypt=no")
         conn_str = ";".join(parts) + ";"
         try:
-            self._conn = pyodbc.connect(conn_str, autocommit=True)
+            raw = pyodbc.connect(conn_str, autocommit=True)
         except Exception as exc:
             message, hint = explain_error(exc)
-            raise ClientError(message, hint)
+            raise ClientError(message, hint, retryable=is_transient(exc))
         timeout = int(getattr(self.cfg, "query_timeout", 300) or 0)
-        self._conn.timeout = timeout
-        self.backend = "pyodbc"
-        self.driver_name = driver
+        raw.timeout = timeout
+        return _LiveConn(raw, "pyodbc", driver)
 
     def placeholder(self):
         # type: () -> str
@@ -373,8 +439,8 @@ class SqlServerClient(object):
             return sql.replace("%", "%%")
         return sql
 
-    def _connect_pymssql(self):
-        # type: () -> None
+    def _open_pymssql(self):
+        # type: () -> _LiveConn
         try:
             import pymssql  # type: ignore
         except Exception:
@@ -396,29 +462,113 @@ class SqlServerClient(object):
             "login_timeout": int(self.cfg.login_timeout),
             "timeout": int(getattr(self.cfg, "query_timeout", 300) or 0),
             "charset": "UTF-8",
+            "appname": "SQLSM",
         }
         try:
-            self._conn = pymssql.connect(**kwargs)
-            self._conn.autocommit(True)
+            raw = pymssql.connect(**kwargs)
+            raw.autocommit(True)
         except TypeError:
-            # Older pymssql builds may not accept charset/login_timeout together.
             kwargs.pop("charset", None)
+            kwargs.pop("appname", None)
             try:
-                self._conn = pymssql.connect(**kwargs)
-                self._conn.autocommit(True)
+                raw = pymssql.connect(**kwargs)
+                raw.autocommit(True)
             except Exception as exc:
                 message, hint = explain_error(exc)
-                raise ClientError(message, hint)
+                raise ClientError(message, hint, retryable=is_transient(exc))
         except Exception as exc:
             message, hint = explain_error(exc)
-            raise ClientError(message, hint)
-        self.backend = "pymssql"
-        self.driver_name = "pymssql/FreeTDS"
+            raise ClientError(message, hint, retryable=is_transient(exc))
+        return _LiveConn(raw, "pymssql", "pymssql/FreeTDS")
 
-    def _cursor(self):
-        if self._conn is None:
+    def _checkout(self):
+        # type: () -> _LiveConn
+        deadline = time.time() + self._CHECKOUT_SEC
+        with self._cv:
+            while True:
+                for item in self._pool:
+                    if item.raw is not None and not item.busy:
+                        item.busy = True
+                        return item
+                if len(self._pool) < self._POOL_MAX:
+                    item = self._open_live()
+                    item.busy = True
+                    self._pool.append(item)
+                    self.backend = item.backend or self.backend
+                    self.driver_name = item.driver_name or self.driver_name
+                    return item
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise ClientError(
+                        "Sesi SQL Server sedang dipakai perintah lain.",
+                        "Tunggu query/export selesai, lalu coba lagi.",
+                        retryable=True,
+                    )
+                self._cv.wait(min(1.0, remaining))
+
+    def _checkin(self, item, discard=False):
+        with self._cv:
+            if discard or item.raw is None:
+                try:
+                    if item.raw is not None:
+                        item.raw.close()
+                except Exception:
+                    pass
+                item.raw = None
+                if item in self._pool:
+                    self._pool.remove(item)
+            else:
+                item.busy = False
+            self._cv.notify()
+
+    def _cursor(self, raw):
+        if raw is None:
             raise ClientError("Belum terhubung ke SQL Server.")
-        return self._conn.cursor()
+        return raw.cursor()
+
+    def _raise_sql(self, exc):
+        if isinstance(exc, ClientError):
+            if not getattr(exc, "retryable", False) and is_transient(exc):
+                exc.retryable = True
+            raise exc
+        message, hint = explain_error(exc)
+        raise ClientError(message, hint, retryable=is_transient(exc))
+
+    def _cancel_cursor(self, cursor):
+        try:
+            cursor.cancel()
+        except Exception:
+            pass
+
+    def _finish_cursor(self, cursor, cancel=False):
+        if cancel:
+            self._cancel_cursor(cursor)
+            return
+        try:
+            while True:
+                if getattr(cursor, "description", None):
+                    while cursor.fetchmany(500):
+                        pass
+                if not self._nextset(cursor):
+                    break
+        except Exception:
+            self._cancel_cursor(cursor)
+
+    def _close_cursor(self, cursor, cancel=False):
+        try:
+            self._finish_cursor(cursor, cancel=cancel)
+        except Exception:
+            pass
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
+    def _use_database(self, cursor, database):
+        if not database:
+            return
+        cursor.execute("USE " + qident(database))
+        self._finish_cursor(cursor)
 
     def execute(self, sql, params=None, max_rows=1000, database=None):
         # type: (str, Optional[Any], int, Optional[str]) -> Dict[str, Any]
@@ -427,12 +577,29 @@ class SqlServerClient(object):
             raise ClientError("SQL kosong.")
         if max_rows < 1:
             max_rows = 1
-        if max_rows > 10000:
-            max_rows = 10000
-        cursor = self._cursor()
+        if max_rows > 100000:
+            max_rows = 100000
+        last = None  # type: Optional[BaseException]
+        for attempt in (0, 1):
+            item = self._checkout()
+            discard = False
+            try:
+                return self._execute_body(item.raw, sql, params=params, max_rows=max_rows, database=database)
+            except Exception as exc:
+                last = exc
+                discard = is_transient(exc)
+                if attempt == 0 and discard:
+                    continue
+                self._raise_sql(exc)
+            finally:
+                self._checkin(item, discard=discard)
+        self._raise_sql(last or ClientError("Gagal menjalankan SQL."))
+
+    def _execute_body(self, raw, sql, params=None, max_rows=1000, database=None):
+        cursor = self._cursor(raw)
+        cancel_leftover = False
         try:
-            if database:
-                cursor.execute("USE " + qident(database))
+            self._use_database(cursor, database)
             batches = split_batches(sql)
             result_sets = []  # type: List[Dict[str, Any]]
             messages = []  # type: List[str]
@@ -448,17 +615,20 @@ class SqlServerClient(object):
                         truncated = False
                         count = 0
                         while count < max_rows:
-                            batch = cursor.fetchmany(min(500, max_rows - count))
-                            if not batch:
+                            fetched = cursor.fetchmany(min(500, max_rows - count))
+                            if not fetched:
                                 break
-                            for raw in batch:
-                                rows.append([json_safe(value) for value in raw])
+                            for raw_row in fetched:
+                                rows.append([json_safe(value) for value in raw_row])
                                 count += 1
                                 if count >= max_rows:
                                     extra = cursor.fetchmany(1)
                                     if extra:
                                         truncated = True
                                     break
+                        if truncated:
+                            cancel_leftover = True
+                            self._cancel_cursor(cursor)
                         result_sets.append(
                             {
                                 "columns": columns,
@@ -467,6 +637,8 @@ class SqlServerClient(object):
                                 "truncated": truncated,
                             }
                         )
+                        if truncated:
+                            break
                     else:
                         affected = cursor.rowcount
                         if affected is not None and affected >= 0:
@@ -483,13 +655,9 @@ class SqlServerClient(object):
         except ClientError:
             raise
         except Exception as exc:
-            message, hint = explain_error(exc)
-            raise ClientError(message, hint)
+            self._raise_sql(exc)
         finally:
-            try:
-                cursor.close()
-            except Exception:
-                pass
+            self._close_cursor(cursor, cancel=cancel_leftover)
 
     def _nextset(self, cursor):
         try:
@@ -531,24 +699,85 @@ FROM sys.databases AS d
 ORDER BY d.name
 """
         rows = self._as_dicts(self.execute(sql, max_rows=5000))
+        sizes = self._database_sizes()
+        for row in rows:
+            key = self._as_int(row.get("database_id"))
+            name = row.get("name")
+            row["size_mb"] = sizes.get(key)
+            if row["size_mb"] is None and name is not None:
+                row["size_mb"] = sizes.get(str(name).lower())
+        return rows
+
+    def _database_sizes(self):
+        # type: () -> Dict[Any, Any]
         sizes = {}  # type: Dict[Any, Any]
         try:
             size_sql = """
-SELECT database_id, CAST(SUM(size) * 8.0 / 1024 AS decimal(18, 2)) AS size_mb
-FROM sys.master_files
-GROUP BY database_id
+SELECT
+    d.database_id,
+    d.name,
+    CAST(SUM(CAST(mf.size AS bigint)) * 8.0 / 1024 AS decimal(18, 2)) AS size_mb
+FROM sys.databases AS d
+LEFT JOIN sys.master_files AS mf ON mf.database_id = d.database_id
+GROUP BY d.database_id, d.name
 """
             for item in self._as_dicts(self.execute(size_sql, max_rows=5000)):
-                sizes[item.get("database_id")] = item.get("size_mb")
+                key = self._as_int(item.get("database_id"))
+                mb = self._parse_size_mb(item.get("size_mb"))
+                name = item.get("name")
+                if mb is None:
+                    continue
+                if key is not None:
+                    sizes[key] = mb
+                if name is not None:
+                    sizes[str(name).lower()] = mb
         except Exception:
             sizes = {}
-        for row in rows:
-            row["size_mb"] = sizes.get(row.get("database_id"))
-        return rows
+        if sizes:
+            return sizes
+        try:
+            for item in self._as_dicts(self.execute("EXEC sp_helpdb", max_rows=5000)):
+                name = item.get("name")
+                raw = item.get("db_size")
+                if raw is None:
+                    raw = item.get("size_mb")
+                mb = self._parse_size_mb(raw)
+                if name is not None and mb is not None:
+                    sizes[str(name).lower()] = mb
+        except Exception:
+            pass
+        return sizes
+
+    def _parse_size_mb(self, raw):
+        if raw is None or raw == "":
+            return None
+        text = str(raw).strip().replace(",", "")
+        try:
+            if text.lower().endswith("mb"):
+                return float(text[:-2].strip())
+            if text.lower().endswith("gb"):
+                return float(text[:-2].strip()) * 1024
+            if text.lower().endswith("kb"):
+                return float(text[:-2].strip()) / 1024
+            return float(text)
+        except (TypeError, ValueError):
+            return None
+
+    def _as_int(self, value):
+        try:
+            if value is None or value == "":
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
 
     def list_objects(self, database):
         # type: (str) -> Dict[str, Any]
         self._assert_db(database)
+        db = qident(database)
         schema_sql = """
 SELECT
     s.name AS schema_name,
@@ -560,12 +789,12 @@ SELECT
             'db_denydatareader', 'db_denydatawriter'
         ) THEN 1 ELSE 0
                     END AS is_system
-FROM sys.schemas AS s
+FROM {0}.sys.schemas AS s
 ORDER BY s.name
-"""
+""".format(db)
         object_sql = """
 SELECT
-    SCHEMA_NAME(o.schema_id) AS schema_name,
+    s.name AS schema_name,
     o.name AS object_name,
     CASE
         WHEN o.type = 'U' THEN 'table'
@@ -574,12 +803,17 @@ SELECT
         ELSE 'function'
     END AS object_type,
     CAST(CASE WHEN o.is_ms_shipped = 1 THEN 1 ELSE 0 END AS int) AS is_system
-FROM sys.objects AS o
+FROM {0}.sys.objects AS o
+JOIN {0}.sys.schemas AS s ON s.schema_id = o.schema_id
 WHERE o.type IN ('U', 'V', 'P', 'FN', 'IF', 'TF')
 ORDER BY 1, 3, 2
-"""
-        schemas = self._as_dicts(self.execute(schema_sql, max_rows=5000, database=database))
-        data = self.execute(object_sql, max_rows=50000, database=database)
+""".format(db)
+        schemas = []
+        try:
+            schemas = self._as_dicts(self.execute(schema_sql, max_rows=5000))
+        except Exception:
+            schemas = []
+        data = self.execute(object_sql, max_rows=50000)
         grouped = {"tables": [], "views": [], "procedures": [], "functions": []}
         key_map = {
             "table": "tables",
@@ -604,7 +838,7 @@ ORDER BY 1, 3, 2
                 {
                     "schema": schema,
                     "name": name,
-                    "row_count": counts.get((schema, name)),
+                    "row_count": counts.get((str(schema), str(name))) if schema is not None and name is not None else None,
                     "is_system": bool(item.get("is_system")),
                 }
             )
@@ -624,27 +858,51 @@ ORDER BY 1, 3, 2
     def table_row_counts(self, database):
         # type: (str) -> Dict[Tuple[str, str], int]
         self._assert_db(database)
-        sql = """
+        db = qident(database)
+        queries = [
+            """
+SELECT
+    s.name AS schema_name,
+    o.name AS object_name,
+    SUM(CAST(p.rows AS bigint)) AS row_count
+FROM {0}.sys.partitions AS p
+JOIN {0}.sys.objects AS o ON o.object_id = p.object_id
+JOIN {0}.sys.schemas AS s ON s.schema_id = o.schema_id
+WHERE p.index_id IN (0, 1) AND o.type = N'U'
+GROUP BY s.name, o.name
+""".format(db),
+            """
 SELECT
     s.name AS schema_name,
     o.name AS object_name,
     SUM(CAST(p.row_count AS bigint)) AS row_count
-FROM sys.dm_db_partition_stats AS p
-JOIN sys.objects AS o ON o.object_id = p.object_id
-JOIN sys.schemas AS s ON s.schema_id = o.schema_id
-WHERE p.index_id IN (0, 1) AND o.type = 'U'
+FROM {0}.sys.dm_db_partition_stats AS p
+JOIN {0}.sys.objects AS o ON o.object_id = p.object_id
+JOIN {0}.sys.schemas AS s ON s.schema_id = o.schema_id
+WHERE p.index_id IN (0, 1) AND o.type = N'U'
 GROUP BY s.name, o.name
-"""
-        data = self.execute(sql, max_rows=10000, database=database)
-        result = {}  # type: Dict[Tuple[str, str], int]
-        for item in self._as_dicts(data):
-            key = (item.get("schema_name"), item.get("object_name"))
-            value = item.get("row_count")
+""".format(db),
+        ]
+        last_error = None
+        for sql in queries:
             try:
-                result[key] = int(value) if value is not None else 0
-            except (TypeError, ValueError):
-                result[key] = 0
-        return result
+                data = self.execute(sql, max_rows=100000)
+                result = {}  # type: Dict[Tuple[str, str], int]
+                for item in self._as_dicts(data):
+                    schema = item.get("schema_name")
+                    name = item.get("object_name")
+                    if schema is None or name is None:
+                        continue
+                    value = self._as_int(item.get("row_count"))
+                    result[(str(schema), str(name))] = 0 if value is None else value
+                if result:
+                    return result
+            except Exception as exc:
+                last_error = exc
+                continue
+        if last_error:
+            raise last_error
+        return {}
 
     def list_columns(self, database, schema, table):
         # type: (str, str, str) -> List[Dict[str, Any]]
@@ -660,11 +918,11 @@ SELECT
     c.NUMERIC_SCALE AS numeric_scale,
     c.IS_NULLABLE AS is_nullable,
     c.COLUMN_DEFAULT AS column_default
-FROM INFORMATION_SCHEMA.COLUMNS AS c
-WHERE c.TABLE_SCHEMA = {0} AND c.TABLE_NAME = {0}
+FROM {0}.INFORMATION_SCHEMA.COLUMNS AS c
+WHERE c.TABLE_SCHEMA = {1} AND c.TABLE_NAME = {1}
 ORDER BY c.ORDINAL_POSITION
-""".format(ph)
-        data = self.execute(sql, params=(schema, table), max_rows=2000, database=database)
+""".format(qident(database), ph)
+        data = self.execute(sql, params=(schema, table), max_rows=2000)
         return self._as_dicts(data)
 
     def list_sessions(self):
@@ -708,21 +966,34 @@ ORDER BY s.session_id
         self._assert_db(database)
         keys = self.key_columns(database, schema, table)
         ph = self.placeholder()
-        sql = """
+        db = qident(database)
+        queries = [
+            """
+SELECT SUM(CAST(p.rows AS bigint)) AS row_count
+FROM {0}.sys.partitions AS p
+JOIN {0}.sys.objects AS o ON o.object_id = p.object_id
+JOIN {0}.sys.schemas AS s ON s.schema_id = o.schema_id
+WHERE s.name = {1} AND o.name = {1} AND p.index_id IN (0, 1)
+""".format(db, ph),
+            """
 SELECT SUM(CAST(p.row_count AS bigint)) AS row_count
-FROM sys.dm_db_partition_stats AS p
-JOIN sys.objects AS o ON o.object_id = p.object_id
-JOIN sys.schemas AS s ON s.schema_id = o.schema_id
-WHERE s.name = {0} AND o.name = {0} AND p.index_id IN (0, 1)
-""".format(ph)
+FROM {0}.sys.dm_db_partition_stats AS p
+JOIN {0}.sys.objects AS o ON o.object_id = p.object_id
+JOIN {0}.sys.schemas AS s ON s.schema_id = o.schema_id
+WHERE s.name = {1} AND o.name = {1} AND p.index_id IN (0, 1)
+""".format(db, ph),
+        ]
         row_count = None
-        try:
-            data = self.execute(sql, params=(schema, table), max_rows=1, database=database)
-            first = self._as_dicts(data)
-            if first and first[0].get("row_count") is not None:
-                row_count = int(first[0]["row_count"])
-        except Exception:
-            row_count = None
+        for sql in queries:
+            try:
+                data = self.execute(sql, params=(schema, table), max_rows=1)
+                first = self._as_dicts(data)
+                if first and first[0].get("row_count") is not None:
+                    row_count = self._as_int(first[0]["row_count"])
+                    if row_count is not None:
+                        break
+            except Exception:
+                continue
         return {
             "database": database,
             "schema": schema,
@@ -736,59 +1007,59 @@ WHERE s.name = {0} AND o.name = {0} AND p.index_id IN (0, 1)
         # type: (str, str, str) -> List[str]
         self._assert_db(database)
         ph = self.placeholder()
+        db = qident(database)
         sql = """
 SELECT TOP 1
     i.index_id,
     i.is_primary_key,
     i.type AS index_type
-FROM sys.indexes AS i
-JOIN sys.objects AS o ON o.object_id = i.object_id
-JOIN sys.schemas AS s ON s.schema_id = o.schema_id
-WHERE s.name = {0} AND o.name = {0}
+FROM {0}.sys.indexes AS i
+JOIN {0}.sys.objects AS o ON o.object_id = i.object_id
+JOIN {0}.sys.schemas AS s ON s.schema_id = o.schema_id
+WHERE s.name = {1} AND o.name = {1}
   AND i.is_hypothetical = 0
   AND (
         i.is_primary_key = 1
         OR i.type = 1
         OR EXISTS (
-            SELECT 1 FROM sys.columns AS c
+            SELECT 1 FROM {0}.sys.columns AS c
             WHERE c.object_id = i.object_id AND c.is_identity = 1
         )
       )
 ORDER BY i.is_primary_key DESC, CASE WHEN i.type = 1 THEN 0 ELSE 1 END, i.index_id
-""".format(ph)
-        chosen = self.execute(sql, params=(schema, table), max_rows=1, database=database)
+""".format(db, ph)
+        chosen = self.execute(sql, params=(schema, table), max_rows=1)
         rows = self._as_dicts(chosen)
         if rows:
             col_sql = """
 SELECT c.name AS name, ic.key_ordinal
-FROM sys.indexes AS i
-JOIN sys.index_columns AS ic
+FROM {0}.sys.indexes AS i
+JOIN {0}.sys.index_columns AS ic
     ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-JOIN sys.columns AS c
+JOIN {0}.sys.columns AS c
     ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-JOIN sys.objects AS o ON o.object_id = i.object_id
-JOIN sys.schemas AS s ON s.schema_id = o.schema_id
-WHERE s.name = {0} AND o.name = {0} AND i.index_id = {0}
+JOIN {0}.sys.objects AS o ON o.object_id = i.object_id
+JOIN {0}.sys.schemas AS s ON s.schema_id = o.schema_id
+WHERE s.name = {1} AND o.name = {1} AND i.index_id = {1}
   AND ic.is_included_column = 0
 ORDER BY ic.key_ordinal
-""".format(ph)
+""".format(db, ph)
             data = self.execute(
                 col_sql,
                 params=(schema, table, rows[0].get("index_id")),
                 max_rows=32,
-                database=database,
             )
             names = [item.get("name") for item in self._as_dicts(data) if item.get("name")]
             if names:
                 return names
         ident_sql = """
 SELECT c.name AS name
-FROM sys.columns AS c
-JOIN sys.objects AS o ON o.object_id = c.object_id
-JOIN sys.schemas AS s ON s.schema_id = o.schema_id
-WHERE s.name = {0} AND o.name = {0} AND c.is_identity = 1
-""".format(ph)
-        ident = self.execute(ident_sql, params=(schema, table), max_rows=1, database=database)
+FROM {0}.sys.columns AS c
+JOIN {0}.sys.objects AS o ON o.object_id = c.object_id
+JOIN {0}.sys.schemas AS s ON s.schema_id = o.schema_id
+WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
+""".format(db, ph)
+        ident = self.execute(ident_sql, params=(schema, table), max_rows=1)
         ident_rows = self._as_dicts(ident)
         if ident_rows and ident_rows[0].get("name"):
             return [ident_rows[0]["name"]]
@@ -823,14 +1094,14 @@ WHERE s.name = {0} AND o.name = {0} AND c.is_identity = 1
             params.extend(clause_params)
             sql = "SELECT TOP %s * FROM %s%s ORDER BY %s" % (
                 page_size,
-                qname(schema, table),
+                qname(database, schema, table),
                 where_sql,
                 ", ".join(qident(key) for key in keys),
             )
         elif keys:
             sql = "SELECT TOP %s * FROM %s ORDER BY %s" % (
                 page_size,
-                qname(schema, table),
+                qname(database, schema, table),
                 ", ".join(qident(key) for key in keys),
             )
         else:
@@ -842,11 +1113,11 @@ WHERE s.name = {0} AND o.name = {0} AND c.is_identity = 1
                     "OFFSET besar pada 100 juta baris akan sangat lambat.",
                 )
             sql = "SELECT * FROM %s ORDER BY (SELECT NULL) OFFSET %s ROWS FETCH NEXT %s ROWS ONLY" % (
-                qname(schema, table),
+                qname(database, schema, table),
                 offset,
                 page_size,
             )
-        data = self.execute(sql, params=params or None, max_rows=page_size, database=database)
+        data = self.execute(sql, params=params or None, max_rows=page_size)
         first = data["result_sets"][0] if data.get("result_sets") else {"columns": [], "rows": []}
         columns = first.get("columns") or []
         rows = first.get("rows") or []
@@ -874,7 +1145,7 @@ WHERE s.name = {0} AND o.name = {0} AND c.is_identity = 1
         if not columns:
             raise ClientError("Pilih minimal satu kolom untuk export.")
         where_sql = validate_where(where)
-        table_sql = qname(schema, table)
+        table_sql = qname(database, schema, table)
         if nolock:
             table_sql += " WITH (NOLOCK)"
         sql = "SELECT %s FROM %s" % (", ".join(qident(col) for col in columns), table_sql)
@@ -882,10 +1153,10 @@ WHERE s.name = {0} AND o.name = {0} AND c.is_identity = 1
             sql += " WHERE (%s)" % where_sql
         if order_keys:
             sql += " ORDER BY " + ", ".join(qident(key) for key in order_keys)
-        cursor = self._cursor()
+        item = self._checkout()
+        discard = False
+        cursor = self._cursor(item.raw)
         try:
-            if database:
-                cursor.execute("USE " + qident(database))
             cursor.execute(self._raw_sql(sql))
             if not cursor.description:
                 return
@@ -894,16 +1165,14 @@ WHERE s.name = {0} AND o.name = {0} AND c.is_identity = 1
                 if not raw_rows:
                     break
                 yield raw_rows
-        except ClientError:
-            raise
         except Exception as exc:
-            message, hint = explain_error(exc)
-            raise ClientError(message, hint)
+            discard = is_transient(exc)
+            if isinstance(exc, ClientError):
+                raise
+            self._raise_sql(exc)
         finally:
-            try:
-                cursor.close()
-            except Exception:
-                pass
+            self._close_cursor(cursor)
+            self._checkin(item, discard=discard)
 
     def select_script(self, schema, table, page_size=200, keys=None):
         # type: (str, str, int, Optional[List[str]]) -> str
@@ -925,7 +1194,7 @@ WHERE s.name = {0} AND o.name = {0} AND c.is_identity = 1
         if not data.get("result_sets"):
             return []
         first = data["result_sets"][0]
-        columns = first["columns"]
+        columns = [str(name).lower() if name is not None else "" for name in first["columns"]]
         rows = []
         for row in first["rows"]:
             item = {}
