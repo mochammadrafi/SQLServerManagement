@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=18">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=19">
   <style>
     body.is-booting .app-header,
     body.is-booting .workspace,
@@ -152,7 +152,7 @@
         <h4>Tabel besar (100 juta+ baris)</h4>
         <p>Aplikasi tidak pernah memuat seluruh tabel. Yang tampil hanya satu halaman (100–1000 baris). Jumlah baris diambil dari statistik partisi, bukan <code>COUNT(*)</code>.</p>
         <h4>Export / backup</h4>
-        <p>Dari kartu database: Backup (.bak) atau Export semua tabel (CSV). Dari kartu tabel: Export tabel itu saja. <strong>Pilih folder...</strong> membuka pemilih folder di dalam aplikasi. File .bak harus ke folder yang bisa ditulis akun SQL Server.</p>
+        <p>Dari kartu database: Backup (.bak) atau Export semua tabel (CSV). Dari kartu tabel: Export tabel itu saja. Daftar tabel bisa diurutkan nama / baris / ukuran. Export database memakai beberapa worker (default 3) supaya beberapa tabel jalan bersamaan. Progress, jeda, dan batal ada di <strong>Export</strong> di header. File .bak harus ke folder yang bisa ditulis akun SQL Server.</p>
         <h4>SQL</h4>
         <p>Mode SQL untuk query ad-hoc. Jangan <code>SELECT *</code> tanpa <code>TOP</code> pada tabel besar. Hasil dipotong 1000 baris. F5 / Ctrl+Enter menjalankan SQL.</p>
         <h4>Hati-hati</h4>
@@ -235,8 +235,16 @@
         <div class="export-actions">
           <button type="button" class="btn-tiny" id="db-export-all">Pilih semua</button>
           <button type="button" class="btn-tiny" id="db-export-none">Kosongkan</button>
+          <label class="field field-compact">
+            <span>Urutkan</span>
+            <select id="db-export-sort">
+              <option value="name" selected>Nama</option>
+              <option value="rows">Jumlah baris</option>
+              <option value="size">Ukuran</option>
+            </select>
+          </label>
         </div>
-        <div id="db-export-tables" class="export-columns"></div>
+        <div id="db-export-tables" class="export-columns export-table-list"></div>
         <label class="choice tight"><input id="db-export-views" type="checkbox"> <span>Sertakan view</span></label>
         <label class="field">
           <span>Folder tujuan</span>
@@ -274,6 +282,17 @@
             <option value="500000">500.000 baris</option>
             <option value="1000000" selected>1.000.000 baris</option>
             <option value="2000000">2.000.000 baris</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Worker paralel</span>
+          <select id="db-export-workers">
+            <option value="1">1 thread</option>
+            <option value="2">2 threads</option>
+            <option value="3" selected>3 threads</option>
+            <option value="4">4 threads</option>
+            <option value="6">6 threads</option>
+            <option value="8">8 threads</option>
           </select>
         </label>
         <label class="choice tight"><input id="db-export-gzip" type="checkbox" checked> <span>Kompres gzip (.csv.gz)</span></label>
@@ -347,9 +366,9 @@
     </div>
   </div>
 
-  <script src="{{ url_for('static', filename='js/ui.js') }}?v=18"></script>
-  <script src="{{ url_for('static', filename='js/grid.js') }}?v=18"></script>
-  <script src="{{ url_for('static', filename='js/export.js') }}?v=18"></script>
-  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=18"></script>
+  <script src="{{ url_for('static', filename='js/ui.js') }}?v=19"></script>
+  <script src="{{ url_for('static', filename='js/grid.js') }}?v=19"></script>
+  <script src="{{ url_for('static', filename='js/export.js') }}?v=19"></script>
+  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=19"></script>
 </body>
 </html>

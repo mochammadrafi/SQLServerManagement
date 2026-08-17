@@ -930,12 +930,12 @@ ORDER BY 1, 3, 2
             "procedure": "procedures",
             "function": "functions",
         }
-        counts = {}  # type: Dict[Tuple[str, str], Any]
+        metrics = {}  # type: Dict[Tuple[str, str], Dict[str, Any]]
         if include_counts:
             try:
-                counts = self.table_row_counts(database)
+                metrics = self.table_metrics(database)
             except Exception:
-                counts = {}
+                metrics = {}
         seen_schema = set()
         for item in self._as_dicts(data):
             bucket = key_map.get(item.get("object_type") or "")
@@ -944,11 +944,13 @@ ORDER BY 1, 3, 2
             schema = item.get("schema_name")
             name = item.get("object_name")
             seen_schema.add(schema)
+            stat = metrics.get((str(schema), str(name))) if schema is not None and name is not None else None
             grouped[bucket].append(
                 {
                     "schema": schema,
                     "name": name,
-                    "row_count": counts.get((str(schema), str(name))) if schema is not None and name is not None else None,
+                    "row_count": (stat or {}).get("row_count"),
+                    "size_kb": (stat or {}).get("size_kb"),
                     "is_system": bool(item.get("is_system")),
                 }
             )
@@ -967,6 +969,15 @@ ORDER BY 1, 3, 2
 
     def table_row_counts(self, database):
         # type: (str) -> Dict[Tuple[str, str], int]
+        metrics = self.table_metrics(database)
+        result = {}  # type: Dict[Tuple[str, str], int]
+        for key, item in metrics.items():
+            value = item.get("row_count")
+            result[key] = 0 if value is None else int(value)
+        return result
+
+    def table_metrics(self, database):
+        # type: (str) -> Dict[Tuple[str, str], Dict[str, Any]]
         self._assert_db(database)
         db = qident(database)
         queries = [
@@ -974,19 +985,34 @@ ORDER BY 1, 3, 2
 SELECT
     s.name AS schema_name,
     o.name AS object_name,
-    SUM(CAST(p.rows AS bigint)) AS row_count
+    SUM(CASE WHEN p.index_id IN (0, 1) AND a.type = 1 THEN CAST(p.rows AS bigint) ELSE 0 END) AS row_count,
+    SUM(CAST(a.used_pages AS bigint)) * 8 AS size_kb
 FROM {0}.sys.partitions AS p
+JOIN {0}.sys.allocation_units AS a ON a.container_id = p.partition_id
 JOIN {0}.sys.objects AS o ON o.object_id = p.object_id
 JOIN {0}.sys.schemas AS s ON s.schema_id = o.schema_id
-WHERE p.index_id IN (0, 1) AND o.type = N'U'
+WHERE o.type = N'U'
 GROUP BY s.name, o.name
 """.format(db),
             """
 SELECT
     s.name AS schema_name,
     o.name AS object_name,
-    SUM(CAST(p.row_count AS bigint)) AS row_count
+    SUM(CASE WHEN p.index_id IN (0, 1) THEN CAST(p.row_count AS bigint) ELSE 0 END) AS row_count,
+    SUM(CAST(p.used_page_count AS bigint)) * 8 AS size_kb
 FROM {0}.sys.dm_db_partition_stats AS p
+JOIN {0}.sys.objects AS o ON o.object_id = p.object_id
+JOIN {0}.sys.schemas AS s ON s.schema_id = o.schema_id
+WHERE o.type = N'U'
+GROUP BY s.name, o.name
+""".format(db),
+            """
+SELECT
+    s.name AS schema_name,
+    o.name AS object_name,
+    SUM(CAST(p.rows AS bigint)) AS row_count,
+    CAST(NULL AS bigint) AS size_kb
+FROM {0}.sys.partitions AS p
 JOIN {0}.sys.objects AS o ON o.object_id = p.object_id
 JOIN {0}.sys.schemas AS s ON s.schema_id = o.schema_id
 WHERE p.index_id IN (0, 1) AND o.type = N'U'
@@ -997,14 +1023,18 @@ GROUP BY s.name, o.name
         for sql in queries:
             try:
                 data = self.execute(sql, max_rows=100000)
-                result = {}  # type: Dict[Tuple[str, str], int]
+                result = {}  # type: Dict[Tuple[str, str], Dict[str, Any]]
                 for item in self._as_dicts(data):
                     schema = item.get("schema_name")
                     name = item.get("object_name")
                     if schema is None or name is None:
                         continue
-                    value = self._as_int(item.get("row_count"))
-                    result[(str(schema), str(name))] = 0 if value is None else value
+                    rows = self._as_int(item.get("row_count"))
+                    size_kb = self._as_int(item.get("size_kb"))
+                    result[(str(schema), str(name))] = {
+                        "row_count": 0 if rows is None else rows,
+                        "size_kb": size_kb,
+                    }
                 if result:
                     return result
             except Exception as exc:

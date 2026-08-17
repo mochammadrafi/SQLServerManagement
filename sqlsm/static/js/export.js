@@ -4,6 +4,7 @@
   var folderTarget = null;
   var folderPath = "";
   var defaultFolder = "";
+  var dbExportSort = "name";
 
   function $(id) {
     return document.getElementById(id);
@@ -24,6 +25,57 @@
     if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
     if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
     return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+  }
+
+  function formatSizeKb(kb) {
+    if (kb == null || kb === "") return "";
+    return formatBytes(Number(kb) * 1024);
+  }
+
+  function isActiveJob(job) {
+    return job.status === "running" || job.status === "queued" ||
+      job.status === "cancelling" || job.status === "paused";
+  }
+
+  function statusLabel(status) {
+    var map = {
+      queued: "Antrian",
+      running: "Berjalan",
+      paused: "Dijeda",
+      cancelling: "Membatalkan",
+      cancelled: "Dibatalkan",
+      done: "Selesai",
+      error: "Gagal"
+    };
+    return map[status] || status || "";
+  }
+
+  function objectName(item) {
+    return String(item.schema || "") + "." + String(item.name || "");
+  }
+
+  function sortObjects(items, sort) {
+    var list = (items || []).slice();
+    function nameKey(item) {
+      return objectName(item).toLowerCase();
+    }
+    function num(value) {
+      return value == null || value === "" ? -1 : Number(value);
+    }
+    list.sort(function (a, b) {
+      if (sort === "rows") {
+        var rows = num(b.row_count) - num(a.row_count);
+        return rows || nameKey(a).localeCompare(nameKey(b));
+      }
+      if (sort === "size") {
+        var size = num(b.size_kb) - num(a.size_kb);
+        if (size) return size;
+        var byRows = num(b.row_count) - num(a.row_count);
+        return byRows || nameKey(a).localeCompare(nameKey(b));
+      }
+      return nameKey(a).localeCompare(nameKey(b));
+    });
+    return list;
   }
 
   function loadDefaultFolder() {
@@ -109,12 +161,34 @@
     $("db-export-modal").setAttribute("data-db", ctx.database || "");
     var objects = [];
     (ctx.tables || []).forEach(function (item) {
-      objects.push({ schema: item.schema, name: item.name, row_count: item.row_count, kind: "table", is_system: item.is_system });
+      objects.push({
+        schema: item.schema,
+        name: item.name,
+        row_count: item.row_count,
+        size_kb: item.size_kb,
+        kind: "table",
+        is_system: item.is_system
+      });
     });
     (ctx.views || []).forEach(function (item) {
-      objects.push({ schema: item.schema, name: item.name, row_count: item.row_count, kind: "view", is_system: item.is_system });
+      objects.push({
+        schema: item.schema,
+        name: item.name,
+        row_count: item.row_count,
+        size_kb: item.size_kb,
+        kind: "view",
+        is_system: item.is_system
+      });
     });
     $("db-export-modal")._objects = objects;
+    if ($("db-export-sort")) {
+      window.SqlSelect.mount($("db-export-sort"), { placeholder: "Urutkan..." });
+      if ($("db-export-sort")._sqlSelect) $("db-export-sort")._sqlSelect.setValue(dbExportSort);
+      else $("db-export-sort").value = dbExportSort;
+    }
+    if ($("db-export-workers")) {
+      window.SqlSelect.mount($("db-export-workers"), { placeholder: "Worker..." });
+    }
     renderDbExportTables();
     if (!$("db-export-folder").value) $("db-export-folder").value = defaultFolder;
     $("db-export-error").hidden = true;
@@ -129,21 +203,33 @@
     var objects = $("db-export-modal")._objects || [];
     var includeViews = $("db-export-views").checked;
     var box = $("db-export-tables");
+    var prev = {};
+    Array.prototype.forEach.call(box.querySelectorAll("input[type=checkbox]"), function (input) {
+      prev[input.getAttribute("data-schema") + "\0" + input.getAttribute("data-name")] = input.checked;
+    });
+    var hasPrev = Object.keys(prev).length > 0;
     box.innerHTML = "";
     var estimate = 0;
     var shown = 0;
-    objects.forEach(function (item) {
-      if (item.kind === "view" && !includeViews) return;
+    var visible = objects.filter(function (item) {
+      return item.kind !== "view" || includeViews;
+    });
+    sortObjects(visible, dbExportSort).forEach(function (item) {
       shown += 1;
       if (item.row_count) estimate += Number(item.row_count) || 0;
+      var key = item.schema + "\0" + item.name;
+      var checked = hasPrev ? prev[key] !== false : true;
+      var meta = [];
+      if (item.kind === "view") meta.push("view");
+      if (item.row_count != null) meta.push(formatCount(item.row_count) + " baris");
+      if (item.size_kb != null) meta.push(formatSizeKb(item.size_kb));
       var label = document.createElement("label");
       label.className = "choice tight";
-      label.innerHTML = '<input type="checkbox" checked data-schema="' +
-        String(item.schema).replace(/"/g, "&quot;") + '" data-name="' +
-        String(item.name).replace(/"/g, "&quot;") + '"> <span>' +
-        item.schema + "." + item.name +
-        (item.kind === "view" ? " <em>(view)</em>" : "") +
-        (item.row_count != null ? " <em>· " + formatCount(item.row_count) + " baris</em>" : "") +
+      label.innerHTML = '<input type="checkbox"' + (checked ? " checked" : "") +
+        ' data-schema="' + escapeHtml(item.schema) + '" data-name="' +
+        escapeHtml(item.name) + '"> <span>' +
+        escapeHtml(item.schema + "." + item.name) +
+        (meta.length ? " <em>· " + escapeHtml(meta.join(" · ")) + "</em>" : "") +
         "</span>";
       box.appendChild(label);
     });
@@ -204,7 +290,8 @@
       chunk_rows: chunkRows,
       chunk_bytes: chunkBytes,
       gzip: $("db-export-gzip").checked,
-      nolock: $("db-export-nolock").checked
+      nolock: $("db-export-nolock").checked,
+      workers: Number($("db-export-workers").value || 3)
     };
     $("db-export-start").disabled = true;
     window.SqlLoading.showIn(
@@ -421,23 +508,69 @@
   function refreshJobs() {
     api("/api/exports", { background: true }).then(function (data) {
       if (!data.ok) return;
-      renderJobs(data.jobs || []);
       updateBadge(data.jobs || []);
+      if ($("jobs-modal") && !$("jobs-modal").hidden) {
+        renderJobs(data.jobs || []);
+      }
+      syncWatch(data.jobs || []);
     });
   }
 
   function updateBadge(jobs) {
     var badge = $("export-badge");
-    var active = jobs.filter(function (job) {
-      return job.status === "running" || job.status === "queued" || job.status === "cancelling";
-    }).length;
+    var active = jobs.filter(isActiveJob).length;
     if (!badge) return;
     badge.hidden = active === 0;
     badge.textContent = String(active);
   }
 
+  function renderJobTables(job) {
+    var currents = job.current_objects || [];
+    if (!currents.length && job.current_object && isActiveJob(job)) {
+      currents = [{ schema: "", name: job.current_object, rows_written: job.rows_written, status: job.status }];
+    }
+    var html = "";
+    if (currents.length) {
+      html += '<div class="job-now"><p class="job-now-label">Sedang diexport</p>';
+      currents.forEach(function (item) {
+        html += '<div class="job-now-item">' +
+          '<strong>' + escapeHtml(item.schema ? objectName(item) : (item.name || "")) + "</strong>" +
+          '<span>' + escapeHtml(statusLabel(item.status || job.status)) +
+          (item.rows_written ? " · " + formatCount(item.rows_written) + " baris" : "") +
+          "</span></div>";
+      });
+      html += "</div>";
+    }
+    var tables = job.tables || [];
+    if (!tables.length) return html;
+    var queued = 0;
+    var running = 0;
+    tables.forEach(function (item) {
+      if (item.status === "queued") queued += 1;
+      if (item.status === "running" || item.status === "paused") running += 1;
+    });
+    html += '<p class="job-meta">Antrian ' + queued + " · aktif " + running +
+      (job.workers ? " · " + job.workers + " worker" : "") + "</p>";
+    html += '<div class="job-tables">';
+    tables.forEach(function (item) {
+      html += '<div class="job-table is-' + escapeHtml(item.status || "queued") + '">' +
+        "<span>" + escapeHtml(objectName(item)) + "</span>" +
+        "<em>" + escapeHtml(statusLabel(item.status)) +
+        (item.rows_written ? " · " + formatCount(item.rows_written) : "") +
+        (item.error ? " · " + escapeHtml(item.error) : "") +
+        "</em></div>";
+    });
+    html += "</div>";
+    return html;
+  }
+
   function renderJobs(jobs) {
     var host = $("jobs-body");
+    var bodyScroll = host.scrollTop;
+    var tableScrolls = [];
+    Array.prototype.forEach.call(host.querySelectorAll(".job-tables"), function (el) {
+      tableScrolls.push(el.scrollTop);
+    });
     if (!jobs.length) {
       host.innerHTML = '<div class="empty-state"><h3>Belum ada job</h3><p>Export CSV atau backup .bak muncul di sini. File sudah ada di folder yang Anda pilih.</p></div>';
       return;
@@ -445,7 +578,7 @@
     host.innerHTML = "";
     jobs.slice().reverse().forEach(function (job) {
       var card = document.createElement("div");
-      card.className = "job-card";
+      card.className = "job-card" + (isActiveJob(job) ? " is-active" : "");
       var pct = "";
       if (job.row_count_estimate && job.rows_written) {
         pct = " · " + Math.min(100, Math.round(job.rows_written / job.row_count_estimate * 100)) + "%";
@@ -458,46 +591,62 @@
         if (job.tables_total) {
           title += " · " + (job.tables_done || 0) + "/" + job.tables_total + " tabel";
         }
-        if (job.current_object && (job.status === "running" || job.status === "queued")) {
-          title += " · " + job.current_object;
-        }
       } else {
         title = "Export " + (job.schema ? job.schema + "." : "") + job.table;
       }
       var parts = (job.parts || []).map(function (part) {
-        return '<a class="job-file" href="/api/export/' + job.id + "/parts/" + encodeURIComponent(part.name) +
-          '">' + part.name + (part.rows ? " · " + formatCount(part.rows) + " baris" : "") +
+        return '<a class="job-file" href="/api/export/' + encodeURIComponent(job.id) + "/parts/" + encodeURIComponent(part.name) +
+          '">' + escapeHtml(part.name) + (part.rows ? " · " + formatCount(part.rows) + " baris" : "") +
           " · " + formatBytes(part.bytes) + "</a>";
       }).join("");
+      var actions = "";
+      if (job.can_pause) {
+        actions += '<button type="button" class="btn-secondary" data-pause="' + escapeHtml(job.id) + '">Jeda</button>';
+      }
+      if (job.can_resume) {
+        actions += '<button type="button" class="btn-primary" data-resume="' + escapeHtml(job.id) + '">Lanjut</button>';
+      }
+      if (job.can_cancel) {
+        actions += '<button type="button" class="btn-secondary" data-cancel="' + escapeHtml(job.id) + '"' +
+          (job.status === "cancelling" ? " disabled" : "") + ">" +
+          (job.status === "cancelling" ? "Membatalkan..." : "Batalkan") + "</button>";
+      }
       card.innerHTML =
-        "<h4>" + title + "</h4>" +
-        '<p class="job-meta">' + job.status +
+        "<h4>" + escapeHtml(title) + "</h4>" +
+        '<p class="job-meta"><span class="job-status is-' + escapeHtml(job.status) + '">' +
+        escapeHtml(statusLabel(job.status)) + "</span>" +
         (job.rows_written ? " · " + formatCount(job.rows_written) +
           (job.row_count_estimate != null ? " / " + formatCount(job.row_count_estimate) : "") + " baris" : "") +
-        pct + " · " + formatBytes(job.bytes_written) + "</p>" +
-        (job.folder ? '<p class="job-meta">' + job.folder + "</p>" : "") +
+        pct + " · " + formatBytes(job.bytes_written) +
+        (job.workers && job.kind === "export_db" ? " · " + job.workers + " worker" : "") + "</p>" +
+        (job.folder ? '<p class="job-meta">' + escapeHtml(job.folder) + "</p>" : "") +
         (job.error ? '<p class="form-error">' + escapeHtml(job.error) + (job.hint ? " — " + escapeHtml(job.hint) : "") + "</p>" : "") +
+        renderJobTables(job) +
         '<div class="job-files">' + (parts || "<span class='job-meta'>Belum ada file siap.</span>") + "</div>" +
-        (job.status === "running" || job.status === "queued" || job.status === "cancelling"
-          ? '<button type="button" class="btn-secondary" data-cancel="' + job.id + '">Batalkan</button>'
-          : "");
+        (actions ? '<div class="job-actions">' + actions + "</div>" : "");
       host.appendChild(card);
     });
+    host.scrollTop = bodyScroll;
+    Array.prototype.forEach.call(host.querySelectorAll(".job-tables"), function (el, index) {
+      if (tableScrolls[index] != null) el.scrollTop = tableScrolls[index];
+    });
+  }
+
+  function syncWatch(jobs) {
+    var active = (jobs || []).some(isActiveJob);
+    var modalOpen = $("jobs-modal") && !$("jobs-modal").hidden;
+    if ((active || modalOpen) && !pollTimer) {
+      pollTimer = setInterval(refreshJobs, 1000);
+    }
+    if (!active && !modalOpen && pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
   }
 
   function pollJob(jobId) {
     currentJobId = jobId;
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(function () {
-      api("/api/export/" + jobId, { background: true }).then(function (data) {
-        if (!data.ok) return;
-        refreshJobs();
-        if (data.job.status === "done" || data.job.status === "error" || data.job.status === "cancelled") {
-          clearInterval(pollTimer);
-          pollTimer = null;
-        }
-      });
-    }, 1000);
+    refreshJobs();
   }
 
   function bind() {
@@ -508,6 +657,8 @@
     window.SqlSelect.mount($("db-export-chunk-mode"), { placeholder: "Cari..." });
     window.SqlSelect.mount($("db-export-chunk-size"), { placeholder: "Cari ukuran..." });
     window.SqlSelect.mount($("db-export-chunk"), { placeholder: "Cari baris..." });
+    window.SqlSelect.mount($("db-export-sort"), { placeholder: "Urutkan..." });
+    window.SqlSelect.mount($("db-export-workers"), { placeholder: "Worker..." });
     window.SqlFormat.bindInput($("export-chunk-custom"), { min: 1, max: 1024 });
     window.SqlFormat.bindInput($("db-export-chunk-custom"), { min: 1, max: 1024 });
     $("export-chunk-mode").addEventListener("change", syncChunkMode);
@@ -517,7 +668,10 @@
     $("export-close").addEventListener("click", function () { $("export-modal").hidden = true; });
     $("db-export-close").addEventListener("click", function () { $("db-export-modal").hidden = true; });
     $("backup-close").addEventListener("click", function () { $("backup-modal").hidden = true; });
-    $("jobs-close").addEventListener("click", function () { $("jobs-modal").hidden = true; });
+    $("jobs-close").addEventListener("click", function () {
+      $("jobs-modal").hidden = true;
+      refreshJobs();
+    });
     if ($("folder-close")) {
       $("folder-close").addEventListener("click", function () { $("folder-modal").hidden = true; });
     }
@@ -539,6 +693,10 @@
     $("db-export-browse").addEventListener("click", function () { openFolderPicker("db-export-folder"); });
     $("backup-browse").addEventListener("click", function () { openFolderPicker("backup-folder"); });
     $("db-export-views").addEventListener("change", renderDbExportTables);
+    $("db-export-sort").addEventListener("change", function () {
+      dbExportSort = $("db-export-sort").value || "name";
+      renderDbExportTables();
+    });
     $("db-export-all").addEventListener("click", function () {
       Array.prototype.forEach.call($("db-export-tables").querySelectorAll("input"), function (box) { box.checked = true; });
     });
@@ -553,13 +711,24 @@
     });
     $("btn-jobs").addEventListener("click", openJobs);
     $("jobs-body").addEventListener("click", function (event) {
-      var id = event.target.getAttribute("data-cancel");
-      if (!id) return;
-      api("/api/export/" + id + "/cancel", { method: "POST" }).then(refreshJobs);
+      var cancelId = event.target.getAttribute("data-cancel");
+      var pauseId = event.target.getAttribute("data-pause");
+      var resumeId = event.target.getAttribute("data-resume");
+      var url = "";
+      if (cancelId) url = "/api/export/" + cancelId + "/cancel";
+      else if (pauseId) url = "/api/export/" + pauseId + "/pause";
+      else if (resumeId) url = "/api/export/" + resumeId + "/resume";
+      if (!url) return;
+      event.target.disabled = true;
+      api(url, { method: "POST" }).then(refreshJobs).catch(function () {
+        event.target.disabled = false;
+      });
     });
     ["export-modal", "db-export-modal", "backup-modal", "jobs-modal", "folder-modal"].forEach(function (id) {
       $(id).addEventListener("click", function (event) {
-        if (event.target === $(id)) $(id).hidden = true;
+        if (event.target !== $(id)) return;
+        $(id).hidden = true;
+        if (id === "jobs-modal") refreshJobs();
       });
     });
     syncChunkMode();
@@ -574,6 +743,9 @@
     openJobs: openJobs,
     bind: bind,
     refreshJobs: refreshJobs,
-    formatCount: formatCount
+    formatCount: formatCount,
+    formatBytes: formatBytes,
+    formatSizeKb: formatSizeKb,
+    sortObjects: sortObjects
   };
 })(window);

@@ -1133,11 +1133,77 @@ button.browse-card { font: inherit; }
   margin: 8px 0 14px;
 }
 .export-columns em { color: var(--muted); font-style: normal; font-size: 12px; }
-.export-actions { display: flex; gap: 8px; }
+.export-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.export-actions .field-compact { margin: 0 0 0 auto; min-width: 160px; }
+.export-table-list { max-height: 240px; }
+.export-table-list .choice.tight { margin: 2px 0; }
+.filter-label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-left: 6px;
+}
+.browse-filter .filter-label:first-child { margin-left: 0; }
 .jobs-body { padding: 12px 16px 20px; overflow: auto; }
 .job-card { border: 1px solid var(--line); padding: 12px; margin-bottom: 12px; }
 .job-card h4 { margin: 0 0 6px; }
+.job-card.is-active { border-color: #7eb0e8; box-shadow: 0 0 0 1px rgba(11, 92, 171, 0.08); }
 .job-meta { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+.job-status {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.job-status.is-running, .job-status.is-queued { color: var(--azure); }
+.job-status.is-paused { color: #b45309; }
+.job-status.is-error { color: var(--danger); }
+.job-status.is-cancelling { color: #b45309; }
+.job-now {
+  background: #f0f7ff;
+  border: 1px solid #d6e6f7;
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin: 0 0 10px;
+}
+.job-now-label {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--azure);
+}
+.job-now-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  margin-top: 4px;
+}
+.job-now-item span { color: var(--muted); }
+.job-tables {
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  margin: 0 0 10px;
+  background: #fff;
+}
+.job-table {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #eef2f6;
+  font-size: 12px;
+}
+.job-table:last-child { border-bottom: 0; }
+.job-table em { color: var(--muted); font-style: normal; }
+.job-table.is-running em { color: var(--azure); }
+.job-table.is-paused em { color: #b45309; }
+.job-table.is-error em { color: var(--danger); }
+.job-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .job-files { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
 .job-file { color: var(--focus); font-size: 13px; }
 .empty-state,

@@ -20,7 +20,16 @@ from sqlsm.client import (
     list_odbc_drivers,
     pick_odbc_driver,
 )
-from sqlsm.export import cancel_job, get_job, list_jobs, start_backup, start_export, start_export_database
+from sqlsm.export import (
+    cancel_job,
+    get_job,
+    list_jobs,
+    pause_job,
+    resume_job,
+    start_backup,
+    start_export,
+    start_export_database,
+)
 from sqlsm.fsutil import default_data_folder, existing_start_dir, list_folders, pick_folder
 from sqlsm.profiles import STORE_DIR, delete_profile, get_profile, list_profiles, read_password, upsert_profile
 
@@ -416,7 +425,7 @@ def api_disconnect():
                 }
             )
         for job in list_jobs(sid):
-            if job.get("status") in ("queued", "running", "cancelling"):
+            if job.get("status") in ("queued", "running", "cancelling", "paused"):
                 try:
                     cancel_job(sid, job["id"])
                 except Exception:
@@ -615,6 +624,10 @@ def api_export_database():
         chunk_bytes = int(payload.get("chunk_bytes") or 0)
     except (TypeError, ValueError):
         chunk_bytes = 0
+    try:
+        workers = int(payload.get("workers") or 3)
+    except (TypeError, ValueError):
+        workers = 3
     tables = []
     for entry in payload.get("tables") or []:
         if not isinstance(entry, dict):
@@ -636,6 +649,7 @@ def api_export_database():
             use_gzip=bool(payload.get("gzip", True)),
             nolock=bool(payload.get("nolock", True)),
             folder=str(payload.get("folder") or ""),
+            workers=workers,
         )
         return jsonify({"ok": True, "job": job.public()})
     except Exception as exc:
@@ -659,6 +673,22 @@ def api_export_status(job_id):
 def api_export_cancel(job_id):
     try:
         return jsonify({"ok": True, "job": cancel_job(_sid(), job_id).public()})
+    except Exception as exc:
+        return _error_payload(exc)
+
+
+@app.route("/api/export/<job_id>/pause", methods=["POST"])
+def api_export_pause(job_id):
+    try:
+        return jsonify({"ok": True, "job": pause_job(_sid(), job_id).public()})
+    except Exception as exc:
+        return _error_payload(exc)
+
+
+@app.route("/api/export/<job_id>/resume", methods=["POST"])
+def api_export_resume(job_id):
+    try:
+        return jsonify({"ok": True, "job": resume_job(_sid(), job_id).public()})
     except Exception as exc:
         return _error_payload(exc)
 

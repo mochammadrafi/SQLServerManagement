@@ -11,7 +11,7 @@
     showSystem: false,
     explorerQuery: "",
     mode: "browse",
-    browse: { view: "home", database: "", kind: "all", query: "" },
+    browse: { view: "home", database: "", kind: "all", query: "", sort: "name", dbSort: "name" },
     table: null,
     selectedRow: null
   };
@@ -166,13 +166,22 @@
         views: catalogObjects(name, "views")
       });
     }
-    if (state.catalog[name]) {
-      go(state.catalog[name]);
-      return;
+    var needMetrics = !state.catalog[name] || !state.catalog[name]._counts;
+    if (needMetrics) {
+      window.SqlLoading.showIn(
+        browseBody,
+        "Menyiapkan export",
+        "Mengambil daftar tabel, jumlah baris, dan ukuran.",
+        { track: false }
+      );
     }
-    ensureCatalog(name).then(function (catalog) {
+    ensureCatalog(name).then(function () {
+      return loadCatalogCounts(name);
+    }).then(function (catalog) {
+      window.SqlLoading.hideIn(browseBody);
       go(catalog);
     }).catch(function (err) {
+      window.SqlLoading.hideIn(browseBody);
       showError(String(err && err.message ? err.message : err));
     });
   }
@@ -262,7 +271,7 @@
     state.table = null;
     state.selectedRow = null;
     state.server = null;
-    state.browse = { view: "home", database: "", kind: "all", query: "" };
+    state.browse = { view: "home", database: "", kind: "all", query: "", sort: "name", dbSort: "name" };
   }
 
   function loadDatabases() {
@@ -416,6 +425,7 @@
             state.table.schema === item.schema && state.table.name === item.name;
           node.className = "tree-item nested" + (active ? " active" : "");
           var countLabel = item.row_count != null ? " · " + formatCount(item.row_count) : "";
+          if (item.size_kb != null) countLabel += " · " + formatSizeKb(item.size_kb);
           var kindIcon = pair[0] === "views" ? "view" : (pair[0] === "tables" ? "table" : "proc");
           node.innerHTML =
             '<span class="tree-ico">' + ico(kindIcon) + "</span>" +
@@ -424,7 +434,7 @@
             if (pair[0] === "tables" || pair[0] === "views") {
               openTable(dbName, item.schema, item.name);
             } else {
-              openProcInSql(dbName, item.schema, item.name);
+              openProcInSql(dbName, item.schema, item.name, pair[0]);
             }
           });
           explorerBody.appendChild(node);
@@ -440,6 +450,34 @@
   function formatCount(n) {
     if (n == null || n === "") return "-";
     return window.SqlFormat.integer(n);
+  }
+
+  function formatSizeKb(kb) {
+    if (kb == null || kb === "") return "";
+    if (window.SqlExport && window.SqlExport.formatSizeKb) {
+      return window.SqlExport.formatSizeKb(kb);
+    }
+    var bytes = Number(kb) * 1024;
+    if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + " KB";
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+  }
+
+  function sortCatalogItems(items, sort) {
+    if (window.SqlExport && window.SqlExport.sortObjects) {
+      return window.SqlExport.sortObjects(items, sort);
+    }
+    return (items || []).slice();
+  }
+
+  function objectMeta(item, kindLabel, includeSchema) {
+    var parts = [];
+    if (includeSchema && item.schema) parts.push(item.schema);
+    if (kindLabel) parts.push(kindLabel);
+    if (item.row_count != null) parts.push(formatCount(item.row_count) + " baris");
+    else parts.push("jumlah tidak diketahui");
+    if (item.size_kb != null) parts.push(formatSizeKb(item.size_kb));
+    return parts.join(" · ");
   }
 
   function selectDatabase(name, loadObjects) {
@@ -486,11 +524,13 @@
       ["tables", "views"].forEach(function (key) {
         var map = {};
         (data.objects[key] || []).forEach(function (item) {
-          map[item.schema + "\0" + item.name] = item.row_count;
+          map[item.schema + "\0" + item.name] = item;
         });
         (state.catalog[name].objects[key] || []).forEach(function (item) {
-          var count = map[item.schema + "\0" + item.name];
-          if (count != null) item.row_count = count;
+          var stat = map[item.schema + "\0" + item.name];
+          if (!stat) return;
+          if (stat.row_count != null) item.row_count = stat.row_count;
+          if (stat.size_kb != null) item.size_kb = stat.size_kb;
         });
       });
       state.catalog[name]._counts = true;
@@ -529,7 +569,9 @@
   function showHome() {
     setMode("browse");
     clearBusyMarks();
-    state.browse = { view: "home", database: "", kind: "all", query: "" };
+    var sort = state.browse.sort || "name";
+    var dbSort = state.browse.dbSort || "name";
+    state.browse = { view: "home", database: "", kind: "all", query: "", sort: sort, dbSort: dbSort };
     state.table = null;
     state.selectedRow = null;
     syncBrowseActions();
@@ -564,14 +606,39 @@
       });
       html += "</dl></div>";
     }
+    var dbSort = state.browse.dbSort || "name";
+    html += '<div class="browse-filter">';
+    html += '<span class="filter-label">Urutkan</span>';
+    html += '<button type="button" class="chip' + (dbSort === "name" ? " active" : "") + '" data-dbsort="name">Nama</button>';
+    html += '<button type="button" class="chip' + (dbSort === "size" ? " active" : "") + '" data-dbsort="size">Ukuran</button>';
+    html += "</div>";
     html += '<div class="card-grid" id="db-cards"></div></div>';
     browseBody.innerHTML = html;
+    Array.prototype.forEach.call(browseBody.querySelectorAll("[data-dbsort]"), function (chip) {
+      chip.addEventListener("click", function () {
+        state.browse.dbSort = chip.getAttribute("data-dbsort") || "name";
+        showHome();
+      });
+    });
     var grid = document.getElementById("db-cards");
     if (!state.databases.length) {
       grid.innerHTML = '<p class="browse-lead">Tidak ada database yang terlihat.</p>';
       return;
     }
-    state.databases.forEach(function (db) {
+    var databases = state.databases.slice();
+    if (dbSort === "size") {
+      databases.sort(function (a, b) {
+        var as = a.size_mb == null ? -1 : Number(a.size_mb);
+        var bs = b.size_mb == null ? -1 : Number(b.size_mb);
+        if (as === bs) return String(a.name).localeCompare(String(b.name));
+        return bs - as;
+      });
+    } else {
+      databases.sort(function (a, b) {
+        return String(a.name).localeCompare(String(b.name), undefined, { sensitivity: "base" });
+      });
+    }
+    databases.forEach(function (db) {
       var card = document.createElement("div");
       card.className = "browse-card";
       var size = db.size_mb != null ? window.SqlFormat.integer(Math.round(Number(db.size_mb))) + " MB" : "";
@@ -619,6 +686,7 @@
     selectDatabase(name, true).then(function () {
       return loadCatalogCounts(name);
     }).then(function () {
+      renderExplorer();
       if (state.catalog[name]) renderDatabasePage(name);
     }).catch(function (err) {
       showError(String(err && err.message ? err.message : err));
@@ -650,11 +718,16 @@
     html += '<div class="stat-pill"><b>' + formatCount(tableCount) + "</b><span>Tabel</span></div>";
     html += '<div class="stat-pill"><b>' + formatCount(viewCount) + "</b><span>View</span></div>";
     html += "</div></div>";
+    var sort = state.browse.sort || "name";
     html += '<div class="browse-filter">';
     html += '<input id="browse-search" type="text" placeholder="Cari tabel atau view" value="' + escapeHtml(state.browse.query || "") + '">';
     html += '<button type="button" class="chip' + (kind === "all" ? " active" : "") + '" data-kind="all">Semua</button>';
     html += '<button type="button" class="chip' + (kind === "tables" ? " active" : "") + '" data-kind="tables">Tabel</button>';
     html += '<button type="button" class="chip' + (kind === "views" ? " active" : "") + '" data-kind="views">View</button>';
+    html += '<span class="filter-label">Urutkan</span>';
+    html += '<button type="button" class="chip' + (sort === "name" ? " active" : "") + '" data-sort="name">Nama</button>';
+    html += '<button type="button" class="chip' + (sort === "rows" ? " active" : "") + '" data-sort="rows">Baris</button>';
+    html += '<button type="button" class="chip' + (sort === "size" ? " active" : "") + '" data-sort="size">Ukuran</button>';
     html += "</div>";
     html += '<div id="table-cards"></div></div>';
     browseBody.innerHTML = html;
@@ -669,72 +742,109 @@
         if (input.setSelectionRange) input.setSelectionRange(pos, pos);
       }
     });
-    Array.prototype.forEach.call(browseBody.querySelectorAll(".chip"), function (chip) {
+    Array.prototype.forEach.call(browseBody.querySelectorAll("[data-kind]"), function (chip) {
       chip.addEventListener("click", function () {
         state.browse.kind = chip.getAttribute("data-kind");
         renderDatabasePage(name);
       });
     });
+    Array.prototype.forEach.call(browseBody.querySelectorAll("[data-sort]"), function (chip) {
+      chip.addEventListener("click", function () {
+        state.browse.sort = chip.getAttribute("data-sort") || "name";
+        renderDatabasePage(name);
+      });
+    });
 
-    var host = document.getElementById("table-cards");
-    var schemas = catalog.schemas || [];
-    var shown = 0;
-    schemas.forEach(function (schema) {
-      if (!state.showSystem && schema.is_system) return;
+    function appendTableCard(grid, entry, includeSchema) {
+      var card = document.createElement("div");
+      card.className = "browse-card";
+      card.innerHTML =
+        '<div class="card-top"><div class="card-icon' + (entry.kind === "views" ? " is-view" : "") + '">' +
+        ico(entry.kind === "views" ? "view" : "table") + "</div>" +
+        '<div class="card-copy"><strong>' + escapeHtml(entry.item.name) + "</strong><span>" +
+        escapeHtml(objectMeta(entry.item, entry.label, includeSchema)) +
+        "</span></div></div>" +
+        '<div class="card-actions">' +
+          '<button type="button" class="btn-tiny" data-act="export">Export</button>' +
+        "</div>";
+      card.addEventListener("click", function (event) {
+        if (event.target.getAttribute("data-act") === "export") {
+          event.stopPropagation();
+          if (window.SqlBusy) window.SqlBusy.mark(event.target, true);
+          openTableExport(name, entry.item.schema, entry.item.name, entry.item.row_count);
+          return;
+        }
+        if (closestClass(event.target, "card-actions")) return;
+        card.classList.add("is-busy");
+        openTable(name, entry.item.schema, entry.item.name);
+      });
+      grid.appendChild(card);
+    }
+
+    function collectCards(schemaName) {
       var groups = [];
-      if (kind === "all" || kind === "tables") {
-        groups.push(["tables", "Tabel"]);
-      }
-      if (kind === "all" || kind === "views") {
-        groups.push(["views", "View"]);
-      }
+      if (kind === "all" || kind === "tables") groups.push(["tables", "Tabel"]);
+      if (kind === "all" || kind === "views") groups.push(["views", "View"]);
       var cards = [];
       groups.forEach(function (pair) {
         (catalog.objects[pair[0]] || []).forEach(function (item) {
-          if (item.schema !== schema.name) return;
+          if (schemaName && item.schema !== schemaName) return;
           if (!state.showSystem && item.is_system) return;
           if (q && String(item.name).toLowerCase().indexOf(q) === -1 &&
-              String(schema.name).toLowerCase().indexOf(q) === -1) return;
+              String(item.schema).toLowerCase().indexOf(q) === -1) return;
           cards.push({ item: item, kind: pair[0], label: pair[1] });
         });
       });
-      if (!cards.length) return;
-      shown += cards.length;
-      var block = document.createElement("div");
-      block.className = "schema-block";
-      block.innerHTML = "<h4>" + escapeHtml(schema.name) + (schema.is_system ? " · sistem" : "") +
-        ' <span class="schema-count">' + cards.length + "</span></h4>";
-      var grid = document.createElement("div");
-      grid.className = "card-grid";
-      cards.forEach(function (entry) {
-        var card = document.createElement("div");
-        card.className = "browse-card";
-        var count = entry.item.row_count != null ? formatCount(entry.item.row_count) + " baris" : "jumlah tidak diketahui";
-        card.innerHTML =
-          '<div class="card-top"><div class="card-icon' + (entry.kind === "views" ? " is-view" : "") + '">' +
-          ico(entry.kind === "views" ? "view" : "table") + "</div>" +
-          '<div class="card-copy"><strong>' + escapeHtml(entry.item.name) + "</strong><span>" +
-          escapeHtml(entry.label + " · " + count) +
-          "</span></div></div>" +
-          '<div class="card-actions">' +
-            '<button type="button" class="btn-tiny" data-act="export">Export</button>' +
-          "</div>";
-        card.addEventListener("click", function (event) {
-          if (event.target.getAttribute("data-act") === "export") {
-            event.stopPropagation();
-            if (window.SqlBusy) window.SqlBusy.mark(event.target, true);
-            openTableExport(name, entry.item.schema, entry.item.name, entry.item.row_count);
-            return;
-          }
-          if (closestClass(event.target, "card-actions")) return;
-          card.classList.add("is-busy");
-          openTable(name, entry.item.schema, entry.item.name);
-        });
-        grid.appendChild(card);
+      return cards;
+    }
+
+    var host = document.getElementById("table-cards");
+    var shown = 0;
+    if (sort === "rows" || sort === "size") {
+      var flat = collectCards(null);
+      var sortedItems = sortCatalogItems(flat.map(function (entry) { return entry.item; }), sort);
+      var byKey = {};
+      flat.forEach(function (entry) {
+        byKey[entry.item.schema + "\0" + entry.item.name] = entry;
       });
-      block.appendChild(grid);
-      host.appendChild(block);
-    });
+      if (sortedItems.length) {
+        var block = document.createElement("div");
+        block.className = "schema-block";
+        block.innerHTML = "<h4>Objek" +
+          ' <span class="schema-count">' + sortedItems.length + "</span></h4>";
+        var grid = document.createElement("div");
+        grid.className = "card-grid";
+        sortedItems.forEach(function (item) {
+          var entry = byKey[item.schema + "\0" + item.name];
+          if (!entry) return;
+          shown += 1;
+          appendTableCard(grid, entry, true);
+        });
+        block.appendChild(grid);
+        host.appendChild(block);
+      }
+    } else {
+      (catalog.schemas || []).forEach(function (schema) {
+        if (!state.showSystem && schema.is_system) return;
+        var cards = collectCards(schema.name);
+        if (!cards.length) return;
+        shown += cards.length;
+        cards.sort(function (a, b) {
+          return String(a.item.name).localeCompare(String(b.item.name), undefined, { sensitivity: "base" });
+        });
+        var block = document.createElement("div");
+        block.className = "schema-block";
+        block.innerHTML = "<h4>" + escapeHtml(schema.name) + (schema.is_system ? " · sistem" : "") +
+          ' <span class="schema-count">' + cards.length + "</span></h4>";
+        var grid = document.createElement("div");
+        grid.className = "card-grid";
+        cards.forEach(function (entry) {
+          appendTableCard(grid, entry, false);
+        });
+        block.appendChild(grid);
+        host.appendChild(block);
+      });
+    }
 
     if (kind === "all") {
       var extras = [];
