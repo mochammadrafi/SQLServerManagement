@@ -37,6 +37,9 @@ def _env_int(name, default, minimum, maximum):
 _MAX_WORKERS = _env_int("SQLSM_MAX_WORKERS", 32, 1, 128)
 _MAX_JOBS = _env_int("SQLSM_MAX_JOBS", 24, 1, 200)
 _MAX_TOTAL_WORKERS = _env_int("SQLSM_MAX_TOTAL_WORKERS", 64, 1, 256)
+_MIN_BATCH = 500
+_MAX_BATCH = 100000
+_DEFAULT_BATCH = _env_int("SQLSM_EXPORT_BATCH", 10000, _MIN_BATCH, _MAX_BATCH)
 if _MAX_TOTAL_WORKERS < _MAX_WORKERS:
     _MAX_TOTAL_WORKERS = _MAX_WORKERS
 
@@ -46,7 +49,54 @@ def export_limits():
         "max_workers": _MAX_WORKERS,
         "max_jobs": _MAX_JOBS,
         "max_total_workers": _MAX_TOTAL_WORKERS,
+        "batch_size": _DEFAULT_BATCH,
+        "min_batch_size": _MIN_BATCH,
+        "max_batch_size": _MAX_BATCH,
     }
+
+
+def clamp_batch_size(value):
+    try:
+        batch = int(value) if value not in (None, "") else _DEFAULT_BATCH
+    except (TypeError, ValueError):
+        batch = _DEFAULT_BATCH
+    if batch < _MIN_BATCH:
+        batch = _MIN_BATCH
+    if batch > _MAX_BATCH:
+        batch = _MAX_BATCH
+    return batch
+
+
+def sanitize_file_prefix(name, fallback="data", required=True):
+    text = (name or "").strip()
+    lower = text.lower()
+    if lower.endswith(".csv.gz"):
+        text = text[:-7]
+    elif lower.endswith(".csv"):
+        text = text[:-4]
+    elif lower.endswith(".gz"):
+        text = text[:-3]
+    cleaned = safe_name(text) if text else ""
+    if cleaned in (".", ".."):
+        cleaned = ""
+    if not cleaned:
+        return safe_name(fallback) if required else ""
+    return cleaned
+
+
+def _table_key(schema, name):
+    return (str(schema or ""), str(name or ""))
+
+
+def _is_skipped(job, schema=None, name=None):
+    keys = getattr(job, "skip_keys", None)
+    if not keys:
+        return False
+    return _table_key(schema, name) in keys
+
+
+def _stop_current(job, schema=None, name=None):
+    return job.cancel_event.is_set() or _is_skipped(job, schema, name)
 
 
 def _now():
@@ -54,7 +104,7 @@ def _now():
 
 
 class ExportJob(object):
-    def __init__(self, sid, cfg, database, schema, table, columns, where, chunk_rows, chunk_bytes, use_gzip, nolock, row_count, folder):
+    def __init__(self, sid, cfg, database, schema, table, columns, where, chunk_rows, chunk_bytes, use_gzip, nolock, row_count, folder, batch_size=None, file_prefix=None):
         self.id = uuid.uuid4().hex
         self.kind = "export"
         self.sid = sid
@@ -68,6 +118,10 @@ class ExportJob(object):
         self.chunk_bytes = int(chunk_bytes or 0)
         self.use_gzip = bool(use_gzip)
         self.nolock = bool(nolock)
+        self.batch_size = clamp_batch_size(batch_size)
+        self.file_prefix = sanitize_file_prefix(file_prefix, table or database or "data", required=False)
+        self.skip_keys = set()
+        self._table_clients = {}
         self.row_count_estimate = row_count
         self.status = "queued"
         self.rows_written = 0
@@ -123,6 +177,8 @@ class ExportJob(object):
                 "chunk_bytes": self.chunk_bytes,
                 "gzip": self.use_gzip,
                 "nolock": self.nolock,
+                "batch_size": self.batch_size,
+                "file_prefix": self.file_prefix,
                 "workers": self.workers,
                 "row_count_estimate": self.row_count_estimate,
                 "rows_written": self.rows_written,
@@ -142,10 +198,10 @@ class ExportJob(object):
                 "can_cancel": status in ("queued", "running", "paused", "cancelling"),
             }
 
-    def wait_if_paused(self):
-        # type: () -> bool
+    def wait_if_paused(self, schema=None, name=None):
+        # type: (Optional[str], Optional[str]) -> bool
         if not self.pause_event.is_set():
-            return not self.cancel_event.is_set()
+            return not _stop_current(self, schema, name)
         with self._state_lock:
             if self.status == "running":
                 self.status = "paused"
@@ -159,9 +215,9 @@ class ExportJob(object):
             self.save_meta()
         except Exception:
             pass
-        while self.pause_event.is_set() and not self.cancel_event.is_set():
+        while self.pause_event.is_set() and not _stop_current(self, schema, name):
             self.cancel_event.wait(0.2)
-        if self.cancel_event.is_set():
+        if _stop_current(self, schema, name):
             return False
         with self._state_lock:
             if self.status == "paused":
@@ -225,6 +281,32 @@ def cancel_job(sid, job_id):
     with job._state_lock:
         if job.status in ("queued", "running", "paused"):
             job.status = "cancelling"
+    try:
+        job.save_meta()
+    except Exception:
+        pass
+    return job
+
+
+def skip_current(sid, job_id, schema="", name=""):
+    # type: (str, str, str, str) -> ExportJob
+    job = get_job(sid, job_id)
+    schema = (schema or "").strip()
+    name = (name or "").strip()
+    if getattr(job, "kind", "export") != "export_db":
+        return cancel_job(sid, job_id)
+    if not name:
+        raise ClientError("Tabel yang dibatalkan tidak valid.")
+    key = _table_key(schema, name)
+    with job._state_lock:
+        job.skip_keys.add(key)
+        client = job._table_clients.get(key)
+    if client is not None:
+        try:
+            client.cancel_running()
+        except Exception:
+            pass
+    _mark_table(job, schema, name, status="cancelling")
     try:
         job.save_meta()
     except Exception:
@@ -363,10 +445,6 @@ def _connect_export(cfg):
     raise ClientError(str(last) if last else "Gagal membuka koneksi export.")
 
 
-def _table_key(schema, name):
-    return (str(schema or ""), str(name or ""))
-
-
 def _mark_table(job, schema, name, **fields):
     key = _table_key(schema, name)
     with job._state_lock:
@@ -426,7 +504,7 @@ def _bump_tables_done(job):
         job.tables_done = int(job.tables_done or 0) + 1
 
 
-def start_export(sid, cfg, database, schema, table, columns, where="", chunk_rows=0, chunk_bytes=0, use_gzip=True, nolock=True, folder=""):
+def start_export(sid, cfg, database, schema, table, columns, where="", chunk_rows=0, chunk_bytes=0, use_gzip=True, nolock=True, folder="", batch_size=None, file_name=""):
     where = validate_where(where)
     chunk_rows = int(chunk_rows or 0)
     chunk_bytes = int(chunk_bytes or 0)
@@ -470,7 +548,10 @@ def start_export(sid, cfg, database, schema, table, columns, where="", chunk_row
         nolock=nolock,
         row_count=stats.get("row_count"),
         folder=dest,
+        batch_size=batch_size,
+        file_prefix=file_name or table,
     )
+    job._file_prefix = job.file_prefix  # type: ignore
     job._order_keys = keys  # type: ignore
     try:
         _register_job(sid, job, workers=1)
@@ -501,7 +582,7 @@ def _purge_jobs():
             _JOBS.pop(job_id, None)
 
 
-def start_export_database(sid, cfg, database, tables=None, include_views=False, include_system=False, chunk_rows=0, chunk_bytes=0, use_gzip=True, nolock=True, folder="", workers=3):
+def start_export_database(sid, cfg, database, tables=None, include_views=False, include_system=False, chunk_rows=0, chunk_bytes=0, use_gzip=True, nolock=True, folder="", workers=3, batch_size=None, file_name=""):
     database = (database or "").strip()
     if not database:
         raise ClientError("Pilih database untuk export.")
@@ -568,6 +649,8 @@ def start_export_database(sid, cfg, database, tables=None, include_views=False, 
         nolock=nolock,
         row_count=estimate if has_estimate else None,
         folder=dest,
+        batch_size=batch_size,
+        file_prefix=file_name,
     )
     job.kind = "export_db"
     job.tables_total = len(picked)
@@ -667,8 +750,10 @@ def _run_db_export(job):
     with job._state_lock:
         leftover_error = str(worker_errors[0]) if worker_errors else "Tidak selesai."
         for item in job.table_states:
-            if item.get("status") in ("queued", "running", "paused"):
-                if job.cancel_event.is_set():
+            if item.get("status") in ("queued", "running", "paused", "cancelling"):
+                if job.cancel_event.is_set() or item.get("status") == "cancelling" or _is_skipped(
+                    job, item.get("schema"), item.get("name")
+                ):
                     item["status"] = "cancelled"
                 else:
                     item["status"] = "error"
@@ -703,11 +788,13 @@ def _export_one_table(job, client, item):
     table = item.get("name")
     _mark_table(job, schema, table, status="running", error=None)
     _set_current(job, schema, table, rows_written=0, status="running")
+    with job._state_lock:
+        job._table_clients[_table_key(schema, table)] = client
     try:
-        if job.cancel_event.is_set():
+        if _stop_current(job, schema, table):
             _mark_table(job, schema, table, status="cancelled")
             return
-        if not job.wait_if_paused():
+        if not job.wait_if_paused(schema, table):
             _mark_table(job, schema, table, status="cancelled")
             return
         columns = [col.get("name") for col in client.list_columns(job.database, schema, table)]
@@ -718,6 +805,8 @@ def _export_one_table(job, client, item):
             return
         stats = client.table_stats(job.database, schema, table)
         prefix = "%s.%s" % (safe_name(schema), safe_name(table))
+        if job.file_prefix:
+            prefix = "%s_%s" % (job.file_prefix, prefix)
         _export_current(
             job,
             client,
@@ -728,22 +817,24 @@ def _export_one_table(job, client, item):
             prefix,
             "",
         )
-        if job.cancel_event.is_set():
+        if _stop_current(job, schema, table):
             _mark_table(job, schema, table, status="cancelled")
         else:
             _mark_table(job, schema, table, status="done")
             _bump_tables_done(job)
     except ClientError as exc:
-        if job.cancel_event.is_set() or "dibatalkan" in str(exc).lower():
+        if _stop_current(job, schema, table) or "dibatalkan" in str(exc).lower():
             _mark_table(job, schema, table, status="cancelled")
         else:
             _mark_table(job, schema, table, status="error", error=str(exc))
     except Exception as exc:
-        if job.cancel_event.is_set() or "dibatalkan" in str(exc).lower():
+        if _stop_current(job, schema, table) or "dibatalkan" in str(exc).lower():
             _mark_table(job, schema, table, status="cancelled")
         else:
             _mark_table(job, schema, table, status="error", error=str(exc))
     finally:
+        with job._state_lock:
+            job._table_clients.pop(_table_key(schema, table), None)
         _clear_current(job, schema, table)
         try:
             job.save_meta()
@@ -758,7 +849,7 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
     if order_keys is None:
         order_keys = getattr(job, "_order_keys", None) or None
     if file_prefix is None:
-        file_prefix = getattr(job, "_file_prefix", None) or safe_name(table)
+        file_prefix = getattr(job, "_file_prefix", None) or job.file_prefix or safe_name(table)
     if where is None:
         where = job.where
     writer = None  # type: Optional[Any]
@@ -778,14 +869,14 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
             where=where,
             order_keys=order_keys or None,
             nolock=job.nolock,
-            batch_size=2000,
+            batch_size=job.batch_size,
         ):
-            if job.cancel_event.is_set():
+            if _stop_current(job, schema, table):
                 break
-            if not job.wait_if_paused():
+            if not job.wait_if_paused(schema, table):
                 break
             for raw in raw_rows:
-                if job.cancel_event.is_set():
+                if _stop_current(job, schema, table):
                     break
                 if writer is None:
                     part_index += 1
@@ -822,11 +913,11 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
         if pending:
             _add_progress(job, schema, table, pending)
             pending = 0
-        if writer is not None and not job.cancel_event.is_set():
+        if writer is not None and not _stop_current(job, schema, table):
             _close_part(job, handle, part_name, part_rows)
             writer = None
             handle = None
-        if wrote_rows == 0 and not job.cancel_event.is_set():
+        if wrote_rows == 0 and not _stop_current(job, schema, table):
             writer, handle, part_name, part_file = _open_part(job, 1, file_prefix)
             writer.writerow(columns)
             _close_part(job, handle, part_name, 0)
@@ -836,10 +927,10 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
         if pending:
             _add_progress(job, schema, table, pending)
         if writer is not None and handle is not None:
-            if job.cancel_event.is_set():
-                _discard_open_part(handle, part_file)
-            else:
+            if part_rows:
                 _close_part(job, handle, part_name, part_rows)
+            else:
+                _discard_open_part(handle, part_file)
 
 
 def _run_job(job):
@@ -862,7 +953,7 @@ def _run_job(job):
             job.table,
             job.columns,
             getattr(job, "_order_keys", None) or [],
-            getattr(job, "_file_prefix", None) or safe_name(job.table),
+            getattr(job, "_file_prefix", None) or job.file_prefix or safe_name(job.table),
             job.where,
         )
         if job.cancel_event.is_set():
@@ -915,8 +1006,11 @@ class _HandleStack(object):
 
 def _open_part(job, part_index, file_prefix=None):
     ext = ".csv.gz" if job.use_gzip else ".csv"
-    prefix = file_prefix or getattr(job, "_file_prefix", None) or safe_name(job.table)
-    name = "%s_part-%05d%s" % (prefix, part_index, ext)
+    prefix = file_prefix or getattr(job, "_file_prefix", None) or job.file_prefix or safe_name(job.table)
+    if not job.chunk_rows and not job.chunk_bytes and int(part_index or 1) <= 1:
+        name = prefix + ext
+    else:
+        name = "%s_part-%05d%s" % (prefix, part_index, ext)
     path = os.path.join(job.folder, name)
     job._part_file = path
     if job.use_gzip:

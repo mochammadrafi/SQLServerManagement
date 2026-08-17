@@ -94,7 +94,7 @@ Mixed Mode (for `sa`):
 1. Connect.
 2. Click a database in Object Explorer.
 3. Click a table. Only one page loads (default 200 rows), even if the table has 100 million rows.
-4. Use **Berikutnya**, jump by key, or filter with WHERE. Filtered pages and exports skip `ORDER BY` so the first matching rows stream immediately on 100M+ tables. Do not `SELECT *` the whole table.
+4. Use **Berikutnya**, jump by key, or filter with WHERE. Filtered pages and exports skip `ORDER BY` so the first matching rows stream immediately on 100M+ tables. Do not `SELECT *` the whole table. You can rename the export file before starting. A table that is currently exporting can be cancelled; finished and cancelled jobs stay in Export history, and any rows already written remain downloadable.
 5. **Export tabel** writes CSV/gzip in the background (default 1 million rows per file). Download each part from **Export** in the header. Pause, resume, or cancel from that panel. You can start several exports at once. Database export can run several tables at once (default 3 workers, up to 32; the app lowers the count if connection slots are full). In Browse, sort tables by name, row count, or size.
 6. Double-click a cell for the full value.
 
@@ -117,6 +117,7 @@ Export files are written under the default data folder above (or `SQLSM_EXPORT_D
 | `SQLSM_MAX_WORKERS` | `32` | Max worker threads per database export |
 | `SQLSM_MAX_JOBS` | `24` | Max concurrent export/backup jobs per session |
 | `SQLSM_MAX_TOTAL_WORKERS` | `64` | Max export connections across all running jobs |
+| `SQLSM_EXPORT_BATCH` | `10000` | Default rows per SQL fetch during export (500–100000) |
 
 ## Layout
 

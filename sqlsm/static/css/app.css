@@ -1188,6 +1188,16 @@ button.browse-card { font: inherit; }
 .job-status.is-paused { color: #b45309; }
 .job-status.is-error { color: var(--danger); }
 .job-status.is-cancelling { color: #b45309; }
+.job-status.is-cancelled { color: #64748b; }
+.job-section {
+  margin: 4px 0 10px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.job-section + .job-card { margin-top: 0; }
 .job-now {
   background: #f0f7ff;
   border: 1px solid #d6e6f7;
@@ -1205,12 +1215,14 @@ button.browse-card { font: inherit; }
 }
 .job-now-item {
   display: flex;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   font-size: 13px;
   margin-top: 4px;
 }
-.job-now-item span { color: var(--muted); }
+.job-now-item span { color: var(--muted); flex: 1; }
+.job-now-item .btn-tiny { flex: 0 0 auto; }
 .job-tables {
   max-height: 180px;
   overflow: auto;
@@ -1232,6 +1244,7 @@ button.browse-card { font: inherit; }
 .job-table.is-running em { color: var(--azure); }
 .job-table.is-paused em { color: #b45309; }
 .job-table.is-error em { color: var(--danger); }
+.job-table.is-cancelled em { color: #64748b; }
 .job-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .job-files { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
 .job-file { color: var(--focus); font-size: 13px; }

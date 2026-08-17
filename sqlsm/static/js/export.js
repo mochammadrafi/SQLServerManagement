@@ -5,7 +5,15 @@
   var folderPath = "";
   var defaultFolder = "";
   var dbExportSort = "name";
-  var exportLimits = { max_workers: 32, max_jobs: 24, max_total_workers: 64 };
+  var exportLimits = {
+    max_workers: 32,
+    max_jobs: 24,
+    max_total_workers: 64,
+    batch_size: 10000,
+    min_batch_size: 500,
+    max_batch_size: 100000
+  };
+  var BATCH_KEY = "sqlsm.export.batch_size";
 
   function $(id) {
     return document.getElementById(id);
@@ -55,6 +63,15 @@
     return String(item.schema || "") + "." + String(item.name || "");
   }
 
+  function objectLabel(job, item) {
+    var db = (job && job.database) || "";
+    var schema = (item && item.schema) || (job && job.schema) || "";
+    var name = (item && item.name) || (job && job.table) || "";
+    if (schema && name) return (db ? db + "." : "") + schema + "." + name;
+    if (name && name !== db) return (db ? db + "." : "") + name;
+    return db || name || "";
+  }
+
   function sortObjects(items, sort) {
     var list = (items || []).slice();
     function nameKey(item) {
@@ -79,11 +96,57 @@
     return list;
   }
 
+  function savedBatchSize() {
+    try {
+      var stored = parseInt(localStorage.getItem(BATCH_KEY), 10);
+      if (stored >= exportLimits.min_batch_size && stored <= exportLimits.max_batch_size) {
+        return stored;
+      }
+    } catch (err) {}
+    return exportLimits.batch_size;
+  }
+
+  function storeBatchSize(value) {
+    try {
+      localStorage.setItem(BATCH_KEY, String(value));
+    } catch (err) {}
+  }
+
+  function readBatchSize(id) {
+    var input = $(id);
+    var value = input && window.SqlFormat ? window.SqlFormat.parseInteger(input.value) : null;
+    if (!value) value = savedBatchSize();
+    if (value < exportLimits.min_batch_size) value = exportLimits.min_batch_size;
+    if (value > exportLimits.max_batch_size) value = exportLimits.max_batch_size;
+    storeBatchSize(value);
+    return value;
+  }
+
+  function fillBatchInputs() {
+    var value = savedBatchSize();
+    ["export-batch", "db-export-batch"].forEach(function (id) {
+      var input = $(id);
+      if (!input) return;
+      if (window.SqlFormat && !input._exportBound) {
+        window.SqlFormat.bindInput(input, {
+          min: exportLimits.min_batch_size,
+          max: exportLimits.max_batch_size
+        });
+        input._exportBound = true;
+      }
+      if (input._sqlNumber) input._sqlNumber.set(value);
+      else input.value = String(value);
+    });
+  }
+
   function applyExportLimits(limits) {
     if (!limits) return;
     exportLimits.max_workers = Number(limits.max_workers || exportLimits.max_workers);
     exportLimits.max_jobs = Number(limits.max_jobs || exportLimits.max_jobs);
     exportLimits.max_total_workers = Number(limits.max_total_workers || exportLimits.max_total_workers);
+    exportLimits.batch_size = Number(limits.batch_size || exportLimits.batch_size);
+    exportLimits.min_batch_size = Number(limits.min_batch_size || exportLimits.min_batch_size);
+    exportLimits.max_batch_size = Number(limits.max_batch_size || exportLimits.max_batch_size);
     var hint = $("db-export-workers-hint");
     if (hint) {
       hint.textContent = "Beberapa tabel diexport bersamaan. Isi 1–" +
@@ -108,6 +171,7 @@
         if ($("backup-folder") && !$("backup-folder").value) $("backup-folder").value = defaultFolder;
       }
       applyExportLimits(data.export_limits);
+      fillBatchInputs();
     });
   }
 
@@ -165,6 +229,8 @@
       box.appendChild(label);
     });
     $("export-where").value = "";
+    $("export-filename").value = ctx.table || "";
+    fillBatchInputs();
     if (!$("export-folder").value) $("export-folder").value = defaultFolder;
     $("export-error").hidden = true;
     $("export-modal").hidden = false;
@@ -209,6 +275,8 @@
       else $("db-export-sort").value = dbExportSort;
     }
     applyExportLimits(exportLimits);
+    fillBatchInputs();
+    if ($("db-export-filename")) $("db-export-filename").value = "";
     renderDbExportTables();
     if (!$("db-export-folder").value) $("db-export-folder").value = defaultFolder;
     $("db-export-error").hidden = true;
@@ -311,7 +379,9 @@
       chunk_bytes: chunkBytes,
       gzip: $("db-export-gzip").checked,
       nolock: $("db-export-nolock").checked,
-      workers: window.SqlFormat.parseInteger($("db-export-workers").value) || 3
+      workers: window.SqlFormat.parseInteger($("db-export-workers").value) || 3,
+      batch_size: readBatchSize("db-export-batch"),
+      file_name: ($("db-export-filename") && $("db-export-filename").value) || ""
     };
     $("db-export-start").disabled = true;
     window.SqlLoading.showIn(
@@ -384,7 +454,9 @@
       chunk_rows: chunkRows,
       chunk_bytes: chunkBytes,
       gzip: $("export-gzip").checked,
-      nolock: $("export-nolock").checked
+      nolock: $("export-nolock").checked,
+      batch_size: readBatchSize("export-batch"),
+      file_name: ($("export-filename") && $("export-filename").value) || ""
     };
     $("export-start").disabled = true;
     window.SqlLoading.showIn(
@@ -551,13 +623,22 @@
     }
     var html = "";
     if (currents.length) {
-      html += '<div class="job-now"><p class="job-now-label">Sedang diexport</p>';
+      html += '<div class="job-now"><p class="job-now-label">Sedang diexport dari ' +
+        escapeHtml(job.database || "database") + "</p>";
       currents.forEach(function (item) {
+        var canSkip = isActiveJob(job) && item.status !== "cancelling";
         html += '<div class="job-now-item">' +
-          '<strong>' + escapeHtml(item.schema ? objectName(item) : (item.name || "")) + "</strong>" +
+          '<strong>' + escapeHtml(objectLabel(job, item)) + "</strong>" +
           '<span>' + escapeHtml(statusLabel(item.status || job.status)) +
           (item.rows_written ? " · " + formatCount(item.rows_written) + " baris" : "") +
-          "</span></div>";
+          "</span>" +
+          (canSkip
+            ? '<button type="button" class="btn-tiny" data-skip="' + escapeHtml(job.id) +
+              '" data-schema="' + escapeHtml(item.schema || "") +
+              '" data-name="' + escapeHtml(item.name || job.table || "") +
+              '">Batalkan</button>'
+            : "") +
+          "</div>";
       });
       html += "</div>";
     }
@@ -574,7 +655,7 @@
     html += '<div class="job-tables">';
     tables.forEach(function (item) {
       html += '<div class="job-table is-' + escapeHtml(item.status || "queued") + '">' +
-        "<span>" + escapeHtml(objectName(item)) + "</span>" +
+        "<span>" + escapeHtml(objectLabel(job, item)) + "</span>" +
         "<em>" + escapeHtml(statusLabel(item.status)) +
         (item.rows_written ? " · " + formatCount(item.rows_written) : "") +
         (item.error ? " · " + escapeHtml(item.error) : "") +
@@ -592,64 +673,86 @@
       tableScrolls.push(el.scrollTop);
     });
     if (!jobs.length) {
-      host.innerHTML = '<div class="empty-state"><h3>Belum ada job</h3><p>Export CSV atau backup .bak muncul di sini. File sudah ada di folder yang Anda pilih.</p></div>';
+      host.innerHTML = '<div class="empty-state"><h3>Belum ada job</h3><p>Export CSV atau backup .bak muncul di sini. Yang selesai atau dibatalkan tetap di riwayat, lengkap dengan file yang sudah tertulis.</p></div>';
       return;
     }
     host.innerHTML = "";
-    jobs.slice().reverse().forEach(function (job) {
-      var card = document.createElement("div");
-      card.className = "job-card" + (isActiveJob(job) ? " is-active" : "");
-      var pct = "";
-      if (job.row_count_estimate && job.rows_written) {
-        pct = " · " + Math.min(100, Math.round(job.rows_written / job.row_count_estimate * 100)) + "%";
-      }
-      var title;
-      if (job.kind === "backup") {
-        title = "Backup " + job.database;
-      } else if (job.kind === "export_db") {
-        title = "Export database " + job.database;
-        if (job.tables_total) {
-          title += " · " + (job.tables_done || 0) + "/" + job.tables_total + " tabel";
-        }
-      } else {
-        title = "Export " + (job.schema ? job.schema + "." : "") + job.table;
-      }
-      var parts = (job.parts || []).map(function (part) {
-        return '<a class="job-file" href="/api/export/' + encodeURIComponent(job.id) + "/parts/" + encodeURIComponent(part.name) +
-          '">' + escapeHtml(part.name) + (part.rows ? " · " + formatCount(part.rows) + " baris" : "") +
-          " · " + formatBytes(part.bytes) + "</a>";
-      }).join("");
-      var actions = "";
-      if (job.can_pause) {
-        actions += '<button type="button" class="btn-secondary" data-pause="' + escapeHtml(job.id) + '">Jeda</button>';
-      }
-      if (job.can_resume) {
-        actions += '<button type="button" class="btn-primary" data-resume="' + escapeHtml(job.id) + '">Lanjut</button>';
-      }
-      if (job.can_cancel) {
-        actions += '<button type="button" class="btn-secondary" data-cancel="' + escapeHtml(job.id) + '"' +
-          (job.status === "cancelling" ? " disabled" : "") + ">" +
-          (job.status === "cancelling" ? "Membatalkan..." : "Batalkan") + "</button>";
-      }
-      card.innerHTML =
-        "<h4>" + escapeHtml(title) + "</h4>" +
-        '<p class="job-meta"><span class="job-status is-' + escapeHtml(job.status) + '">' +
-        escapeHtml(statusLabel(job.status)) + "</span>" +
-        (job.rows_written ? " · " + formatCount(job.rows_written) +
-          (job.row_count_estimate != null ? " / " + formatCount(job.row_count_estimate) : "") + " baris" : "") +
-        pct + " · " + formatBytes(job.bytes_written) +
-        (job.workers && job.kind === "export_db" ? " · " + job.workers + " worker" : "") + "</p>" +
-        (job.folder ? '<p class="job-meta">' + escapeHtml(job.folder) + "</p>" : "") +
-        (job.error ? '<p class="form-error">' + escapeHtml(job.error) + (job.hint ? " — " + escapeHtml(job.hint) : "") + "</p>" : "") +
-        renderJobTables(job) +
-        '<div class="job-files">' + (parts || "<span class='job-meta'>Belum ada file siap.</span>") + "</div>" +
-        (actions ? '<div class="job-actions">' + actions + "</div>" : "");
-      host.appendChild(card);
+    var active = [];
+    var history = [];
+    jobs.forEach(function (job) {
+      if (isActiveJob(job)) active.push(job);
+      else history.push(job);
     });
+    function appendSection(title, items) {
+      if (!items.length) return;
+      var head = document.createElement("p");
+      head.className = "job-section";
+      head.textContent = title;
+      host.appendChild(head);
+      items.slice().reverse().forEach(function (job) {
+        host.appendChild(renderJobCard(job));
+      });
+    }
+    appendSection("Sedang berjalan", active);
+    appendSection("Riwayat", history);
     host.scrollTop = bodyScroll;
     Array.prototype.forEach.call(host.querySelectorAll(".job-tables"), function (el, index) {
       if (tableScrolls[index] != null) el.scrollTop = tableScrolls[index];
     });
+  }
+
+  function renderJobCard(job) {
+    var card = document.createElement("div");
+    card.className = "job-card" + (isActiveJob(job) ? " is-active" : "");
+    var pct = "";
+    if (job.row_count_estimate && job.rows_written) {
+      pct = " · " + Math.min(100, Math.round(job.rows_written / job.row_count_estimate * 100)) + "%";
+    }
+    var title;
+    if (job.kind === "backup") {
+      title = "Backup " + job.database;
+    } else if (job.kind === "export_db") {
+      title = "Export database " + job.database;
+      if (job.tables_total) {
+        title += " · " + (job.tables_done || 0) + "/" + job.tables_total + " tabel";
+      }
+    } else {
+      title = "Export " + objectLabel(job, { schema: job.schema, name: job.table });
+    }
+    var parts = (job.parts || []).map(function (part) {
+      return '<a class="job-file" href="/api/export/' + encodeURIComponent(job.id) + "/parts/" + encodeURIComponent(part.name) +
+        '">' + escapeHtml(part.name) + (part.rows ? " · " + formatCount(part.rows) + " baris" : "") +
+        " · " + formatBytes(part.bytes) + "</a>";
+    }).join("");
+    var actions = "";
+    if (job.can_pause) {
+      actions += '<button type="button" class="btn-secondary" data-pause="' + escapeHtml(job.id) + '">Jeda</button>';
+    }
+    if (job.can_resume) {
+      actions += '<button type="button" class="btn-primary" data-resume="' + escapeHtml(job.id) + '">Lanjut</button>';
+    }
+    if (job.can_cancel) {
+      actions += '<button type="button" class="btn-secondary" data-cancel="' + escapeHtml(job.id) + '"' +
+        (job.status === "cancelling" ? " disabled" : "") + ">" +
+        (job.status === "cancelling" ? "Membatalkan..." : "Batalkan") + "</button>";
+    }
+    card.innerHTML =
+      "<h4>" + escapeHtml(title) + "</h4>" +
+      '<p class="job-meta"><span class="job-status is-' + escapeHtml(job.status) + '">' +
+      escapeHtml(statusLabel(job.status)) + "</span>" +
+      (job.rows_written ? " · " + formatCount(job.rows_written) +
+        (job.row_count_estimate != null ? " / " + formatCount(job.row_count_estimate) : "") + " baris" : "") +
+      pct + " · " + formatBytes(job.bytes_written) +
+      (job.workers && job.kind === "export_db" ? " · " + job.workers + " worker" : "") +
+      (job.batch_size && job.kind !== "backup" ? " · " + formatCount(job.batch_size) + " /ambil" : "") +
+      (job.file_prefix && job.kind !== "backup" ? " · " + escapeHtml(job.file_prefix) : "") + "</p>" +
+      (job.database ? '<p class="job-meta">Database ' + escapeHtml(job.database) + "</p>" : "") +
+      (job.folder ? '<p class="job-meta">' + escapeHtml(job.folder) + "</p>" : "") +
+      (job.error ? '<p class="form-error">' + escapeHtml(job.error) + (job.hint ? " — " + escapeHtml(job.hint) : "") + "</p>" : "") +
+      renderJobTables(job) +
+      '<div class="job-files">' + (parts || "<span class='job-meta'>Belum ada file siap.</span>") + "</div>" +
+      (actions ? '<div class="job-actions">' + actions + "</div>" : "");
+    return card;
   }
 
   function syncWatch(jobs) {
@@ -680,6 +783,7 @@
     window.SqlSelect.mount($("db-export-sort"), { placeholder: "Urutkan..." });
     window.SqlFormat.bindInput($("export-chunk-custom"), { min: 1, max: 1024 });
     window.SqlFormat.bindInput($("db-export-chunk-custom"), { min: 1, max: 1024 });
+    fillBatchInputs();
     $("export-chunk-mode").addEventListener("change", syncChunkMode);
     $("export-chunk-size").addEventListener("change", syncChunkMode);
     $("db-export-chunk-mode").addEventListener("change", syncDbChunkMode);
@@ -733,13 +837,22 @@
       var cancelId = event.target.getAttribute("data-cancel");
       var pauseId = event.target.getAttribute("data-pause");
       var resumeId = event.target.getAttribute("data-resume");
+      var skipId = event.target.getAttribute("data-skip");
       var url = "";
-      if (cancelId) url = "/api/export/" + cancelId + "/cancel";
+      var options = { method: "POST" };
+      if (skipId) {
+        url = "/api/export/" + skipId + "/skip";
+        options.headers = { "Content-Type": "application/json" };
+        options.body = JSON.stringify({
+          schema: event.target.getAttribute("data-schema") || "",
+          name: event.target.getAttribute("data-name") || ""
+        });
+      } else if (cancelId) url = "/api/export/" + cancelId + "/cancel";
       else if (pauseId) url = "/api/export/" + pauseId + "/pause";
       else if (resumeId) url = "/api/export/" + resumeId + "/resume";
       if (!url) return;
       event.target.disabled = true;
-      api(url, { method: "POST" }).then(refreshJobs).catch(function () {
+      api(url, options).then(refreshJobs).catch(function () {
         event.target.disabled = false;
       });
     });

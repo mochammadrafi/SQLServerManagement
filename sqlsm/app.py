@@ -27,6 +27,7 @@ from sqlsm.export import (
     list_jobs,
     pause_job,
     resume_job,
+    skip_current,
     start_backup,
     start_export,
     start_export_database,
@@ -594,6 +595,10 @@ def api_export_start():
     except (TypeError, ValueError):
         chunk_bytes = 0
     try:
+        batch_size = int(payload.get("batch_size") or 0)
+    except (TypeError, ValueError):
+        batch_size = 0
+    try:
         job = start_export(
             sid=_sid(),
             cfg=item["cfg"],
@@ -607,6 +612,8 @@ def api_export_start():
             use_gzip=bool(payload.get("gzip", True)),
             nolock=bool(payload.get("nolock", True)),
             folder=str(payload.get("folder") or ""),
+            batch_size=batch_size or None,
+            file_name=str(payload.get("file_name") or ""),
         )
         return jsonify({"ok": True, "job": job.public()})
     except Exception as exc:
@@ -631,6 +638,10 @@ def api_export_database():
         workers = int(payload.get("workers") or 3)
     except (TypeError, ValueError):
         workers = 3
+    try:
+        batch_size = int(payload.get("batch_size") or 0)
+    except (TypeError, ValueError):
+        batch_size = 0
     tables = []
     for entry in payload.get("tables") or []:
         if not isinstance(entry, dict):
@@ -653,6 +664,8 @@ def api_export_database():
             nolock=bool(payload.get("nolock", True)),
             folder=str(payload.get("folder") or ""),
             workers=workers,
+            batch_size=batch_size or None,
+            file_name=str(payload.get("file_name") or ""),
         )
         return jsonify({"ok": True, "job": job.public()})
     except Exception as exc:
@@ -676,6 +689,23 @@ def api_export_status(job_id):
 def api_export_cancel(job_id):
     try:
         return jsonify({"ok": True, "job": cancel_job(_sid(), job_id).public()})
+    except Exception as exc:
+        return _error_payload(exc)
+
+
+@app.route("/api/export/<job_id>/skip", methods=["POST"])
+def api_export_skip(job_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        return jsonify({
+            "ok": True,
+            "job": skip_current(
+                _sid(),
+                job_id,
+                str(payload.get("schema") or ""),
+                str(payload.get("name") or payload.get("table") or ""),
+            ).public(),
+        })
     except Exception as exc:
         return _error_payload(exc)
 

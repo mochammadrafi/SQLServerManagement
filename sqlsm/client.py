@@ -1321,7 +1321,7 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
             "sql": sql,
         }
 
-    def iter_table_rows(self, database, schema, table, columns, where="", order_keys=None, nolock=True, batch_size=2000):
+    def iter_table_rows(self, database, schema, table, columns, where="", order_keys=None, nolock=True, batch_size=10000):
         self._assert_db(database)
         if not columns:
             raise ClientError("Pilih minimal satu kolom untuk export.")
@@ -1334,7 +1334,7 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
             sql += " WHERE (%s)" % where_sql
         # No ORDER BY: on 100M+ rows a sort/key-ordered scan can stall before the first row,
         # especially when WHERE does not match the clustered index.
-        sql += " OPTION (FAST %s)" % int(batch_size or 2000)
+        sql += " OPTION (FAST %s)" % int(batch_size or 10000)
         item = self._checkout()
         discard = False
         cursor = self._cursor(item.raw)
