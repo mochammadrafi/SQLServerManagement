@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=19">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=21">
   <style>
     body.is-booting .app-header,
     body.is-booting .workspace,
@@ -99,7 +99,7 @@
         <button type="button" class="btn-primary" id="btn-run">Jalankan</button>
         <button type="button" class="btn-secondary" id="btn-cancel" hidden>Batalkan</button>
         <button type="button" class="btn-secondary" id="btn-new">Query baru</button>
-        <span class="hint-inline">F5 atau Ctrl+Enter. Tabel besar: pager + export, jangan SELECT *</span>
+        <span class="hint-inline">F5 atau Ctrl+Enter. Esc membatalkan. Tabel besar: pager + export, jangan SELECT *</span>
       </div>
       <div class="work-split">
         <div class="editor-wrap">
@@ -152,9 +152,9 @@
         <h4>Tabel besar (100 juta+ baris)</h4>
         <p>Aplikasi tidak pernah memuat seluruh tabel. Yang tampil hanya satu halaman (100–1000 baris). Jumlah baris diambil dari statistik partisi, bukan <code>COUNT(*)</code>.</p>
         <h4>Export / backup</h4>
-        <p>Dari kartu database: Backup (.bak) atau Export semua tabel (CSV). Dari kartu tabel: Export tabel itu saja. Daftar tabel bisa diurutkan nama / baris / ukuran. Export database memakai beberapa worker (default 3) supaya beberapa tabel jalan bersamaan. Progress, jeda, dan batal ada di <strong>Export</strong> di header. File .bak harus ke folder yang bisa ditulis akun SQL Server.</p>
+        <p>Dari kartu database: Backup (.bak) atau Export semua tabel (CSV). Dari kartu tabel: Export tabel itu saja. Daftar tabel bisa diurutkan nama / baris / ukuran. Beberapa export bisa jalan bersamaan. Export database memakai worker paralel (default 3, sampai 32; dipangkas otomatis jika slot penuh). Progress, jeda, dan batal ada di <strong>Export</strong> di header. File .bak harus ke folder yang bisa ditulis akun SQL Server.</p>
         <h4>SQL</h4>
-        <p>Mode SQL untuk query ad-hoc. Jangan <code>SELECT *</code> tanpa <code>TOP</code> pada tabel besar. Hasil dipotong 1000 baris. F5 / Ctrl+Enter menjalankan SQL.</p>
+        <p>Mode SQL untuk query ad-hoc. Jangan <code>SELECT *</code> tanpa <code>TOP</code> pada tabel besar. Hasil dipotong 1000 baris. F5 / Ctrl+Enter menjalankan SQL. <strong>Batalkan</strong> atau Esc menghentikan query yang sedang jalan.</p>
         <h4>Hati-hati</h4>
         <p><code>DELETE</code> / <code>UPDATE</code> / <code>DROP</code> jalan apa adanya. Tidak ada undo.</p>
       </div>
@@ -286,15 +286,9 @@
         </label>
         <label class="field">
           <span>Worker paralel</span>
-          <select id="db-export-workers">
-            <option value="1">1 thread</option>
-            <option value="2">2 threads</option>
-            <option value="3" selected>3 threads</option>
-            <option value="4">4 threads</option>
-            <option value="6">6 threads</option>
-            <option value="8">8 threads</option>
-          </select>
+          <input id="db-export-workers" type="text" inputmode="numeric" value="3">
         </label>
+        <p class="card-sub" id="db-export-workers-hint">Beberapa tabel diexport bersamaan. Bisa diisi sampai 32. Kalau slot penuh, jumlahnya disesuaikan sendiri. Beberapa job export bisa jalan sekaligus.</p>
         <label class="choice tight"><input id="db-export-gzip" type="checkbox" checked> <span>Kompres gzip (.csv.gz)</span></label>
         <label class="choice tight"><input id="db-export-nolock" type="checkbox" checked> <span>NOLOCK / read uncommitted (jangan kunci tabel produksi)</span></label>
         <p id="db-export-error" class="form-error" hidden></p>
@@ -366,9 +360,9 @@
     </div>
   </div>
 
-  <script src="{{ url_for('static', filename='js/ui.js') }}?v=19"></script>
-  <script src="{{ url_for('static', filename='js/grid.js') }}?v=19"></script>
-  <script src="{{ url_for('static', filename='js/export.js') }}?v=19"></script>
-  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=19"></script>
+  <script src="{{ url_for('static', filename='js/ui.js') }}?v=21"></script>
+  <script src="{{ url_for('static', filename='js/grid.js') }}?v=21"></script>
+  <script src="{{ url_for('static', filename='js/export.js') }}?v=21"></script>
+  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=21"></script>
 </body>
 </html>

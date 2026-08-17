@@ -1468,6 +1468,7 @@
   });
   document.addEventListener("keydown", function (event) {
     if (event.key === "Escape") {
+      if (document.body.classList.contains("is-working")) return;
       if (!detailModal.hidden) detailModal.hidden = true;
       if (!helpModal.hidden) helpModal.hidden = true;
     }

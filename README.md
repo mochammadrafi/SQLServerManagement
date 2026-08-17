@@ -12,7 +12,8 @@ It is a local Flask app (Python 3.8) that opens in the browser. Use it when full
 - Fast row counts from partition stats (not `COUNT(*)`)
 - Keyset paging (PK / clustered / identity), virtualized result grid
 - Async CSV/gzip export in chunks, with progress, pause/resume, cancel, and per-part download
-- Database export with parallel workers (default 3 threads) and live per-table status
+- Database export with parallel workers (default 3, up to 32) and live per-table status
+- Multiple export jobs can run at the same time (backups of the same database stay exclusive)
 - Database backup to `.bak` (async job; restore wizard not included yet)
 - Run SQL (F5 / Ctrl+Enter), including `GO` batches
 - Show server version, edition, collation, and active sessions
@@ -94,7 +95,7 @@ Mixed Mode (for `sa`):
 2. Click a database in Object Explorer.
 3. Click a table. Only one page loads (default 200 rows), even if the table has 100 million rows.
 4. Use **Berikutnya** or jump by key to walk the table. Do not `SELECT *` the whole table.
-5. **Export tabel** writes CSV/gzip in the background (default 1 million rows per file). Download each part from **Export** in the header. Pause, resume, or cancel from that panel. Database export can run several tables at once (default 3 workers). In Browse, sort tables by name, row count, or size.
+5. **Export tabel** writes CSV/gzip in the background (default 1 million rows per file). Download each part from **Export** in the header. Pause, resume, or cancel from that panel. You can start several exports at once. Database export can run several tables at once (default 3 workers, up to 32; the app lowers the count if connection slots are full). In Browse, sort tables by name, row count, or size.
 6. Double-click a cell for the full value.
 
 Excel cannot open 100 million rows (limit 1,048,576). Use CSV/gzip. A full export can be tens of GB and run for hours; filter with WHERE when you can.
@@ -113,6 +114,9 @@ Export files are written under the default data folder above (or `SQLSM_EXPORT_D
 | `SQLSM_IDLE_SEC` | `7200` | Close idle SQL connections after N seconds |
 | `SQLSM_ALLOW_REMOTE` | unset | Set to `1` to allow non-loopback bind without startup warning |
 | `SQLSM_EXPORT_DIR` | `~/sqlsm-data` (macOS) / `C:\SQLSM-Data` (Windows) | Folder for CSV/gzip parts and backup files |
+| `SQLSM_MAX_WORKERS` | `32` | Max worker threads per database export |
+| `SQLSM_MAX_JOBS` | `24` | Max concurrent export/backup jobs per session |
+| `SQLSM_MAX_TOTAL_WORKERS` | `64` | Max export connections across all running jobs |
 
 ## Layout
 
@@ -132,6 +136,6 @@ sqlsm/static/          CSS / JS
 - Browse and ad-hoc query never materialize the full 100 million rows
 - Ad-hoc SELECT is capped at 1000 rows; use table pager + export for full data
 - Deep `OFFSET` on a heap (no PK/identity) is rejected past 100,000 rows
-- One export or backup job at a time per session (a database export may use up to 8 worker threads)
+- Concurrent exports are allowed; worker count is clamped so SQL connections stay within limits. Two backups of the same database at once are blocked.
 - Restore from `.bak` wizard not included yet; no job agent or security editor
 - Do not expose the HTTP port to the network

@@ -22,6 +22,7 @@ from sqlsm.client import (
 )
 from sqlsm.export import (
     cancel_job,
+    export_limits,
     get_job,
     list_jobs,
     pause_job,
@@ -279,6 +280,7 @@ def api_meta():
             "default_folder": existing_start_dir(default_data_folder()),
             "profiles": list_profiles(),
             "csrf_token": _csrf_token(),
+            "export_limits": export_limits(),
         }
     )
 

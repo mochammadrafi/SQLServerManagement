@@ -415,6 +415,12 @@ fieldset.field {
 .panel-loading p { margin: 0; color: var(--muted); line-height: 1.45; font-size: 13px; }
 .panel-loading.is-dark p { color: #bfdbfe; }
 .panel-loading .boot-spinner { margin-bottom: 12px; }
+.panel-cancel { margin-top: 14px; }
+.panel-loading.is-dark .panel-cancel {
+  background: transparent;
+  color: #fff;
+  border-color: rgba(255,255,255,0.35);
+}
 .sql-select { position: relative; min-width: 0; width: 100%; }
 .sql-select-native {
   position: absolute;

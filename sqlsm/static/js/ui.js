@@ -163,6 +163,22 @@
         cancelWork(false);
       });
     }
+    if (!document._sqlPanelCancel) {
+      document._sqlPanelCancel = true;
+      document.addEventListener("click", function (event) {
+        var btn = event.target;
+        if (!btn || !btn.classList || !btn.classList.contains("panel-cancel")) return;
+        event.preventDefault();
+        cancelWork(false);
+      });
+      document.addEventListener("keydown", function (event) {
+        if (event.key !== "Escape") return;
+        if (!document.body.classList.contains("is-working")) return;
+        if (document.querySelector(".modal:not([hidden])")) return;
+        event.preventDefault();
+        cancelWork(false);
+      });
+    }
   }
 
   function setWorkCancelVisible(on) {
@@ -172,7 +188,13 @@
     var sqlMode = document.getElementById("mode-sql");
     var inSql = sqlMode && !sqlMode.hidden;
     var runCancel = document.getElementById("btn-cancel");
-    if (runCancel) runCancel.hidden = !on || !inSql;
+    if (runCancel) {
+      runCancel.hidden = !on || !inSql;
+      if (on && inSql) {
+        runCancel.disabled = false;
+        runCancel.textContent = "Batalkan";
+      }
+    }
     var run = document.getElementById("btn-run");
     if (run) run.disabled = !!on && inSql;
   }
@@ -201,19 +223,61 @@
     });
   }
 
-  function cancelWork(fromBoot) {
+  function markCancelling() {
     setStatus("Membatalkan", "Menghentikan perintah di SQL Server.");
-    if (workAbort) {
-      try { workAbort.abort(); } catch (err) {}
+    Array.prototype.forEach.call(document.querySelectorAll(".panel-cancel, #btn-cancel"), function (btn) {
+      btn.disabled = true;
+      btn.textContent = "Membatalkan...";
+    });
+    var statusBtn = document.getElementById("btn-cancel-work");
+    if (statusBtn) statusBtn.disabled = true;
+  }
+
+  function resetCancelLabels() {
+    var runCancel = document.getElementById("btn-cancel");
+    if (runCancel) {
+      runCancel.disabled = false;
+      runCancel.textContent = "Batalkan";
     }
-    if (!fromBoot) {
-      fetch("/api/cancel", {
+    var statusBtn = document.getElementById("btn-cancel-work");
+    if (statusBtn) statusBtn.disabled = false;
+  }
+
+  function cancelWork(fromBoot) {
+    markCancelling();
+    if (fromBoot) {
+      if (workAbort) {
+        try { workAbort.abort(); } catch (err) {}
+      }
+      return;
+    }
+    var req;
+    if (global.SqlApi && global.SqlApi.request) {
+      req = global.SqlApi.request("/api/cancel", {
+        method: "POST",
+        background: true,
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      });
+    } else {
+      req = fetch("/api/cancel", {
         method: "POST",
         credentials: "same-origin",
         headers: { "Content-Type": "application/json", "X-SQLSM-Token": csrfToken },
         body: "{}"
-      }).catch(function () {});
+      });
     }
+    Promise.resolve(req).then(function () {
+      setTimeout(function () {
+        if (workAbort) {
+          try { workAbort.abort(); } catch (err) {}
+        }
+      }, 1500);
+    }).catch(function () {
+      if (workAbort) {
+        try { workAbort.abort(); } catch (err) {}
+      }
+    });
   }
 
   function track(title, text) {
@@ -237,6 +301,7 @@
     setHeaderLock(false);
     setWorkCancelVisible(false);
     setStatusActive(false);
+    resetCancelLabels();
     document.body.classList.remove("is-working");
   }
 
@@ -296,6 +361,7 @@
     setHeaderLock(false);
     setWorkCancelVisible(false);
     setStatusActive(false);
+    resetCancelLabels();
     Array.prototype.forEach.call(document.querySelectorAll(".is-loading-host"), function (host) {
       host.classList.remove("is-loading-host");
       var layer = childByClass(host, "panel-loading");
@@ -326,13 +392,18 @@
     }
     var compact = host.classList.contains("explorer-body") ? " is-dark" : "";
     layer.className = "panel-loading" + compact;
+    var canCancel = opts.track !== false;
     layer.innerHTML =
       '<div class="panel-loading-inner">' +
         '<div class="boot-spinner dark"></div>' +
         "<h3>" + escapeHtml(title || "Memuat") + "</h3>" +
         "<p>" + escapeHtml(text || "") + "</p>" +
+        (canCancel
+          ? '<button type="button" class="btn-secondary panel-cancel">Batalkan</button>'
+          : "") +
       "</div>";
     layer.hidden = false;
+    bindCancelButtons();
   }
 
   function hideIn(host) {

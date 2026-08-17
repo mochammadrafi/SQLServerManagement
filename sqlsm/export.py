@@ -19,7 +19,34 @@ EXPORT_ROOT = os.environ.get("SQLSM_EXPORT_DIR") or default_data_folder()
 _LOCK = threading.Lock()
 _JOBS = {}  # type: Dict[str, "ExportJob"]
 _ACTIVE = ("queued", "running", "paused", "cancelling")
-_MAX_WORKERS = 8
+
+
+def _env_int(name, default, minimum, maximum):
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        value = default
+    if value < minimum:
+        value = minimum
+    if value > maximum:
+        value = maximum
+    return value
+
+
+_MAX_WORKERS = _env_int("SQLSM_MAX_WORKERS", 32, 1, 128)
+_MAX_JOBS = _env_int("SQLSM_MAX_JOBS", 24, 1, 200)
+_MAX_TOTAL_WORKERS = _env_int("SQLSM_MAX_TOTAL_WORKERS", 64, 1, 256)
+if _MAX_TOTAL_WORKERS < _MAX_WORKERS:
+    _MAX_TOTAL_WORKERS = _MAX_WORKERS
+
+
+def export_limits():
+    return {
+        "max_workers": _MAX_WORKERS,
+        "max_jobs": _MAX_JOBS,
+        "max_total_workers": _MAX_TOTAL_WORKERS,
+    }
 
 
 def _now():
@@ -261,6 +288,81 @@ def _clamp_workers(value):
     return workers
 
 
+def _active_jobs_unlocked(sid):
+    return [job for job in _JOBS.values() if job.sid == sid and job.status in _ACTIVE]
+
+
+def _used_workers_unlocked(sid):
+    used = 0
+    for job in _active_jobs_unlocked(sid):
+        used += max(1, int(getattr(job, "workers", 1) or 1))
+    return used
+
+
+def _fit_workers(sid, requested, table_count=None):
+    requested = _clamp_workers(requested)
+    if table_count is not None:
+        requested = max(1, min(requested, max(1, int(table_count))))
+    remaining = _MAX_TOTAL_WORKERS - _used_workers_unlocked(sid)
+    if remaining >= 1:
+        return max(1, min(requested, remaining))
+    if len(_active_jobs_unlocked(sid)) < _MAX_JOBS:
+        return 1
+    raise ClientError(
+        "Terlalu banyak job sekaligus.",
+        "Tunggu, jeda, atau batalkan sebagian. Maksimal %s job / %s worker." % (_MAX_JOBS, _MAX_TOTAL_WORKERS),
+    )
+
+
+def _job_folder(base, name):
+    dest = ensure_writable_dir(base)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(dest, "%s_%s_%s" % (safe_name(name), stamp, uuid.uuid4().hex[:8]))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _register_job(sid, job, workers=1, table_count=None):
+    requested = _clamp_workers(workers)
+    with _LOCK:
+        if len(_active_jobs_unlocked(sid)) >= _MAX_JOBS:
+            raise ClientError(
+                "Terlalu banyak job sekaligus.",
+                "Maksimal %s job berjalan. Tunggu atau batalkan sebagian." % _MAX_JOBS,
+            )
+        if getattr(job, "kind", "export") == "backup":
+            for other in _active_jobs_unlocked(sid):
+                if getattr(other, "kind", "") == "backup" and other.database == job.database:
+                    raise ClientError(
+                        "Backup %s masih berjalan." % job.database,
+                        "SQL Server tidak bisa dua backup database yang sama sekaligus.",
+                    )
+        fitted = _fit_workers(sid, requested, table_count=table_count)
+        job.workers = fitted
+        _JOBS[job.id] = job
+    if fitted < requested:
+        extra = "Worker dipangkas dari %s ke %s supaya tidak melebihi slot koneksi." % (requested, fitted)
+        job.hint = ("%s %s" % (job.hint, extra)).strip() if job.hint else extra
+    return fitted
+
+
+def _connect_export(cfg):
+    export_cfg = ConnectionConfig(**cfg.__dict__)
+    export_cfg.query_timeout = 86400
+    last = None  # type: Optional[Exception]
+    for attempt in range(4):
+        try:
+            return connect_client(export_cfg)
+        except Exception as exc:
+            last = exc
+            if attempt >= 3:
+                break
+            time.sleep(0.35 * (attempt + 1))
+    if isinstance(last, ClientError):
+        raise last
+    raise ClientError(str(last) if last else "Gagal membuka koneksi export.")
+
+
 def _table_key(schema, name):
     return (str(schema or ""), str(name or ""))
 
@@ -336,8 +438,6 @@ def start_export(sid, cfg, database, schema, table, columns, where="", chunk_row
         chunk_bytes = 0
     if chunk_bytes and chunk_bytes < 64 * 1024 * 1024:
         raise ClientError("Ukuran pecahan terlalu kecil.", "Minimum 64 MB supaya tidak menghasilkan ribuan file.")
-    with _LOCK:
-        _assert_no_active(sid)
     probe_cfg = ConnectionConfig(**cfg.__dict__)
     probe = connect_client(probe_cfg)
     try:
@@ -355,10 +455,7 @@ def start_export(sid, cfg, database, schema, table, columns, where="", chunk_row
         keys = stats.get("keys") or []
     finally:
         probe.close()
-    dest = ensure_writable_dir(folder or EXPORT_ROOT)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    dest = os.path.join(dest, "%s_%s" % (safe_name(table), stamp))
-    os.makedirs(dest, exist_ok=True)
+    dest = _job_folder(folder or EXPORT_ROOT, table)
     job = ExportJob(
         sid=sid,
         cfg=cfg,
@@ -375,9 +472,14 @@ def start_export(sid, cfg, database, schema, table, columns, where="", chunk_row
         folder=dest,
     )
     job._order_keys = keys  # type: ignore
-    with _LOCK:
-        _assert_no_active(sid)
-        _JOBS[job.id] = job
+    try:
+        _register_job(sid, job, workers=1)
+    except Exception:
+        try:
+            os.rmdir(dest)
+        except Exception:
+            pass
+        raise
     job.save_meta()
     thread = threading.Thread(target=_run_job, args=(job,), name="export-" + job.id)
     thread.daemon = True
@@ -399,15 +501,6 @@ def _purge_jobs():
             _JOBS.pop(job_id, None)
 
 
-def _assert_no_active(sid):
-    active = [job for job in _JOBS.values() if job.sid == sid and job.status in _ACTIVE]
-    if active:
-        raise ClientError(
-            "Masih ada job yang berjalan.",
-            "Tunggu selesai, jeda selesai dilanjutkan, atau batalkan dulu.",
-        )
-
-
 def start_export_database(sid, cfg, database, tables=None, include_views=False, include_system=False, chunk_rows=0, chunk_bytes=0, use_gzip=True, nolock=True, folder="", workers=3):
     database = (database or "").strip()
     if not database:
@@ -422,8 +515,6 @@ def start_export_database(sid, cfg, database, tables=None, include_views=False, 
         chunk_bytes = 0
     if chunk_bytes and chunk_bytes < 64 * 1024 * 1024:
         raise ClientError("Ukuran pecahan terlalu kecil.", "Minimum 64 MB supaya tidak menghasilkan ribuan file.")
-    with _LOCK:
-        _assert_no_active(sid)
     probe = connect_client(ConnectionConfig(**cfg.__dict__))
     try:
         catalog = probe.list_objects(database, include_counts=True)
@@ -462,10 +553,7 @@ def start_export_database(sid, cfg, database, tables=None, include_views=False, 
                 has_estimate = True
     finally:
         probe.close()
-    dest = ensure_writable_dir(folder or EXPORT_ROOT)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    dest = os.path.join(dest, "%s_%s" % (safe_name(database), stamp))
-    os.makedirs(dest, exist_ok=True)
+    dest = _job_folder(folder or EXPORT_ROOT, database)
     job = ExportJob(
         sid=sid,
         cfg=cfg,
@@ -482,9 +570,6 @@ def start_export_database(sid, cfg, database, tables=None, include_views=False, 
         folder=dest,
     )
     job.kind = "export_db"
-    job.workers = _clamp_workers(workers)
-    if job.workers > len(picked):
-        job.workers = max(1, len(picked))
     job.tables_total = len(picked)
     job.tables_done = 0
     job.current_object = None
@@ -509,9 +594,14 @@ def start_export_database(sid, cfg, database, tables=None, include_views=False, 
         }
         for item in job._tables
     ]
-    with _LOCK:
-        _assert_no_active(sid)
-        _JOBS[job.id] = job
+    try:
+        _register_job(sid, job, workers=workers, table_count=len(picked))
+    except Exception:
+        try:
+            os.rmdir(dest)
+        except Exception:
+            pass
+        raise
     job.save_meta()
     thread = threading.Thread(target=_run_db_export, args=(job,), name="export-db-" + job.id)
     thread.daemon = True
@@ -529,15 +619,18 @@ def _run_db_export(job):
     for item in tables:
         work.put(item)
     worker_errors = []  # type: List[Exception]
+    error_lock = threading.Lock()
     workers_n = max(1, min(int(job.workers or 1), len(tables) or 1))
     job.workers = workers_n
 
-    def worker():
+    def worker(index):
         client = None
         try:
-            export_cfg = ConnectionConfig(**job.cfg.__dict__)
-            export_cfg.query_timeout = 86400
-            client = connect_client(export_cfg)
+            if index:
+                time.sleep(min(0.03 * index, 1.5))
+            if job.cancel_event.is_set():
+                return
+            client = _connect_export(job.cfg)
             with job._state_lock:
                 job._clients.append(client)
             while True:
@@ -554,7 +647,8 @@ def _run_db_export(job):
                 finally:
                     work.task_done()
         except Exception as exc:
-            worker_errors.append(exc)
+            with error_lock:
+                worker_errors.append(exc)
         finally:
             if client is not None:
                 try:
@@ -564,7 +658,7 @@ def _run_db_export(job):
 
     threads = []
     for index in range(workers_n):
-        thread = threading.Thread(target=worker, name="export-db-%s-%s" % (job.id, index + 1))
+        thread = threading.Thread(target=worker, args=(index,), name="export-db-%s-%s" % (job.id, index + 1))
         thread.daemon = True
         thread.start()
         threads.append(thread)
@@ -754,11 +848,9 @@ def _run_job(job):
     job.started_at = _now()
     _set_current(job, job.schema, job.table, rows_written=0, status="running")
     job.save_meta()
-    export_cfg = ConnectionConfig(**job.cfg.__dict__)
-    export_cfg.query_timeout = 86400
     client = None
     try:
-        client = connect_client(export_cfg)
+        client = _connect_export(job.cfg)
         job._client = client
         with job._state_lock:
             if client not in job._clients:
@@ -871,8 +963,6 @@ def start_backup(sid, cfg, database, folder="", chunk_bytes=0, compress=True):
     if not database:
         raise ClientError("Pilih database untuk backup.")
     dest = ensure_writable_dir(folder or EXPORT_ROOT)
-    with _LOCK:
-        _assert_no_active(sid)
     probe = connect_client(ConnectionConfig(**cfg.__dict__))
     size_bytes = 0
     try:
@@ -899,8 +989,9 @@ def start_backup(sid, cfg, database, folder="", chunk_bytes=0, compress=True):
     if parts_n > 64:
         parts_n = 64
     stamp = time.strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:8]
     files = [
-        os.path.join(dest, "%s_%s_%02d.bak" % (safe_name(database), stamp, index + 1))
+        os.path.join(dest, "%s_%s_%s_%02d.bak" % (safe_name(database), stamp, suffix, index + 1))
         for index in range(parts_n)
     ]
     job = ExportJob(
@@ -921,9 +1012,7 @@ def start_backup(sid, cfg, database, folder="", chunk_bytes=0, compress=True):
     job.kind = "backup"
     job._backup_files = files  # type: ignore
     job._backup_compress = bool(compress)  # type: ignore
-    with _LOCK:
-        _assert_no_active(sid)
-        _JOBS[job.id] = job
+    _register_job(sid, job, workers=1)
     job.save_meta()
     thread = threading.Thread(target=_run_backup, args=(job,), name="backup-" + job.id)
     thread.daemon = True

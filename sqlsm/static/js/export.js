@@ -5,6 +5,7 @@
   var folderPath = "";
   var defaultFolder = "";
   var dbExportSort = "name";
+  var exportLimits = { max_workers: 32, max_jobs: 24, max_total_workers: 64 };
 
   function $(id) {
     return document.getElementById(id);
@@ -78,14 +79,35 @@
     return list;
   }
 
+  function applyExportLimits(limits) {
+    if (!limits) return;
+    exportLimits.max_workers = Number(limits.max_workers || exportLimits.max_workers);
+    exportLimits.max_jobs = Number(limits.max_jobs || exportLimits.max_jobs);
+    exportLimits.max_total_workers = Number(limits.max_total_workers || exportLimits.max_total_workers);
+    var hint = $("db-export-workers-hint");
+    if (hint) {
+      hint.textContent = "Beberapa tabel diexport bersamaan. Isi 1–" +
+        exportLimits.max_workers + " thread. Kalau slot penuh, jumlahnya disesuaikan sendiri (maks " +
+        exportLimits.max_total_workers + " worker / " + exportLimits.max_jobs +
+        " job sekaligus). Beberapa export bisa jalan bersama.";
+    }
+    var input = $("db-export-workers");
+    if (input && window.SqlFormat && !input._exportBound) {
+      window.SqlFormat.bindInput(input, { min: 1, max: exportLimits.max_workers });
+      input._exportBound = true;
+    }
+  }
+
   function loadDefaultFolder() {
     return api("/api/meta").then(function (data) {
-      if (data.ok && data.default_folder) {
+      if (!data.ok) return;
+      if (data.default_folder) {
         defaultFolder = data.default_folder;
         if ($("export-folder") && !$("export-folder").value) $("export-folder").value = defaultFolder;
         if ($("db-export-folder") && !$("db-export-folder").value) $("db-export-folder").value = defaultFolder;
         if ($("backup-folder") && !$("backup-folder").value) $("backup-folder").value = defaultFolder;
       }
+      applyExportLimits(data.export_limits);
     });
   }
 
@@ -186,9 +208,7 @@
       if ($("db-export-sort")._sqlSelect) $("db-export-sort")._sqlSelect.setValue(dbExportSort);
       else $("db-export-sort").value = dbExportSort;
     }
-    if ($("db-export-workers")) {
-      window.SqlSelect.mount($("db-export-workers"), { placeholder: "Worker..." });
-    }
+    applyExportLimits(exportLimits);
     renderDbExportTables();
     if (!$("db-export-folder").value) $("db-export-folder").value = defaultFolder;
     $("db-export-error").hidden = true;
@@ -291,7 +311,7 @@
       chunk_bytes: chunkBytes,
       gzip: $("db-export-gzip").checked,
       nolock: $("db-export-nolock").checked,
-      workers: Number($("db-export-workers").value || 3)
+      workers: window.SqlFormat.parseInteger($("db-export-workers").value) || 3
     };
     $("db-export-start").disabled = true;
     window.SqlLoading.showIn(
@@ -658,7 +678,6 @@
     window.SqlSelect.mount($("db-export-chunk-size"), { placeholder: "Cari ukuran..." });
     window.SqlSelect.mount($("db-export-chunk"), { placeholder: "Cari baris..." });
     window.SqlSelect.mount($("db-export-sort"), { placeholder: "Urutkan..." });
-    window.SqlSelect.mount($("db-export-workers"), { placeholder: "Worker..." });
     window.SqlFormat.bindInput($("export-chunk-custom"), { min: 1, max: 1024 });
     window.SqlFormat.bindInput($("db-export-chunk-custom"), { min: 1, max: 1024 });
     $("export-chunk-mode").addEventListener("change", syncChunkMode);
@@ -733,6 +752,7 @@
     });
     syncChunkMode();
     syncDbChunkMode();
+    applyExportLimits(exportLimits);
     loadDefaultFolder();
   }
 

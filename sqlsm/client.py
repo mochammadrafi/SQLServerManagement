@@ -511,8 +511,7 @@ class SqlServerClient(object):
                         item.busy = True
                         item.cancel_event = threading.Event()
                         item.cursor = None
-                        if item.spid is None:
-                            item.spid = self._spid(item.raw)
+                        item.spid = self._spid(item.raw) or item.spid
                         return item
                 if len(self._pool) < self._POOL_MAX:
                     item = self._open_live()
@@ -698,6 +697,8 @@ class SqlServerClient(object):
         self._raise_sql(last or ClientError("Gagal menjalankan SQL."))
 
     def _execute_body(self, item, sql, params=None, max_rows=1000, database=None):
+        if item.spid is None:
+            item.spid = self._spid(item.raw)
         cursor = self._cursor(item.raw)
         item.cursor = cursor
         cancel_leftover = False
