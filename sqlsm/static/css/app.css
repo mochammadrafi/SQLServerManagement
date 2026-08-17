@@ -163,6 +163,13 @@ code {
   font-weight: 600;
 }
 .btn-tiny:hover { border-color: #93c5fd; color: var(--azure); }
+.btn-tiny:disabled,
+.btn-tiny:disabled:hover {
+  opacity: 0.45;
+  cursor: default;
+  border-color: #c5d0dc;
+  color: var(--text);
+}
 
 /* Connect */
 .page-connect { background: var(--bg); }
@@ -1078,6 +1085,7 @@ button.browse-card { font: inherit; }
   font-size: 12px;
   flex: 0 0 auto;
 }
+.table-bar { flex-wrap: wrap; }
 .pager { border-bottom: 0; border-top: 1px solid var(--line); }
 .table-bar-info,
 .table-bar-seek,
@@ -1089,6 +1097,7 @@ button.browse-card { font: inherit; }
 .table-bar-seek label,
 .pager label { display: flex; align-items: center; gap: 6px; }
 .table-bar-seek input,
+.table-bar-filter input,
 .pager select {
   height: 28px;
   border: 1px solid #cbd5e1;
@@ -1096,6 +1105,20 @@ button.browse-card { font: inherit; }
   padding: 0 8px;
   font: inherit;
 }
+.table-bar-filter {
+  flex: 1 1 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.table-bar-filter label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+.table-bar-filter input { flex: 1; min-width: 160px; }
 .grid-host { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .grid-note { margin: 0; padding: 6px 10px; color: var(--muted); font-size: 12px; }
 .virt {

@@ -917,6 +917,7 @@
       seek: null,
       offset: 0,
       paging: "keyset",
+      where: "",
       page: null
     };
     syncBrowseActions();
@@ -947,14 +948,22 @@
       state.table.keys = stats.keys || [];
       state.table.rowCount = stats.row_count;
       state.table.paging = stats.paging;
-      editor.value = "SELECT TOP 200 *\nFROM " + bracket(schema) + "." + bracket(table) +
-        (state.table.keys.length ? "\nORDER BY " + state.table.keys.map(bracket).join(", ") : "") + ";";
+      editor.value = tableSelectScript();
       window.SqlLoading.hideIn(browseBody);
       return loadTablePage();
     }).catch(function (err) {
       window.SqlLoading.hideIn(browseBody);
       showError(String(err));
     });
+  }
+
+  function tableSelectScript() {
+    var t = state.table;
+    if (!t) return "";
+    var sql = "SELECT TOP 200 *\nFROM " + bracket(t.schema) + "." + bracket(t.name);
+    if (t.where) sql += "\nWHERE " + t.where;
+    else if (t.keys.length) sql += "\nORDER BY " + t.keys.map(bracket).join(", ");
+    return sql + ";";
   }
 
   function tablePageUrl(after, seek, offset) {
@@ -966,6 +975,7 @@
     if (after) url += "&after=" + encodeURIComponent(JSON.stringify(after));
     if (seek) url += "&seek=" + encodeURIComponent(JSON.stringify(seek));
     if (offset) url += "&offset=" + encodeURIComponent(offset);
+    if (t.where) url += "&where=" + encodeURIComponent(t.where);
     return url;
   }
 
@@ -1016,16 +1026,26 @@
             ' <input id="seek-value" type="text" placeholder="nilai kunci"></label>' +
             '<button type="button" class="btn-tiny" id="btn-seek">Pergi</button>'
           : "<span>Tidak ada PK/identity. Jangan loncat jauh dengan OFFSET.</span>") +
+      "</div>" +
+      '<div class="table-bar-filter">' +
+        '<label>WHERE <input id="table-where" type="text" placeholder="CreatedAt >= \'2024-01-01\' AND Status = 1"></label>' +
+        '<button type="button" class="btn-tiny" id="btn-table-where">Terapkan</button>' +
       "</div>";
     var gridHost = document.createElement("div");
     gridHost.className = "grid-host";
     var pager = document.createElement("div");
     pager.className = "pager";
+    var filterPreview = page.paging === "filter";
     pager.innerHTML =
       '<button type="button" class="btn-tiny" id="page-first">Awal</button>' +
       '<button type="button" class="btn-tiny" id="page-prev">Sebelumnya</button>' +
-      '<button type="button" class="btn-tiny" id="page-next">Berikutnya</button>' +
-      "<span>Halaman " + (t.afterStack.length + 1) + (page.has_more ? "+" : "") + "</span>" +
+      '<button type="button" class="btn-tiny" id="page-next"' +
+        (filterPreview || !page.has_more ? " disabled" : "") + ">Berikutnya</button>" +
+      "<span>" +
+        (filterPreview
+          ? "Cuplikan cepat (tanpa urutan). Export untuk semua baris yang cocok."
+          : "Halaman " + (t.afterStack.length + 1) + (page.has_more ? "+" : "")) +
+      "</span>" +
       '<label>Ukuran <select id="page-size">' +
         [100, 200, 500, 1000].map(function (n) {
           return '<option value="' + n + '"' + (n === t.pageSize ? " selected" : "") + ">" +
@@ -1081,7 +1101,7 @@
       loadTablePage();
     });
     document.getElementById("page-next").addEventListener("click", function () {
-      if (!page.has_more) return;
+      if (!page.has_more || page.paging === "filter") return;
       if (t.paging === "offset") {
         t.offset += t.pageSize;
       } else if (t.lastKey) {
@@ -1100,6 +1120,25 @@
       t.offset = 0;
       loadTablePage();
     });
+    var whereInput = document.getElementById("table-where");
+    if (whereInput) {
+      whereInput.value = t.where || "";
+      function applyWhere() {
+        t.where = (whereInput.value || "").trim();
+        t.afterStack = [];
+        t.seek = null;
+        t.offset = 0;
+        editor.value = tableSelectScript();
+        loadTablePage();
+      }
+      document.getElementById("btn-table-where").addEventListener("click", applyWhere);
+      whereInput.addEventListener("keydown", function (event) {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          applyWhere();
+        }
+      });
+    }
     var seekBtn = document.getElementById("btn-seek");
     if (seekBtn) {
       var seekInput = window.SqlFormat.bindInput(document.getElementById("seek-value"), { flexible: true });

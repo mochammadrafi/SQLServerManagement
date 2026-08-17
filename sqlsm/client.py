@@ -174,6 +174,35 @@ def validate_where(where):
     return text
 
 
+_SELECT_HEAD = re.compile(r"^(\s*SELECT\s+)(DISTINCT\s+)?", re.IGNORECASE)
+_HAS_TOP = re.compile(r"^\s*SELECT\s+(DISTINCT\s+)?TOP\b", re.IGNORECASE)
+_HAS_OFFSET = re.compile(r"\bOFFSET\s+\d+\s+ROWS\b|\bFETCH\s+(FIRST|NEXT)\b", re.IGNORECASE)
+_SELECT_INTO = re.compile(r"^\s*SELECT\b.+\bINTO\b", re.IGNORECASE | re.DOTALL)
+_SET_OP = re.compile(r"\bUNION\b|\bEXCEPT\b|\bINTERSECT\b", re.IGNORECASE)
+_HAS_HINT = re.compile(r"\bOPTION\s*\(|\bFOR\s+(XML|JSON)\b", re.IGNORECASE)
+
+
+def limit_select_sql(sql, max_rows):
+    # type: (str, int) -> str
+    text = sql or ""
+    stripped = text.lstrip()
+    if not stripped or not re.match(r"SELECT\b", stripped, re.IGNORECASE):
+        return sql
+    if _HAS_OFFSET.search(text) or _SELECT_INTO.match(text) or _SET_OP.search(text):
+        return sql
+    if not _HAS_TOP.match(text):
+        match = _SELECT_HEAD.match(text)
+        if not match:
+            return sql
+        text = match.group(1) + (match.group(2) or "") + ("TOP %s " % int(max_rows)) + text[match.end():]
+    if _HAS_HINT.search(text):
+        return text
+    trimmed = text.rstrip()
+    if trimmed.endswith(";"):
+        trimmed = trimmed[:-1].rstrip()
+    return trimmed + " OPTION (FAST %s)" % int(max_rows)
+
+
 def csv_value(value):
     # type: (Any) -> Any
     if value is None:
@@ -711,10 +740,11 @@ class SqlServerClient(object):
             messages = []  # type: List[str]
             for batch in batches:
                 self._throw_if_cancelled(item)
+                to_run = batch if params is not None else limit_select_sql(batch, max_rows)
                 if params is not None and len(batches) == 1:
-                    cursor.execute(batch, params)
+                    cursor.execute(to_run, params)
                 else:
-                    cursor.execute(self._raw_sql(batch))
+                    cursor.execute(self._raw_sql(to_run))
                 self._throw_if_cancelled(item)
                 while True:
                     if cursor.description:
@@ -1206,8 +1236,8 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
             return [ident_rows[0]["name"]]
         return []
 
-    def page_table(self, database, schema, table, page_size=200, after=None, seek=None, offset=0):
-        # type: (str, str, str, int, Optional[Dict[str, Any]], Optional[Dict[str, Any]], int) -> Dict[str, Any]
+    def page_table(self, database, schema, table, page_size=200, after=None, seek=None, offset=0, where=""):
+        # type: (str, str, str, int, Optional[Dict[str, Any]], Optional[Dict[str, Any]], int, str) -> Dict[str, Any]
         self._assert_db(database)
         page_size = int(page_size or 200)
         if page_size < 1:
@@ -1217,10 +1247,14 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
         offset = int(offset or 0)
         if offset < 0:
             offset = 0
+        user_where = validate_where(where)
         keys = self.key_columns(database, schema, table)
         ph = self.placeholder()
         params = []  # type: List[Any]
-        where_sql = ""
+        table_sql = qname(database, schema, table) + " WITH (NOLOCK)"
+        parts = []  # type: List[str]
+        if user_where:
+            parts.append("(%s)" % user_where)
         paging = "keyset" if keys else "offset"
         if keys and (after or seek):
             source = after or seek
@@ -1231,19 +1265,24 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
                     "Isi semua kolom kunci: %s" % ", ".join(keys),
                 )
             clause, clause_params = keyset_clause(keys, values, ph, inclusive=bool(seek) and not after)
-            where_sql = " WHERE " + clause
+            parts.append("(%s)" % clause)
             params.extend(clause_params)
-            sql = "SELECT TOP %s * FROM %s%s ORDER BY %s" % (
+        where_sql = (" WHERE " + " AND ".join(parts)) if parts else ""
+        if user_where and not after and not seek:
+            sql = "SELECT TOP %s * FROM %s%s OPTION (FAST %s)" % (
                 page_size,
-                qname(database, schema, table),
+                table_sql,
+                where_sql,
+                page_size,
+            )
+            paging = "filter"
+        elif keys:
+            sql = "SELECT TOP %s * FROM %s%s ORDER BY %s OPTION (FAST %s)" % (
+                page_size,
+                table_sql,
                 where_sql,
                 ", ".join(qident(key) for key in keys),
-            )
-        elif keys:
-            sql = "SELECT TOP %s * FROM %s ORDER BY %s" % (
                 page_size,
-                qname(database, schema, table),
-                ", ".join(qident(key) for key in keys),
             )
         else:
             paging = "offset"
@@ -1253,8 +1292,9 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
                     "Tambahkan primary key / identity, atau pakai Export. "
                     "OFFSET besar pada 100 juta baris akan sangat lambat.",
                 )
-            sql = "SELECT * FROM %s ORDER BY (SELECT NULL) OFFSET %s ROWS FETCH NEXT %s ROWS ONLY" % (
-                qname(database, schema, table),
+            sql = "SELECT * FROM %s%s ORDER BY (SELECT NULL) OFFSET %s ROWS FETCH NEXT %s ROWS ONLY" % (
+                table_sql,
+                where_sql,
                 offset,
                 page_size,
             )
@@ -1292,8 +1332,9 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
         sql = "SELECT %s FROM %s" % (", ".join(qident(col) for col in columns), table_sql)
         if where_sql:
             sql += " WHERE (%s)" % where_sql
-        if order_keys:
-            sql += " ORDER BY " + ", ".join(qident(key) for key in order_keys)
+        # No ORDER BY: on 100M+ rows a sort/key-ordered scan can stall before the first row,
+        # especially when WHERE does not match the clustered index.
+        sql += " OPTION (FAST %s)" % int(batch_size or 2000)
         item = self._checkout()
         discard = False
         cursor = self._cursor(item.raw)

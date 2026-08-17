@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=21">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=22">
   <style>
     body.is-booting .app-header,
     body.is-booting .workspace,
@@ -150,11 +150,11 @@
         <h4>Jelajah (tanpa SQL)</h4>
         <p>Klik database, lalu klik tabel atau view. Datanya langsung tampil. Klik satu baris untuk membuka viewer. Double-click sel untuk nilai penuh.</p>
         <h4>Tabel besar (100 juta+ baris)</h4>
-        <p>Aplikasi tidak pernah memuat seluruh tabel. Yang tampil hanya satu halaman (100–1000 baris). Jumlah baris diambil dari statistik partisi, bukan <code>COUNT(*)</code>.</p>
+        <p>Aplikasi tidak pernah memuat seluruh tabel. Yang tampil hanya satu halaman (100–1000 baris). Jumlah baris diambil dari statistik partisi, bukan <code>COUNT(*)</code>. Filter WHERE di tabel ratusan juta memakai <code>TOP</code> + <code>FAST</code> tanpa <code>ORDER BY</code>, supaya baris pertama langsung keluar. Export memakai pola yang sama.</p>
         <h4>Export / backup</h4>
         <p>Dari kartu database: Backup (.bak) atau Export semua tabel (CSV). Dari kartu tabel: Export tabel itu saja. Daftar tabel bisa diurutkan nama / baris / ukuran. Beberapa export bisa jalan bersamaan. Export database memakai worker paralel (default 3, sampai 32; dipangkas otomatis jika slot penuh). Progress, jeda, dan batal ada di <strong>Export</strong> di header. File .bak harus ke folder yang bisa ditulis akun SQL Server.</p>
         <h4>SQL</h4>
-        <p>Mode SQL untuk query ad-hoc. Jangan <code>SELECT *</code> tanpa <code>TOP</code> pada tabel besar. Hasil dipotong 1000 baris. F5 / Ctrl+Enter menjalankan SQL. <strong>Batalkan</strong> atau Esc menghentikan query yang sedang jalan.</p>
+        <p>Mode SQL untuk query ad-hoc. <code>SELECT</code> tanpa <code>TOP</code> dipotong otomatis 1000 baris di server. F5 / Ctrl+Enter menjalankan SQL. <strong>Batalkan</strong> atau Esc menghentikan query yang sedang jalan.</p>
         <h4>Hati-hati</h4>
         <p><code>DELETE</code> / <code>UPDATE</code> / <code>DROP</code> jalan apa adanya. Tidak ada undo.</p>
       </div>
@@ -177,6 +177,7 @@
         <label class="field">
           <span>WHERE (opsional)</span>
           <input id="export-where" type="text" placeholder="CreatedAt >= '2024-01-01' AND Status = 1">
+          <p class="hint-inline">Tanpa ORDER BY. Baris pertama langsung stream, cocok untuk tabel ratusan juta.</p>
         </label>
         <label class="field">
           <span>Folder tujuan</span>
@@ -360,9 +361,9 @@
     </div>
   </div>
 
-  <script src="{{ url_for('static', filename='js/ui.js') }}?v=21"></script>
-  <script src="{{ url_for('static', filename='js/grid.js') }}?v=21"></script>
-  <script src="{{ url_for('static', filename='js/export.js') }}?v=21"></script>
-  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=21"></script>
+  <script src="{{ url_for('static', filename='js/ui.js') }}?v=22"></script>
+  <script src="{{ url_for('static', filename='js/grid.js') }}?v=22"></script>
+  <script src="{{ url_for('static', filename='js/export.js') }}?v=22"></script>
+  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=22"></script>
 </body>
 </html>

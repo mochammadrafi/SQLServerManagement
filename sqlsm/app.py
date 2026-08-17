@@ -571,6 +571,7 @@ def api_table_page():
             after=after_obj,
             seek=seek_obj,
             offset=offset,
+            where=request.args.get("where") or "",
         )
         data["elapsed_ms"] = int((time.time() - started) * 1000)
         return jsonify({"ok": True, **data})

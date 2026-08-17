@@ -94,11 +94,11 @@ Mixed Mode (for `sa`):
 1. Connect.
 2. Click a database in Object Explorer.
 3. Click a table. Only one page loads (default 200 rows), even if the table has 100 million rows.
-4. Use **Berikutnya** or jump by key to walk the table. Do not `SELECT *` the whole table.
+4. Use **Berikutnya**, jump by key, or filter with WHERE. Filtered pages and exports skip `ORDER BY` so the first matching rows stream immediately on 100M+ tables. Do not `SELECT *` the whole table.
 5. **Export tabel** writes CSV/gzip in the background (default 1 million rows per file). Download each part from **Export** in the header. Pause, resume, or cancel from that panel. You can start several exports at once. Database export can run several tables at once (default 3 workers, up to 32; the app lowers the count if connection slots are full). In Browse, sort tables by name, row count, or size.
 6. Double-click a cell for the full value.
 
-Excel cannot open 100 million rows (limit 1,048,576). Use CSV/gzip. A full export can be tens of GB and run for hours; filter with WHERE when you can.
+Excel cannot open 100 million rows (limit 1,048,576). Use CSV/gzip. A full export can be tens of GB and run for hours; filter with WHERE when you can. Ad-hoc `SELECT` without `TOP` is limited to 1000 rows on the server.
 
 `DELETE` / `UPDATE` / `DROP` run as written. There is no undo.
 
