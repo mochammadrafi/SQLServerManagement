@@ -744,7 +744,7 @@
         (job.row_count_estimate != null ? " / " + formatCount(job.row_count_estimate) : "") + " baris" : "") +
       pct + " · " + formatBytes(job.bytes_written) +
       (job.workers && job.kind === "export_db" ? " · " + job.workers + " worker" : "") +
-      (job.batch_size && job.kind !== "backup" ? " · " + formatCount(job.batch_size) + " /ambil" : "") +
+        (job.batch_size && job.kind !== "backup" ? " · " + formatCount(job.batch_size) + " baris/fetch" : "") +
       (job.file_prefix && job.kind !== "backup" ? " · " + escapeHtml(job.file_prefix) : "") + "</p>" +
       (job.database ? '<p class="job-meta">Database ' + escapeHtml(job.database) + "</p>" : "") +
       (job.folder ? '<p class="job-meta">' + escapeHtml(job.folder) + "</p>" : "") +

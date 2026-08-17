@@ -1332,13 +1332,19 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
         sql = "SELECT %s FROM %s" % (", ".join(qident(col) for col in columns), table_sql)
         if where_sql:
             sql += " WHERE (%s)" % where_sql
-        # No ORDER BY: on 100M+ rows a sort/key-ordered scan can stall before the first row,
-        # especially when WHERE does not match the clustered index.
-        sql += " OPTION (FAST %s)" % int(batch_size or 10000)
+            # FAST only with a filter: a full dump must not use it or the plan stalls after the first batch.
+            sql += " OPTION (FAST %s)" % int(batch_size or 10000)
         item = self._checkout()
         discard = False
         cursor = self._cursor(item.raw)
         item.cursor = cursor
+        fetch_n = int(batch_size or 10000)
+        if fetch_n < 1:
+            fetch_n = 1
+        try:
+            cursor.arraysize = fetch_n
+        except Exception:
+            pass
         if item.spid is None:
             item.spid = self._spid(item.raw)
         try:
@@ -1349,7 +1355,7 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
                 return
             while True:
                 self._throw_if_cancelled(item)
-                raw_rows = cursor.fetchmany(int(batch_size))
+                raw_rows = cursor.fetchmany(fetch_n)
                 if not raw_rows:
                     break
                 yield raw_rows

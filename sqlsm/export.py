@@ -875,6 +875,7 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
                 break
             if not job.wait_if_paused(schema, table):
                 break
+            pending = 0
             for raw in raw_rows:
                 if _stop_current(job, schema, table):
                     break
@@ -887,9 +888,6 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
                 part_rows += 1
                 wrote_rows += 1
                 pending += 1
-                if pending >= 50:
-                    _add_progress(job, schema, table, pending)
-                    pending = 0
                 rotate = False
                 if job.chunk_rows and part_rows >= job.chunk_rows:
                     rotate = True
@@ -898,9 +896,6 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
                     if os.path.isfile(part_file) and os.path.getsize(part_file) >= job.chunk_bytes:
                         rotate = True
                 if rotate:
-                    if pending:
-                        _add_progress(job, schema, table, pending)
-                        pending = 0
                     _close_part(job, handle, part_name, part_rows)
                     writer = None
                     handle = None
@@ -910,9 +905,6 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
             if pending:
                 _add_progress(job, schema, table, pending)
                 pending = 0
-        if pending:
-            _add_progress(job, schema, table, pending)
-            pending = 0
         if writer is not None and not _stop_current(job, schema, table):
             _close_part(job, handle, part_name, part_rows)
             writer = None
@@ -926,6 +918,7 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
     finally:
         if pending:
             _add_progress(job, schema, table, pending)
+            pending = 0
         if writer is not None and handle is not None:
             if part_rows:
                 _close_part(job, handle, part_name, part_rows)
