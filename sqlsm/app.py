@@ -674,13 +674,17 @@ def api_export_database():
 
 @app.route("/api/exports")
 def api_exports():
-    return jsonify({"ok": True, "jobs": list_jobs(_sid())})
+    item = _active_item()
+    cfg = item["cfg"] if item else None
+    return jsonify({"ok": True, "jobs": list_jobs(_sid(), cfg)})
 
 
 @app.route("/api/export/<job_id>")
 def api_export_status(job_id):
     try:
-        return jsonify({"ok": True, "job": get_job(_sid(), job_id).public()})
+        item = _active_item()
+        cfg = item["cfg"] if item else None
+        return jsonify({"ok": True, "job": get_job(_sid(), job_id, cfg=cfg).public()})
     except Exception as exc:
         return _error_payload(exc)
 
@@ -721,7 +725,10 @@ def api_export_pause(job_id):
 @app.route("/api/export/<job_id>/resume", methods=["POST"])
 def api_export_resume(job_id):
     try:
-        return jsonify({"ok": True, "job": resume_job(_sid(), job_id).public()})
+        item = _active_item()
+        if not item:
+            return _error_payload(ClientError("Belum terhubung ke SQL Server."))
+        return jsonify({"ok": True, "job": resume_job(_sid(), job_id, cfg=item["cfg"]).public()})
     except Exception as exc:
         return _error_payload(exc)
 

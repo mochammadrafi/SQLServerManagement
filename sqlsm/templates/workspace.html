@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=26">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=27">
   <style>
     body.is-booting .app-header,
     body.is-booting .workspace,
@@ -152,7 +152,7 @@
         <h4>Tabel besar (100 juta+ baris)</h4>
         <p>Aplikasi tidak pernah memuat seluruh tabel. Yang tampil hanya satu halaman (100–1000 baris). Jumlah baris diambil dari statistik partisi, bukan <code>COUNT(*)</code>. Filter WHERE di tabel ratusan juta memakai <code>TOP</code> + <code>FAST</code> tanpa <code>ORDER BY</code>, supaya baris pertama langsung keluar. Export memakai pola yang sama.</p>
         <h4>Export / backup</h4>
-        <p>Dari kartu database: Backup (.bak) atau Export semua tabel (CSV). Dari kartu tabel: Export tabel itu saja. Nama file bisa diubah sebelum mulai. Beberapa export bisa jalan bersamaan. Tabel yang sedang diexport bisa dibatalkan sendiri; job tetap lanjut dan hasilnya masuk riwayat. File yang sudah tertulis tetap bisa diunduh. Progress, jeda, dan batal ada di <strong>Export</strong> di header.</p>
+        <p>Dari kartu database: Backup (.bak) atau Export semua tabel (CSV). Dari kartu tabel: Export tabel itu saja. Nama file bisa diubah sebelum mulai. Beberapa export bisa jalan bersamaan. Kalau koneksi putus, export menyambung ulang sendiri; job gagal bisa <strong>Lanjutkan</strong> dari file yang sudah ada (tabel ber-PK). Progress, jeda, dan batal ada di <strong>Export</strong> di header.</p>
         <h4>SQL</h4>
         <p>Mode SQL untuk query ad-hoc. <code>SELECT</code> tanpa <code>TOP</code> dipotong otomatis 1000 baris di server. F5 / Ctrl+Enter menjalankan SQL. <strong>Batalkan</strong> atau Esc menghentikan query yang sedang jalan.</p>
         <h4>Hati-hati</h4>
@@ -381,9 +381,9 @@
     </div>
   </div>
 
-  <script src="{{ url_for('static', filename='js/ui.js') }}?v=26"></script>
-  <script src="{{ url_for('static', filename='js/grid.js') }}?v=26"></script>
-  <script src="{{ url_for('static', filename='js/export.js') }}?v=26"></script>
-  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=26"></script>
+  <script src="{{ url_for('static', filename='js/ui.js') }}?v=27"></script>
+  <script src="{{ url_for('static', filename='js/grid.js') }}?v=27"></script>
+  <script src="{{ url_for('static', filename='js/export.js') }}?v=27"></script>
+  <script src="{{ url_for('static', filename='js/workspace.js') }}?v=27"></script>
 </body>
 </html>

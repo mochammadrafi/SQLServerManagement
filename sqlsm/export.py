@@ -10,7 +10,16 @@ import uuid
 from queue import Empty, Queue
 from typing import Any, Dict, List, Optional
 
-from sqlsm.client import ClientError, ConnectionConfig, connect_client, csv_value, qident, validate_where
+from sqlsm.client import (
+    ClientError,
+    ConnectionConfig,
+    connect_client,
+    csv_value,
+    is_transient,
+    json_safe,
+    qident,
+    validate_where,
+)
 from sqlsm.fsutil import default_data_folder, ensure_writable_dir, safe_name
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -140,6 +149,9 @@ class ExportJob(object):
         self.current_objects = []  # type: List[Dict[str, Any]]
         self.table_states = []  # type: List[Dict[str, Any]]
         self._clients = []  # type: List[Any]
+        self.last_key = None
+        self.last_key_schema = ""
+        self.last_key_table = ""
 
     def public(self):
         # type: () -> Dict[str, Any]
@@ -194,8 +206,14 @@ class ExportJob(object):
                 "current_objects": currents,
                 "tables": tables,
                 "can_pause": kind in ("export", "export_db") and status in ("queued", "running"),
-                "can_resume": status == "paused",
+                "can_resume": status == "paused" or (
+                    kind in ("export", "export_db")
+                    and status in ("error", "cancelled")
+                    and (bool(self.last_key) or bool(self.parts))
+                ),
                 "can_cancel": status in ("queued", "running", "paused", "cancelling"),
+                "last_key": dict(self.last_key) if self.last_key else None,
+                "keys": list(getattr(self, "_order_keys", None) or []),
             }
 
     def wait_if_paused(self, schema=None, name=None):
@@ -253,19 +271,115 @@ class ExportJob(object):
         return path
 
 
-def list_jobs(sid):
-    # type: (str) -> List[Dict[str, Any]]
+def list_jobs(sid, cfg=None):
+    # type: (str, Optional[ConnectionConfig]) -> List[Dict[str, Any]]
+    _reload_disk_jobs(sid, cfg)
     with _LOCK:
         return [job.public() for job in _JOBS.values() if job.sid == sid]
 
 
-def get_job(sid, job_id):
-    # type: (str, str) -> ExportJob
+def get_job(sid, job_id, cfg=None):
+    # type: (str, str, Optional[ConnectionConfig]) -> ExportJob
+    _reload_disk_jobs(sid, cfg)
     with _LOCK:
         job = _JOBS.get(job_id)
     if job is None or job.sid != sid:
         raise ClientError("Job export tidak ditemukan.")
+    if cfg is not None:
+        job.cfg = cfg
     return job
+
+
+def _job_from_meta(sid, cfg, meta, folder):
+    job = ExportJob(
+        sid=sid,
+        cfg=cfg,
+        database=str(meta.get("database") or ""),
+        schema=str(meta.get("schema") or ""),
+        table=str(meta.get("table") or ""),
+        columns=list(meta.get("columns") or []),
+        where=str(meta.get("where") or ""),
+        chunk_rows=meta.get("chunk_rows") or 0,
+        chunk_bytes=meta.get("chunk_bytes") or 0,
+        use_gzip=bool(meta.get("gzip", True)),
+        nolock=bool(meta.get("nolock", True)),
+        row_count=meta.get("row_count_estimate"),
+        folder=folder,
+        batch_size=meta.get("batch_size"),
+        file_prefix=meta.get("file_prefix"),
+    )
+    job.id = str(meta.get("id") or job.id)
+    job.kind = meta.get("kind") or "export"
+    job.status = meta.get("status") or "error"
+    if job.status in _ACTIVE:
+        job.status = "error"
+        job.error = meta.get("error") or "Proses export terhenti. Lanjutkan untuk meneruskan."
+    else:
+        job.error = meta.get("error")
+    job.rows_written = int(meta.get("rows_written") or 0)
+    job.bytes_written = int(meta.get("bytes_written") or 0)
+    job.parts = []
+    for part in meta.get("parts") or []:
+        name = part.get("name")
+        job.parts.append(
+            {
+                "name": name,
+                "rows": part.get("rows"),
+                "bytes": part.get("bytes"),
+                "path": os.path.join(folder, name) if name else "",
+            }
+        )
+    job.hint = meta.get("hint")
+    job.started_at = meta.get("started_at")
+    job.finished_at = meta.get("finished_at")
+    job.last_key = meta.get("last_key")
+    job._order_keys = list(meta.get("keys") or [])
+    job._file_prefix = job.file_prefix
+    job.workers = int(meta.get("workers") or 1)
+    job.tables_total = meta.get("tables_total")
+    job.tables_done = int(meta.get("tables_done") or 0)
+    job.table_states = [dict(item) for item in (meta.get("tables") or [])]
+    if job.kind == "export_db":
+        job._tables = [
+            {
+                "schema": item.get("schema"),
+                "name": item.get("name"),
+                "row_count": item.get("row_count"),
+                "size_kb": item.get("size_kb"),
+            }
+            for item in job.table_states
+        ]
+    return job
+
+
+def _reload_disk_jobs(sid, cfg=None):
+    root = EXPORT_ROOT
+    if not root or not os.path.isdir(root):
+        return
+    try:
+        names = os.listdir(root)
+    except Exception:
+        return
+    for name in names:
+        folder = os.path.join(root, name)
+        meta_path = os.path.join(folder, "meta.json")
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+        except Exception:
+            continue
+        job_id = str(meta.get("id") or "")
+        if not job_id:
+            continue
+        with _LOCK:
+            existing = _JOBS.get(job_id)
+            if existing is not None:
+                if cfg is not None and existing.cfg is None:
+                    existing.cfg = cfg
+                continue
+            _JOBS[job_id] = _job_from_meta(sid, cfg, meta, folder)
 
 
 def cancel_job(sid, job_id):
@@ -334,25 +448,136 @@ def pause_job(sid, job_id):
     return job
 
 
-def resume_job(sid, job_id):
-    # type: (str, str) -> ExportJob
-    job = get_job(sid, job_id)
-    with job._state_lock:
-        if job.status != "paused":
-            raise ClientError("Job tidak sedang dijeda.")
-        if job.cancel_event.is_set():
-            job.status = "cancelling"
-        else:
-            job.status = "running"
-            for item in job.current_objects:
-                if item.get("status") == "paused":
-                    item["status"] = "running"
-            for item in job.table_states:
-                if item.get("status") == "paused":
-                    item["status"] = "running"
-        job.pause_event.clear()
+def resume_job(sid, job_id, cfg=None):
+    # type: (str, str, Optional[ConnectionConfig]) -> ExportJob
+    job = get_job(sid, job_id, cfg=cfg)
+    if job.status == "paused":
+        with job._state_lock:
+            if job.cancel_event.is_set():
+                job.status = "cancelling"
+            else:
+                job.status = "running"
+                for item in job.current_objects:
+                    if item.get("status") == "paused":
+                        item["status"] = "running"
+                for item in job.table_states:
+                    if item.get("status") == "paused":
+                        item["status"] = "running"
+            job.pause_event.clear()
+        job.save_meta()
+        return job
+    return continue_export(sid, job_id, cfg=cfg)
+
+
+def continue_export(sid, job_id, cfg=None):
+    # type: (str, str, Optional[ConnectionConfig]) -> ExportJob
+    job = get_job(sid, job_id, cfg=cfg)
+    kind = getattr(job, "kind", "export")
+    if kind == "backup":
+        raise ClientError("Backup gagal tidak bisa dilanjutkan.", "Jalankan backup baru.")
+    if job.status in ("queued", "running", "cancelling"):
+        raise ClientError("Job masih berjalan.")
+    if job.status == "paused":
+        return resume_job(sid, job_id)
+    if job.status not in ("error", "cancelled"):
+        raise ClientError("Job ini tidak bisa dilanjutkan.")
+    if cfg is not None:
+        job.cfg = cfg
+    if not getattr(job, "_order_keys", None) and job.cfg and job.kind == "export":
+        probe = None
+        try:
+            probe = connect_client(ConnectionConfig(**job.cfg.__dict__))
+            job._order_keys = probe.key_columns(job.database, job.schema, job.table)
+        except Exception:
+            pass
+        finally:
+            if probe is not None:
+                try:
+                    probe.close()
+                except Exception:
+                    pass
+    if not getattr(job, "_order_keys", None) and job.kind != "export_db":
+        raise ClientError(
+            "Tidak ada kunci tabel untuk titik lanjut.",
+            "Export ulang dari awal. Resume hanya untuk tabel ber-PK/identity.",
+        )
+    if not job.parts and not job.last_key:
+        raise ClientError("Belum ada file yang bisa dilanjutkan.")
+    job.cancel_event = threading.Event()
+    job.pause_event = threading.Event()
+    job.status = "running"
+    job.error = None
+    job.finished_at = None
+    job.hint = "Melanjutkan dari file yang sudah ada. Bagian berikutnya ditulis file baru."
     job.save_meta()
+    target = _run_db_export if kind == "export_db" else _run_job
+    thread = threading.Thread(target=target, args=(job,), name="export-resume-" + job.id)
+    thread.daemon = True
+    thread.start()
     return job
+
+
+def _store_last_key(job, columns, row, keys, schema, table):
+    if not keys or not row:
+        return
+    lower = {str(name).lower(): index for index, name in enumerate(columns or [])}
+    last_key = {}
+    for key in keys:
+        index = lower.get(str(key).lower())
+        if index is None or index >= len(row):
+            return
+        last_key[key] = json_safe(row[index])
+    with job._state_lock:
+        job.last_key = last_key
+        job.last_key_schema = schema
+        job.last_key_table = table
+        for item in job.table_states:
+            if _table_key(item.get("schema"), item.get("name")) == _table_key(schema, table):
+                item["last_key"] = dict(last_key)
+                break
+
+
+def _last_csv_row(path):
+    if not path or not os.path.isfile(path):
+        return None, None
+    handle = None
+    try:
+        if path.endswith(".gz"):
+            handle = gzip.open(path, "rt", encoding="utf-8-sig", newline="")
+        else:
+            handle = io.open(path, "r", encoding="utf-8-sig", newline="")
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        last = None
+        for row in reader:
+            last = row
+        return header, last
+    except Exception:
+        return None, None
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
+def _recover_last_key(job):
+    keys = getattr(job, "_order_keys", None) or []
+    if job.last_key or not keys or not job.parts:
+        return job.last_key
+    part = job.parts[-1]
+    path = part.get("path") or os.path.join(job.folder, part.get("name") or "")
+    job.hint = "Membaca baris terakhir %s untuk titik lanjut..." % (part.get("name") or "")
+    try:
+        job.save_meta()
+    except Exception:
+        pass
+    header, row = _last_csv_row(path)
+    if not header or not row:
+        return None
+    _store_last_key(job, header, row, keys, job.schema, job.table)
+    return job.last_key
 
 
 def _clamp_workers(value):
@@ -694,16 +919,34 @@ def start_export_database(sid, cfg, database, tables=None, include_views=False, 
 
 def _run_db_export(job):
     # type: (ExportJob) -> None
+    if not job.started_at:
+        job.started_at = _now()
     job.status = "running"
-    job.started_at = _now()
+    job.finished_at = None
     job.save_meta()
-    tables = list(getattr(job, "_tables", []) or [])
     work = Queue()
-    for item in tables:
+    pending = 0
+    for item in list(getattr(job, "_tables", []) or []):
+        state = None
+        for row in job.table_states:
+            if _table_key(row.get("schema"), row.get("name")) == _table_key(item.get("schema"), item.get("name")):
+                state = row
+                break
+        if state and state.get("status") == "done":
+            continue
+        if state and state.get("status") in ("error", "cancelled", "cancelling", "running", "paused"):
+            _mark_table(job, item.get("schema"), item.get("name"), status="queued", error=None)
         work.put(item)
+        pending += 1
+    if pending == 0:
+        job.status = "done"
+        job.finished_at = _now()
+        job.save_meta()
+        _purge_jobs()
+        return
     worker_errors = []  # type: List[Exception]
     error_lock = threading.Lock()
-    workers_n = max(1, min(int(job.workers or 1), len(tables) or 1))
+    workers_n = max(1, min(int(job.workers or 1), pending or 1))
     job.workers = workers_n
 
     def worker(index):
@@ -786,8 +1029,18 @@ def _run_db_export(job):
 def _export_one_table(job, client, item):
     schema = item.get("schema")
     table = item.get("name")
+    rows_so_far = 0
+    with job._state_lock:
+        for row in job.table_states:
+            if _table_key(row.get("schema"), row.get("name")) == _table_key(schema, table):
+                rows_so_far = int(row.get("rows_written") or 0)
+                if row.get("last_key"):
+                    job.last_key = dict(row["last_key"])
+                    job.last_key_schema = schema
+                    job.last_key_table = table
+                break
     _mark_table(job, schema, table, status="running", error=None)
-    _set_current(job, schema, table, rows_written=0, status="running")
+    _set_current(job, schema, table, rows_written=rows_so_far, status="running")
     with job._state_lock:
         job._table_clients[_table_key(schema, table)] = client
     try:
@@ -854,13 +1107,16 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
         where = job.where
     writer = None  # type: Optional[Any]
     handle = None
-    part_index = 0
+    part_index = len(job.parts)
     part_rows = 0
     part_name = ""
     part_file = ""
     wrote_rows = 0
     pending = 0
     try:
+        after = None
+        if job.last_key and _table_key(getattr(job, "last_key_schema", schema), getattr(job, "last_key_table", table)) == _table_key(schema, table):
+            after = job.last_key
         for raw_rows in client.iter_table_rows(
             job.database,
             schema,
@@ -870,12 +1126,14 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
             order_keys=order_keys or None,
             nolock=job.nolock,
             batch_size=job.batch_size,
+            after=after,
         ):
             if _stop_current(job, schema, table):
                 break
             if not job.wait_if_paused(schema, table):
                 break
             pending = 0
+            last_raw = None
             for raw in raw_rows:
                 if _stop_current(job, schema, table):
                     break
@@ -888,6 +1146,7 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
                 part_rows += 1
                 wrote_rows += 1
                 pending += 1
+                last_raw = raw
                 rotate = False
                 if job.chunk_rows and part_rows >= job.chunk_rows:
                     rotate = True
@@ -902,6 +1161,8 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
                     part_name = ""
                     part_file = ""
                     job.save_meta()
+            if last_raw is not None:
+                _store_last_key(job, columns, last_raw, order_keys or [], schema, table)
             if pending:
                 _add_progress(job, schema, table, pending)
                 pending = 0
@@ -909,7 +1170,7 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
             _close_part(job, handle, part_name, part_rows)
             writer = None
             handle = None
-        if wrote_rows == 0 and not _stop_current(job, schema, table):
+        if wrote_rows == 0 and not job.parts and not after and not _stop_current(job, schema, table):
             writer, handle, part_name, part_file = _open_part(job, 1, file_prefix)
             writer.writerow(columns)
             _close_part(job, handle, part_name, 0)
@@ -928,56 +1189,94 @@ def _export_current(job, client, schema=None, table=None, columns=None, order_ke
 
 def _run_job(job):
     # type: (ExportJob) -> None
+    if not job.started_at:
+        job.started_at = _now()
     job.status = "running"
-    job.started_at = _now()
-    _set_current(job, job.schema, job.table, rows_written=0, status="running")
+    job.finished_at = None
+    if not job.last_key and job.parts:
+        try:
+            _recover_last_key(job)
+        except Exception:
+            pass
+    _set_current(job, job.schema, job.table, rows_written=job.rows_written, status="running")
     job.save_meta()
-    client = None
-    try:
-        client = _connect_export(job.cfg)
-        job._client = client
-        with job._state_lock:
-            if client not in job._clients:
-                job._clients.append(client)
-        _export_current(
-            job,
-            client,
-            job.schema,
-            job.table,
-            job.columns,
-            getattr(job, "_order_keys", None) or [],
-            getattr(job, "_file_prefix", None) or job.file_prefix or safe_name(job.table),
-            job.where,
-        )
-        if job.cancel_event.is_set():
-            job.status = "cancelled"
-        else:
-            job.status = "done"
-        job.finished_at = _now()
-        job.save_meta()
-    except ClientError as exc:
-        if job.cancel_event.is_set() or "dibatalkan" in str(exc).lower():
-            job.status = "cancelled"
-            job.error = None
-        else:
+    retries = 0
+    max_retries = 12
+    last_error = None  # type: Optional[Exception]
+    while True:
+        client = None
+        try:
+            client = _connect_export(job.cfg)
+            job._client = client
+            with job._state_lock:
+                if client not in job._clients:
+                    job._clients.append(client)
+            _export_current(
+                job,
+                client,
+                job.schema,
+                job.table,
+                job.columns,
+                getattr(job, "_order_keys", None) or [],
+                getattr(job, "_file_prefix", None) or job.file_prefix or safe_name(job.table),
+                job.where,
+            )
+            if job.cancel_event.is_set():
+                job.status = "cancelled"
+                job.error = None
+            else:
+                job.status = "done"
+                job.error = None
+                job.hint = None
+            last_error = None
+            break
+        except Exception as exc:
+            last_error = exc
+            if job.cancel_event.is_set() or "dibatalkan" in str(exc).lower():
+                job.status = "cancelled"
+                job.error = None
+                break
+            if is_transient(exc) and retries < max_retries:
+                retries += 1
+                job.status = "running"
+                job.error = None
+                job.hint = "Koneksi putus. Menyambung ulang %s/%s dari %s baris." % (
+                    retries,
+                    max_retries,
+                    job.rows_written,
+                )
+                try:
+                    job.save_meta()
+                except Exception:
+                    pass
+                time.sleep(min(1.5 * retries, 20))
+                continue
             job.status = "error"
             job.error = str(exc)
-            job.hint = exc.hint
-        job.finished_at = _now()
+            job.hint = getattr(exc, "hint", None) or (
+                "File yang sudah ada tetap dipakai. Tekan Lanjutkan untuk meneruskan."
+            )
+            break
+        finally:
+            _clear_current(job, job.schema, job.table)
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                with job._state_lock:
+                    if client in job._clients:
+                        job._clients.remove(client)
+            job._client = None
+    if job.status == "running" and last_error is not None:
+        job.status = "error"
+        job.error = str(last_error)
+    job.finished_at = _now()
+    try:
         job.save_meta()
-    except Exception as exc:
-        job.status = "cancelled" if job.cancel_event.is_set() else "error"
-        job.error = None if job.cancel_event.is_set() else str(exc)
-        job.finished_at = _now()
-        job.save_meta()
-    finally:
-        _clear_current(job, job.schema, job.table)
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
-        _purge_jobs()
+    except Exception:
+        pass
+    _purge_jobs()
 
 
 class _HandleStack(object):

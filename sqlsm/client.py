@@ -1321,7 +1321,7 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
             "sql": sql,
         }
 
-    def iter_table_rows(self, database, schema, table, columns, where="", order_keys=None, nolock=True, batch_size=10000):
+    def iter_table_rows(self, database, schema, table, columns, where="", order_keys=None, nolock=True, batch_size=10000, after=None):
         self._assert_db(database)
         if not columns:
             raise ClientError("Pilih minimal satu kolom untuk export.")
@@ -1329,18 +1329,36 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
         table_sql = qname(database, schema, table)
         if nolock:
             table_sql += " WITH (NOLOCK)"
-        sql = "SELECT %s FROM %s" % (", ".join(qident(col) for col in columns), table_sql)
+        fetch_n = int(batch_size or 10000)
+        if fetch_n < 1:
+            fetch_n = 1
+        keys = [key for key in (order_keys or []) if key]
+        after = after if isinstance(after, dict) and after else None
+        params = []  # type: List[Any]
+        clauses = []  # type: List[str]
         if where_sql:
-            sql += " WHERE (%s)" % where_sql
-            # FAST only with a filter: a full dump must not use it or the plan stalls after the first batch.
-            sql += " OPTION (FAST %s)" % int(batch_size or 10000)
+            clauses.append("(%s)" % where_sql)
+        if after and keys:
+            values = [after.get(key) for key in keys]
+            if any(value is None or value == "" for value in values):
+                after = None
+            else:
+                clause, clause_params = keyset_clause(keys, values, self.placeholder())
+                clauses.append(clause)
+                params.extend(clause_params)
+        sql = "SELECT %s FROM %s" % (", ".join(qident(col) for col in columns), table_sql)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        # Full dump / resume: ORDER BY key so a dropped connection can continue.
+        # Filtered first-page export keeps FAST and skips sort.
+        if keys and (after or not where_sql):
+            sql += " ORDER BY " + ", ".join(qident(key) for key in keys)
+        elif where_sql and not after:
+            sql += " OPTION (FAST %s)" % fetch_n
         item = self._checkout()
         discard = False
         cursor = self._cursor(item.raw)
         item.cursor = cursor
-        fetch_n = int(batch_size or 10000)
-        if fetch_n < 1:
-            fetch_n = 1
         try:
             cursor.arraysize = fetch_n
         except Exception:
@@ -1349,7 +1367,10 @@ WHERE s.name = {1} AND o.name = {1} AND c.is_identity = 1
             item.spid = self._spid(item.raw)
         try:
             self._throw_if_cancelled(item)
-            cursor.execute(self._raw_sql(sql))
+            if params:
+                cursor.execute(sql, params)
+            else:
+                cursor.execute(self._raw_sql(sql))
             self._throw_if_cancelled(item)
             if not cursor.description:
                 return

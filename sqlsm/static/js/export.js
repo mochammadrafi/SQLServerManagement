@@ -729,7 +729,8 @@
       actions += '<button type="button" class="btn-secondary" data-pause="' + escapeHtml(job.id) + '">Jeda</button>';
     }
     if (job.can_resume) {
-      actions += '<button type="button" class="btn-primary" data-resume="' + escapeHtml(job.id) + '">Lanjut</button>';
+      actions += '<button type="button" class="btn-primary" data-resume="' + escapeHtml(job.id) + '">' +
+        (job.status === "paused" ? "Lanjut" : "Lanjutkan") + "</button>";
     }
     if (job.can_cancel) {
       actions += '<button type="button" class="btn-secondary" data-cancel="' + escapeHtml(job.id) + '"' +
