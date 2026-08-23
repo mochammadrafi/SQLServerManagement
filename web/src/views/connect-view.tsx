@@ -1,7 +1,7 @@
 import { yupResolver } from '@hookform/resolvers/yup'
 import { Moon, Sun, Terminal } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Controller, useForm } from 'react-hook-form'
+import { Controller, useForm, type DefaultValues } from 'react-hook-form'
 import * as yup from 'yup'
 import { LocaleSelect } from '@/components/locale-select'
 import { Button } from '@/components/ui/button'
@@ -13,6 +13,44 @@ import { api, setCsrf, type Meta, type Profile } from '@/lib/api'
 import { useLocale } from '@/lib/i18n'
 import { useTheme } from '@/lib/theme'
 import { useRevalidateOnLocale } from '@/lib/yup-locale'
+
+type ConnectForm = {
+  server: string
+  port: number
+  instance: string
+  auth: 'sql' | 'windows'
+  username: string
+  password: string
+  database: string
+  encrypt: boolean
+  remember_password: boolean
+}
+
+const DEFAULTS: DefaultValues<ConnectForm> = {
+  server: 'localhost',
+  port: 1433,
+  instance: '',
+  auth: 'sql',
+  username: 'sa',
+  password: '',
+  database: 'master',
+  encrypt: false,
+  remember_password: false,
+}
+
+function profileValues(profile: Profile): ConnectForm {
+  return {
+    server: profile.server,
+    port: profile.port || 1433,
+    instance: profile.instance || '',
+    auth: profile.auth === 'windows' ? 'windows' : 'sql',
+    username: profile.username || 'sa',
+    password: '',
+    database: profile.database || 'master',
+    encrypt: profile.encrypt,
+    remember_password: profile.remember_password,
+  }
+}
 
 export function ConnectView({
   onAuthed,
@@ -29,15 +67,28 @@ export function ConnectView({
   const schema = useMemo(
     () =>
       yup.object({
-        server: yup.string().required(),
-        port: yup.number().min(1).max(65535).required(),
-        instance: yup.string(),
-        auth: yup.string().oneOf(['sql', 'windows']).required(),
-        username: yup.string(),
-        password: yup.string(),
-        database: yup.string().required(),
-        encrypt: yup.boolean(),
-        remember_password: yup.boolean(),
+        server: yup.string().trim().required(),
+        port: yup
+          .number()
+          .transform((_value, originalValue) => {
+            if (originalValue === '' || originalValue === null || originalValue === undefined) return undefined
+            const parsed = Number(originalValue)
+            return Number.isNaN(parsed) ? undefined : parsed
+          })
+          .min(1)
+          .max(65535)
+          .required(),
+        instance: yup.string().default(''),
+        auth: yup
+          .string()
+          .transform((value) => (value === 'windows' ? 'windows' : 'sql'))
+          .oneOf(['sql', 'windows'])
+          .required(),
+        username: yup.string().default(''),
+        password: yup.string().default(''),
+        database: yup.string().trim().required(),
+        encrypt: yup.boolean().default(false),
+        remember_password: yup.boolean().default(false),
       }),
     [],
   )
@@ -45,23 +96,14 @@ export function ConnectView({
     register,
     control,
     handleSubmit,
+    reset,
     setValue,
     watch,
     trigger,
     formState: { errors, isSubmitting, isSubmitted },
-  } = useForm({
+  } = useForm<ConnectForm>({
     resolver: yupResolver(schema),
-    defaultValues: {
-      server: 'localhost',
-      port: 1433,
-      instance: '',
-      auth: 'sql',
-      username: 'sa',
-      password: '',
-      database: 'master',
-      encrypt: false,
-      remember_password: false,
-    },
+    defaultValues: DEFAULTS,
   })
   useRevalidateOnLocale(trigger, isSubmitted)
   const auth = watch('auth')
@@ -79,18 +121,10 @@ export function ConnectView({
 
   const fill = (profile: Profile) => {
     setProfileId(profile.id)
-    setValue('server', profile.server)
-    setValue('port', profile.port)
-    setValue('instance', profile.instance)
-    setValue('auth', profile.auth === 'windows' ? 'windows' : 'sql')
-    setValue('username', profile.username || 'sa')
-    setValue('password', '')
-    setValue('database', profile.database || 'master')
-    setValue('encrypt', profile.encrypt)
-    setValue('remember_password', profile.remember_password)
+    reset(profileValues(profile))
   }
 
-  const connectNow = async (values: Record<string, unknown>, id?: string) => {
+  const connectNow = async (values: ConnectForm, id?: string) => {
     setError(null)
     try {
       const result = await api.connect({ ...values, profile_id: id || '' })
@@ -144,7 +178,7 @@ export function ConnectView({
                     onClick={() => {
                       fill(profile)
                       if (profile.auth === 'windows' || profile.has_password) {
-                        void handleSubmit((values) => connectNow(values, profile.id))()
+                        void connectNow(profileValues(profile), profile.id)
                       }
                     }}
                   >
@@ -174,7 +208,7 @@ export function ConnectView({
             </div>
             <div>
               <div className="font-mono text-[10px] text-muted-foreground">{t('connect.port')}</div>
-              <Input className="mt-1" {...register('port', { valueAsNumber: true })} />
+              <Input className="mt-1" type="number" min={1} max={65535} {...register('port')} />
               <FieldError message={errors.port?.message} />
             </div>
           </div>
@@ -220,6 +254,7 @@ export function ConnectView({
           <div className="mt-3">
             <div className="font-mono text-[10px] text-muted-foreground">{t('connect.database')}</div>
             <Input className="mt-1" {...register('database')} />
+            <FieldError message={errors.database?.message} />
           </div>
           <label className="mt-2 flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
             <input type="checkbox" {...register('encrypt')} />
