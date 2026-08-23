@@ -60,7 +60,7 @@ export function DataGrid({
 
   return (
     <>
-      <div ref={parentRef} className="min-h-0 flex-1 overflow-auto">
+      <div ref={parentRef} className="min-h-[240px] flex-1 overflow-auto">
         <table className="w-full min-w-[640px] text-left font-mono text-[11px]">
           <thead className="sticky top-0 z-10 bg-card">
             {table.getHeaderGroups().map((hg) => (
@@ -73,8 +73,22 @@ export function DataGrid({
               </tr>
             ))}
           </thead>
-          <tbody style={{ height: virtual.getTotalSize() }}>
-            {virtual.getVirtualItems().map((item) => {
+          <tbody>
+            {virtual.getVirtualItems().length === 0
+              ? table.getRowModel().rows.slice(0, 80).map((row) => (
+                  <tr
+                    key={row.id}
+                    className="cursor-pointer border-b border-border/60 hover:bg-accent/40"
+                    onDoubleClick={() => setOpen(row.original)}
+                  >
+                    {row.getVisibleCells().map((cell) => (
+                      <td key={cell.id} className="max-w-64 truncate px-4 py-1.5">
+                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                      </td>
+                    ))}
+                  </tr>
+                ))
+              : virtual.getVirtualItems().map((item) => {
               const row = table.getRowModel().rows[item.index]
               return (
                 <tr

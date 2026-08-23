@@ -15,6 +15,10 @@ export function qname(...parts: string[]): string {
   return parts.filter(Boolean).map(qident).join(".");
 }
 
+export function qstr(value: string): string {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
 export function assertDb(database: string): string {
   const name = (database || "").trim();
   if (!name) throw new ClientError("Select a database.");

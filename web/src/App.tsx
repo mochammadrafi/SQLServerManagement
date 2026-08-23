@@ -6,6 +6,7 @@ import {
   Moon,
   RefreshCw,
   Server,
+  Sparkles,
   Sun,
   Terminal,
 } from 'lucide-react'
@@ -23,10 +24,11 @@ import { cn } from '@/lib/utils'
 import { BrowseView } from '@/views/browse-view'
 import { ConnectView } from '@/views/connect-view'
 import { JobsView } from '@/views/jobs-view'
+import { AiView } from '@/views/ai-view'
 import { ServerView } from '@/views/server-view'
 import { SqlView } from '@/views/sql-view'
 
-type View = 'browse' | 'sql' | 'jobs' | 'server'
+type View = 'browse' | 'sql' | 'ai' | 'jobs' | 'server'
 
 export default function App() {
   const { t } = useLocale()
@@ -190,6 +192,7 @@ function Console({
           </div>
           <NavBtn active={view === 'browse'} onClick={() => setView('browse')} icon={Database} label={t('nav.browse')} />
           <NavBtn active={view === 'sql'} onClick={() => setView('sql')} icon={Terminal} label={t('nav.sql')} />
+          <NavBtn active={view === 'ai'} onClick={() => setView('ai')} icon={Sparkles} label={t('nav.ai')} />
           <NavBtn active={view === 'jobs'} onClick={() => setView('jobs')} icon={FileDown} label={t('nav.jobs')} />
           <NavBtn active={view === 'server'} onClick={() => setView('server')} icon={Server} label={t('nav.server')} />
           <Separator className="my-2 hidden md:block" />
@@ -202,7 +205,7 @@ function Console({
           <div className="hidden px-3 font-mono text-[10px] text-muted-foreground md:block">{t('nav.connected')}</div>
         </aside>
 
-        {view === 'browse' ? (
+        <div className={cn('min-h-0 min-w-0 flex-1', view === 'browse' ? 'flex' : 'hidden')}>
           <BrowseView
             onOpenSql={(sql, database) => {
               setSqlSeed({ sql, db: database })
@@ -210,13 +213,24 @@ function Console({
             }}
             onStatus={setStatus}
           />
-        ) : view === 'sql' ? (
+        </div>
+        <div className={cn('min-h-0 min-w-0 flex-1', view === 'sql' ? 'flex' : 'hidden')}>
           <SqlView initialSql={sqlSeed?.sql} initialDb={sqlSeed?.db} />
-        ) : view === 'jobs' ? (
+        </div>
+        <div className={cn('min-h-0 min-w-0 flex-1', view === 'ai' ? 'flex' : 'hidden')}>
+          <AiView
+            onOpenSql={(sql, database) => {
+              setSqlSeed({ sql, db: database })
+              setView('sql')
+            }}
+          />
+        </div>
+        <div className={cn('min-h-0 min-w-0 flex-1', view === 'jobs' ? 'flex' : 'hidden')}>
           <JobsView tick={jobTick} />
-        ) : (
+        </div>
+        <div className={cn('min-h-0 min-w-0 flex-1', view === 'server' ? 'flex' : 'hidden')}>
           <ServerView tick={jobTick} />
-        )}
+        </div>
       </div>
 
       <footer className="flex h-7 shrink-0 items-center gap-3 border-t border-border bg-card/90 px-3 font-mono text-[10px] text-muted-foreground sm:px-4">

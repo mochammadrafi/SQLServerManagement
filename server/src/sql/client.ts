@@ -7,6 +7,7 @@ import {
   limitSelectSql,
   qident,
   qname,
+  qstr,
   splitBatches,
   validateWhere,
 } from "./ident.js";
@@ -130,9 +131,42 @@ async function openPool(cfg: ConnectionConfig): Promise<{
 }
 
 function asInt(value: unknown): number | null {
+  const n = parseNumber(value);
+  return n == null ? null : Math.trunc(n);
+}
+
+function parseNumber(value: unknown): number | null {
   if (value == null || value === "") return null;
-  const n = Number(value);
-  return Number.isFinite(n) ? Math.trunc(n) : null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const text = String(value).trim().replace(/,/g, "");
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  const n = Number(lower.replace(/[^0-9.e+-]/g, ""));
+  if (!Number.isFinite(n)) return null;
+  if (lower.endsWith("gb")) return n * 1024;
+  if (lower.endsWith("kb")) return n / 1024;
+  return n;
+}
+
+function recordsetColumns(recordset: { columns?: unknown } & unknown[]): string[] {
+  const cols = recordset.columns;
+  if (Array.isArray(cols)) {
+    return cols.map((col) => String((col as { name?: string })?.name || ""));
+  }
+  if (cols && typeof cols === "object") return Object.keys(cols as object);
+  const first = recordset[0];
+  if (Array.isArray(first)) return first.map((_, index) => `c${index}`);
+  if (first && typeof first === "object") return Object.keys(first as object);
+  return [];
+}
+
+function cellOf(row: unknown, name: string, index: number): unknown {
+  if (Array.isArray(row)) return row[index];
+  if (!row || typeof row !== "object") return null;
+  const rec = row as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(rec, name)) return rec[name];
+  const found = Object.keys(rec).find((key) => key.toLowerCase() === name.toLowerCase());
+  return found != null ? rec[found] : null;
 }
 
 function asDicts(data: { columns: string[]; rows: unknown[][] }): Record<string, unknown>[] {
@@ -140,7 +174,7 @@ function asDicts(data: { columns: string[]; rows: unknown[][] }): Record<string,
   return data.rows.map((row) => {
     const item: Record<string, unknown> = {};
     columns.forEach((column, index) => {
-      item[column] = row[index];
+      item[column] = Array.isArray(row) ? row[index] : null;
     });
     return item;
   });
@@ -260,7 +294,7 @@ export class SqlServerClient {
           continue;
         }
         for (const recordset of sets) {
-          const columns = (recordset.columns ? Object.keys(recordset.columns) : Object.keys(recordset[0] || {})) as string[];
+          const columns = recordsetColumns(recordset as { columns?: unknown } & unknown[]);
           const rows: unknown[][] = [];
           let truncated = false;
           for (const row of recordset) {
@@ -268,7 +302,7 @@ export class SqlServerClient {
               truncated = true;
               break;
             }
-            rows.push(columns.map((name) => jsonSafe((row as Record<string, unknown>)[name])));
+            rows.push(columns.map((name, index) => jsonSafe(cellOf(row, name, index))));
           }
           resultSets.push({
             columns,
@@ -332,7 +366,19 @@ SELECT
     d.recovery_model_desc
 FROM sys.databases AS d
 ORDER BY d.name`);
-    const sizes = new Map<string, number>();
+    const sizes = await this.databaseSizes();
+    return rows.map((row) => ({
+      ...row,
+      size_mb:
+        sizes.get(asInt(row.database_id) ?? -1) ??
+        sizes.get(String(row.name || "").toLowerCase()) ??
+        null,
+      is_system: ["master", "model", "msdb", "tempdb"].includes(String(row.name || "").toLowerCase()),
+    }));
+  }
+
+  private async databaseSizes() {
+    const sizes = new Map<string | number, number>();
     try {
       const sizeRows = await this.queryDicts(`
 SELECT d.database_id, d.name,
@@ -341,18 +387,27 @@ FROM sys.databases AS d
 LEFT JOIN sys.master_files AS mf ON mf.database_id = d.database_id
 GROUP BY d.database_id, d.name`);
       for (const item of sizeRows) {
-        const mb = Number(item.size_mb);
-        if (!Number.isFinite(mb)) continue;
+        const mb = parseNumber(item.size_mb);
+        if (mb == null) continue;
+        const id = asInt(item.database_id);
+        if (id != null) sizes.set(id, mb);
         if (item.name != null) sizes.set(String(item.name).toLowerCase(), mb);
+      }
+    } catch {
+      /* try sp_helpdb below */
+    }
+    if (sizes.size) return sizes;
+    try {
+      const helpRows = await this.queryDicts("EXEC sp_helpdb");
+      for (const item of helpRows) {
+        const mb = parseNumber(item.db_size ?? item.size_mb);
+        if (mb == null || item.name == null) continue;
+        sizes.set(String(item.name).toLowerCase(), mb);
       }
     } catch {
       /* optional */
     }
-    return rows.map((row) => ({
-      ...row,
-      size_mb: sizes.get(String(row.name || "").toLowerCase()) ?? null,
-      is_system: ["master", "model", "msdb", "tempdb"].includes(String(row.name || "").toLowerCase()),
-    }));
+    return sizes;
   }
 
   async listObjects(database: string, includeCounts = false) {
@@ -464,9 +519,9 @@ GROUP BY s.name, o.name`,
     c.IS_NULLABLE AS is_nullable,
     c.COLUMN_DEFAULT AS column_default
 FROM ${qident(assertDb(database))}.INFORMATION_SCHEMA.COLUMNS AS c
-WHERE c.TABLE_SCHEMA = @p0 AND c.TABLE_NAME = @p1
+WHERE c.TABLE_SCHEMA = ${qstr(schema)} AND c.TABLE_NAME = ${qstr(table)}
 ORDER BY c.ORDINAL_POSITION`,
-      [schema, table],
+      undefined,
       2000,
     );
   }
@@ -492,49 +547,55 @@ ORDER BY s.session_id`,
   }
 
   async keyColumns(database: string, schema: string, table: string): Promise<string[]> {
-    const db = qident(assertDb(database));
-    const chosen = await this.queryDicts(
-      `SELECT TOP 1 i.index_id, i.is_primary_key, i.type AS index_type
+    try {
+      const db = qident(assertDb(database));
+      const sch = qstr(schema);
+      const tbl = qstr(table);
+      const chosen = await this.queryDicts(
+        `SELECT TOP 1 i.index_id, i.is_primary_key, i.type AS index_type
 FROM ${db}.sys.indexes AS i
 JOIN ${db}.sys.objects AS o ON o.object_id = i.object_id
 JOIN ${db}.sys.schemas AS s ON s.schema_id = o.schema_id
-WHERE s.name = @p0 AND o.name = @p1
+WHERE s.name = ${sch} AND o.name = ${tbl}
   AND i.is_hypothetical = 0
   AND (i.is_primary_key = 1 OR i.type = 1 OR EXISTS (
     SELECT 1 FROM ${db}.sys.columns AS c
     WHERE c.object_id = i.object_id AND c.is_identity = 1
   ))
 ORDER BY i.is_primary_key DESC, CASE WHEN i.type = 1 THEN 0 ELSE 1 END, i.index_id`,
-      [schema, table],
-      1,
-    );
-    if (chosen[0]) {
-      const cols = await this.queryDicts(
-        `SELECT c.name AS name, ic.key_ordinal
+        undefined,
+        1,
+      );
+      if (chosen[0]) {
+        const cols = await this.queryDicts(
+          `SELECT c.name AS name, ic.key_ordinal
 FROM ${db}.sys.indexes AS i
 JOIN ${db}.sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
 JOIN ${db}.sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
 JOIN ${db}.sys.objects AS o ON o.object_id = i.object_id
 JOIN ${db}.sys.schemas AS s ON s.schema_id = o.schema_id
-WHERE s.name = @p0 AND o.name = @p1 AND i.index_id = @p2
+WHERE s.name = ${sch} AND o.name = ${tbl} AND i.index_id = ${Number(chosen[0].index_id)}
   AND ic.is_included_column = 0
 ORDER BY ic.key_ordinal`,
-        [schema, table, chosen[0].index_id],
-        32,
-      );
-      const names = cols.map((item) => item.name).filter(Boolean) as string[];
-      if (names.length) return names;
-    }
-    const ident = await this.queryDicts(
-      `SELECT c.name AS name
+          undefined,
+          32,
+        );
+        const names = cols.map((item) => item.name).filter(Boolean) as string[];
+        if (names.length) return names;
+      }
+      const ident = await this.queryDicts(
+        `SELECT c.name AS name
 FROM ${db}.sys.columns AS c
 JOIN ${db}.sys.objects AS o ON o.object_id = c.object_id
 JOIN ${db}.sys.schemas AS s ON s.schema_id = o.schema_id
-WHERE s.name = @p0 AND o.name = @p1 AND c.is_identity = 1`,
-      [schema, table],
-      1,
-    );
-    if (ident[0]?.name) return [String(ident[0].name)];
+WHERE s.name = ${sch} AND o.name = ${tbl} AND c.is_identity = 1`,
+        undefined,
+        1,
+      );
+      if (ident[0]?.name) return [String(ident[0].name)];
+    } catch {
+      /* fall through to heap / offset paging */
+    }
     return [];
   }
 
@@ -548,8 +609,8 @@ WHERE s.name = @p0 AND o.name = @p1 AND c.is_identity = 1`,
 FROM ${db}.sys.partitions AS p
 JOIN ${db}.sys.objects AS o ON o.object_id = p.object_id
 JOIN ${db}.sys.schemas AS s ON s.schema_id = o.schema_id
-WHERE s.name = @p0 AND o.name = @p1 AND p.index_id IN (0, 1)`,
-        [schema, table],
+WHERE s.name = ${qstr(schema)} AND o.name = ${qstr(table)} AND p.index_id IN (0, 1)`,
+        undefined,
         1,
       );
       rowCount = asInt(rows[0]?.row_count);

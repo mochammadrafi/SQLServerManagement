@@ -8,6 +8,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .env
+.openai-key
+openai.json
 .local/
 *.log
 .DS_Store

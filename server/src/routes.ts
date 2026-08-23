@@ -32,6 +32,8 @@ import {
 } from "./sql/export.js";
 import { existingStartDir, listFolders, pickFolder } from "./sql/fs.js";
 import { deleteProfile, getProfile, listProfiles, readPassword, upsertProfile } from "./sql/profiles.js";
+import { askAi } from "./sql/ai.js";
+import { openaiStatus, saveOpenAiKey } from "./sql/openai.js";
 
 function body<T>(request: FastifyRequest): T {
   return (request.body || {}) as T;
@@ -63,6 +65,7 @@ export async function registerRoutes(app: FastifyInstance) {
       profiles: listProfiles(),
       csrf_token: csrfToken(request),
       export_limits: exportLimits(),
+      openai: openaiStatus(),
     }),
   );
 
@@ -300,6 +303,33 @@ export async function registerRoutes(app: FastifyInstance) {
   });
   app.post("/api/v1/fs/pick", async (request) => ok("Folder selected", pickFolder(body<{ path?: string }>(request).path || "")));
 
+  app.get("/api/v1/ai/settings", async () => ok("AI settings", openaiStatus()));
+  app.post("/api/v1/ai/settings", async (request) => {
+    const payload = body<{ api_key?: string; model?: string }>(request);
+    return ok("AI settings saved", saveOpenAiKey(String(payload.api_key || ""), payload.model));
+  });
+  app.post("/api/v1/ai/ask", async (request) => {
+    const client = await clientOf(request);
+    const payload = body<{
+      mode?: "query" | "analyze" | "join" | "scan";
+      message?: string;
+      databases?: string[];
+      tables?: { database?: string; schema: string; name: string }[];
+      include_samples?: boolean;
+      sql?: string;
+    }>(request);
+    return ok(
+      "AI ready",
+      await askAi(client, {
+        mode: payload.mode,
+        message: payload.message,
+        databases: payload.databases,
+        tables: payload.tables,
+        includeSamples: payload.include_samples,
+        sql: payload.sql,
+      }),
+    );
+  });
 }
 
 function needCfg(request: FastifyRequest): ConnectionConfig {

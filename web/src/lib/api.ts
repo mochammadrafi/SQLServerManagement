@@ -49,6 +49,15 @@ export type Meta = {
     min_batch_size: number
     max_batch_size: number
   }
+  openai?: { configured: boolean; masked: string; model: string; source: string }
+}
+
+export type AiReply = {
+  explanation: string
+  sql: string[]
+  notes: string[]
+  mode: string
+  scanned: { database: string; tables: number; objects: string[] }[]
 }
 
 export type Session = {
@@ -65,7 +74,8 @@ export type DatabaseRow = {
   name: string
   is_system?: boolean
   state?: string
-  size_mb?: number
+  state_desc?: string
+  size_mb?: number | null
 }
 
 export type CatalogObject = {
@@ -74,6 +84,7 @@ export type CatalogObject = {
   kind?: string
   is_system?: boolean
   row_count?: number | null
+  size_kb?: number | null
   size_mb?: number | null
 }
 
@@ -177,7 +188,7 @@ export const api = {
       driver_name?: string
     }>('/api/v1/server'),
   databases: () => request<{ databases: DatabaseRow[] }>('/api/v1/databases'),
-  objects: (database: string, counts = false) =>
+  objects: (database: string, counts = true) =>
     request<{
       database: string
       schemas: { name: string; is_system?: boolean }[]
@@ -255,4 +266,13 @@ export const api = {
     }>(`/api/v1/fs?path=${encodeURIComponent(path)}`),
   fsPick: (path: string) =>
     request<{ path: string }>('/api/v1/fs/pick', { method: 'POST', body: JSON.stringify({ path }) }),
+  aiSettings: () =>
+    request<{ configured: boolean; masked: string; model: string; source: string }>('/api/v1/ai/settings'),
+  saveAiSettings: (apiKey: string, model?: string) =>
+    request<{ configured: boolean; masked: string; model: string; source: string }>('/api/v1/ai/settings', {
+      method: 'POST',
+      body: JSON.stringify({ api_key: apiKey, model }),
+    }),
+  aiAsk: (body: Record<string, unknown>) =>
+    request<AiReply>('/api/v1/ai/ask', { method: 'POST', body: JSON.stringify(body) }),
 }

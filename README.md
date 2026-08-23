@@ -75,6 +75,7 @@ From macOS/Linux use a SQL login. Tedious talks TDS directly; no ODBC/Python dri
 | `SQLSM_IDLE_SEC` | `7200` | Drop idle SQL sessions after N seconds |
 | `SQLSM_ALLOW_REMOTE` | unset | Set `1` to bind a non-loopback host |
 | `SQLSM_EXPORT_DIR` | `~/sqlsm-data` or `C:\SQLSM-Data` | Export / backup folder |
+| `SQLSM_OPENAI_KEY` | file in `~/.sqlsm/openai.json` | OpenAI key for the AI query helper |
 
 Passwords stay in memory unless **Remember password** is checked.
 
