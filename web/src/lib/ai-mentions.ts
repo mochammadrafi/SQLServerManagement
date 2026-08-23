@@ -1,4 +1,4 @@
-import type { AiContextDb } from '@/lib/api'
+import type { AiCatalogItem, AiContextDb } from '@/lib/api'
 
 export type MentionPick = {
   kind: 'database' | 'table' | 'column'
@@ -13,13 +13,71 @@ export type MentionTable = {
   name: string
 }
 
+const MENTION_IN_TEXT = /@((?:\[[^\]]+\]|[^.@\s]+)(?:\.(?:\[[^\]]+\]|[^.@\s]+)){0,2})/g
+
+export function quoteMentionPart(part: string) {
+  return /[^A-Za-z0-9_]/.test(part) ? `[${part}]` : part
+}
+
+export function formatMentionRef(database: string, schema: string, name: string) {
+  return `${quoteMentionPart(database)}.${quoteMentionPart(schema)}.${quoteMentionPart(name)}`
+}
+
+export function splitMentionParts(raw: string): string[] {
+  const parts: string[] = []
+  let cur = ''
+  let bracket = false
+  for (const ch of raw) {
+    if (ch === '[') {
+      bracket = true
+      cur += ch
+      continue
+    }
+    if (ch === ']') {
+      bracket = false
+      cur += ch
+      continue
+    }
+    if (ch === '.' && !bracket) {
+      parts.push(unquoteMentionPart(cur))
+      cur = ''
+      continue
+    }
+    cur += ch
+  }
+  if (cur) parts.push(unquoteMentionPart(cur))
+  return parts.map((part) => part.trim()).filter(Boolean)
+}
+
+export function unquoteMentionPart(part: string) {
+  const text = part.trim()
+  if (text.startsWith('[') && text.endsWith(']')) return text.slice(1, -1)
+  return text
+}
+
+function matchesLoose(haystack: string, needle: string) {
+  const h = haystack.toLowerCase()
+  const n = needle.trim().toLowerCase()
+  if (!n) return true
+  if (h.includes(n)) return true
+  const words = n.split(/\s+/).filter(Boolean)
+  if (!words.length) return true
+  let pos = 0
+  for (const word of words) {
+    const idx = h.indexOf(word, pos)
+    if (idx < 0) return false
+    pos = idx + word.length
+  }
+  return true
+}
+
 export function parseMentionTables(text: string, defaultDb: string): MentionTable[] {
   const tables: MentionTable[] = []
   const seen = new Set<string>()
-  for (const match of text.matchAll(/@([A-Za-z0-9_$-]+(?:\.[A-Za-z0-9_$-]+){1,2})/g)) {
+  for (const match of text.matchAll(MENTION_IN_TEXT)) {
     const raw = match[1]
     if (!raw) continue
-    const parts = raw.split('.')
+    const parts = splitMentionParts(raw)
     if (parts.length === 3) {
       const key = `${parts[0]}|${parts[1]}|${parts[2]}`.toLowerCase()
       if (seen.has(key)) continue
@@ -40,60 +98,91 @@ export function mentionFilterAt(value: string, cursor: number) {
   const at = before.lastIndexOf('@')
   if (at < 0) return null
   const chunk = before.slice(at + 1)
-  if (chunk.includes(' ') || chunk.includes('\n')) return null
-  return { start: at, filter: chunk.toLowerCase() }
+  if (chunk.includes('\n')) return null
+  return { start: at, filter: chunk }
+}
+
+function rankMention(label: string, ref: string, filter: string) {
+  const labelLower = label.toLowerCase()
+  const refLower = ref.toLowerCase()
+  const n = filter.trim().toLowerCase()
+  if (!n) return 4
+  if (labelLower === n || refLower === n) return 0
+  if (labelLower.startsWith(n) || refLower.startsWith(n)) return 1
+  const parts = splitMentionParts(filter)
+  const last = parts[parts.length - 1]?.toLowerCase() || n
+  if (labelLower.startsWith(last)) return 2
+  if (labelLower.includes(n) || refLower.includes(n)) return 3
+  return 5
+}
+
+function matchCatalogItem(item: AiCatalogItem, filter: string) {
+  const parts = splitMentionParts(filter)
+  const db = item.database
+  const schema = item.schema
+  const name = item.name
+  if (parts.length >= 3) {
+    return (
+      matchesLoose(db, parts[0]) &&
+      matchesLoose(schema, parts[1]) &&
+      matchesLoose(name, parts.slice(2).join('.'))
+    )
+  }
+  if (parts.length === 2) {
+    return matchesLoose(schema, parts[0]) && matchesLoose(name, parts[1])
+  }
+  return (
+    matchesLoose(name, filter) ||
+    matchesLoose(`${schema}.${name}`, filter) ||
+    matchesLoose(`${db}.${schema}.${name}`, filter) ||
+    matchesLoose(db, filter)
+  )
 }
 
 export function buildMentionSuggestions(
   filter: string,
+  catalog: AiCatalogItem[] | undefined,
   context: AiContextDb[] | undefined,
   databases: string[],
-): MentionPick[] {
+  limit = 80,
+) {
   const out: MentionPick[] = []
-  const n = filter.trim().toLowerCase()
-  const parts = n.split('.').filter(Boolean)
+  const parts = splitMentionParts(filter)
+  const dbPrefix = parts.length >= 1 && filter.includes('.') ? parts[0] : ''
 
   for (const db of databases) {
-    const dbLower = db.toLowerCase()
-    if (!n || dbLower.includes(n) || dbLower.startsWith(parts[0] || '')) {
-      out.push({ kind: 'database', ref: db, label: db, hint: 'database' })
+    if (dbPrefix && !db.toLowerCase().includes(dbPrefix.toLowerCase())) continue
+    if (!filter.trim() || matchesLoose(db, filter)) {
+      out.push({ kind: 'database', ref: quoteMentionPart(db), label: db, hint: 'database' })
     }
   }
 
-  for (const db of context || []) {
-    const dbLower = db.database.toLowerCase()
-    if (parts[0] && parts[0] !== dbLower && !dbLower.startsWith(parts[0])) continue
+  const catalogItems = catalog || []
+  for (const item of catalogItems) {
+    if (dbPrefix && !item.database.toLowerCase().includes(dbPrefix.toLowerCase())) continue
+    if (!matchCatalogItem(item, filter)) continue
+    const ref = formatMentionRef(item.database, item.schema, item.name)
+    out.push({
+      kind: 'table',
+      ref,
+      label: `${item.schema}.${item.name}`,
+      hint: `${item.database} · ${item.kind}${item.row_count != null ? ` · ${item.row_count.toLocaleString()}` : ''}`,
+    })
+  }
 
-    for (const obj of db.objects) {
-      const tableRef = `${db.database}.${obj.schema}.${obj.name}`
-      const shortRef = `${obj.schema}.${obj.name}`
-      const tableLower = shortRef.toLowerCase()
-      const fullLower = tableRef.toLowerCase()
-
-      const tableMatch =
-        !n ||
-        fullLower.includes(n) ||
-        tableLower.includes(n) ||
-        tableLower.startsWith(parts[parts.length - 1] || '') ||
-        (parts.length === 2 && obj.schema.toLowerCase().startsWith(parts[0]) && obj.name.toLowerCase().startsWith(parts[1]))
-
-      if (tableMatch) {
-        out.push({
-          kind: 'table',
-          ref: tableRef,
-          label: shortRef,
-          hint: `${db.database} · ${obj.kind}`,
-        })
-      }
-
-      if (parts.length >= 2 || n.includes('.')) {
+  if (parts.length >= 2 || filter.includes('.')) {
+    for (const db of context || []) {
+      for (const obj of db.objects) {
+        const tableRef = formatMentionRef(db.database, obj.schema, obj.name)
+        const shortRef = `${obj.schema}.${obj.name}`
+        if (!matchCatalogItem({ database: db.database, schema: obj.schema, name: obj.name, kind: obj.kind }, filter)) {
+          continue
+        }
         for (const col of obj.columns) {
-          const colLower = col.name.toLowerCase()
-          const colFilter = parts[parts.length - 1] || n
-          if (colFilter && !colLower.includes(colFilter) && !colLower.startsWith(colFilter)) continue
+          if (!matchesLoose(col.name, parts[parts.length - 1] || filter)) continue
           out.push({
             kind: 'column',
-            ref: `${tableRef}.${col.name}`,
+            ref: `${tableRef}.${quoteMentionPart(col.name)}`,
             label: col.name,
             hint: `${shortRef} · ${col.type}`,
           })
@@ -102,15 +191,16 @@ export function buildMentionSuggestions(
     }
   }
 
-  const rank = (item: MentionPick) => {
-    const label = item.label.toLowerCase()
-    if (label === n) return 0
-    if (label.startsWith(n)) return 1
-    if (item.ref.toLowerCase().includes(n)) return 2
-    return 3
-  }
-
-  return out.sort((a, b) => rank(a) - rank(b)).slice(0, 24)
+  const seen = new Set<string>()
+  return out
+    .filter((item) => {
+      const key = `${item.kind}:${item.ref}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    .sort((a, b) => rankMention(a.label, a.ref, filter) - rankMention(b.label, b.ref, filter))
+    .slice(0, limit)
 }
 
 export function insertMention(value: string, start: number, cursor: number, ref: string) {

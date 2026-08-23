@@ -4,7 +4,7 @@ import { DataGrid } from '@/components/data-grid'
 import { useLocale } from '@/lib/i18n'
 import { api } from '@/lib/api'
 
-export function ServerView({ tick }: { tick: number }) {
+export function ServerView({ active, tick }: { active?: boolean; tick: number }) {
   const { t } = useLocale()
   const [info, setInfo] = useState<Record<string, unknown> | null>(null)
   const [sessions, setSessions] = useState<Record<string, unknown>[]>([])
@@ -12,6 +12,7 @@ export function ServerView({ tick }: { tick: number }) {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    if (!active) return
     setLoading(true)
     void api
       .server()
@@ -22,7 +23,7 @@ export function ServerView({ tick }: { tick: number }) {
       })
       .catch((err) => setError(err instanceof Error ? err.message : t('error.apiUnreachable')))
       .finally(() => setLoading(false))
-  }, [tick, t])
+  }, [active, tick, t])
 
   const keys = info ? Object.keys(info) : []
 

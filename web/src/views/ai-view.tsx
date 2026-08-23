@@ -1,4 +1,4 @@
-import { Sparkles } from 'lucide-react'
+import { Plus, Sparkles, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AiMentionInput } from '@/components/ai-mention-input'
 import { ContextTree, SqlBlock } from '@/components/ai-context-tree'
@@ -6,28 +6,18 @@ import { Button } from '@/components/ui/button'
 import { PasswordInput } from '@/components/ui/password-input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { parseMentionTables } from '@/lib/ai-mentions'
+import { api, type AiStep, type DatabaseRow } from '@/lib/api'
+import { localeTag, useLocale } from '@/lib/i18n'
 import {
-  api,
-  type AiContextDb,
-  type AiStep,
-  type DatabaseRow,
-} from '@/lib/api'
-import { useLocale } from '@/lib/i18n'
+  addChatSession,
+  chatSessionTitle,
+  getActiveSession,
+  patchActiveSession,
+  removeChatSession,
+  switchChatSession,
+  type AiShellState,
+} from '@/lib/shell-state'
 import { cn } from '@/lib/utils'
-
-type Mode = 'query' | 'analyze'
-
-type ChatItem = {
-  role: 'user' | 'ai'
-  text: string
-  sql?: string[]
-  notes?: string[]
-  warnings?: string[]
-  used_objects?: string[]
-  context?: AiContextDb[]
-  steps?: AiStep[]
-  model?: string
-}
 
 const LIVE_STEPS = ['scope', 'catalog', 'columns', 'samples', 'model', 'validate'] as const
 
@@ -104,68 +94,83 @@ function ProcessSteps({
 }
 
 export function AiView({
+  active,
+  connectionId,
+  ai,
+  onAiChange,
   onOpenSql,
 }: {
+  active: boolean
+  connectionId: string
+  ai: AiShellState
+  onAiChange: (patch: Partial<AiShellState> | ((current: AiShellState) => AiShellState)) => void
   onOpenSql: (sql: string, database: string) => void
 }) {
-  const { t } = useLocale()
+  const { t, locale } = useLocale()
   const [databases, setDatabases] = useState<DatabaseRow[]>([])
-  const [selected, setSelected] = useState<string[]>([])
-  const [mode, setMode] = useState<Mode>('query')
-  const [message, setMessage] = useState('')
-  const [sql, setSql] = useState('')
-  const [samples, setSamples] = useState(true)
   const [busy, setBusy] = useState(false)
-  const [previewBusy, setPreviewBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [items, setItems] = useState<ChatItem[]>([])
-  const [preview, setPreview] = useState<AiContextDb[]>([])
-  const [previewSteps, setPreviewSteps] = useState<AiStep[]>([])
+  const [catalogBusy, setCatalogBusy] = useState(false)
+  const [detailBusy, setDetailBusy] = useState(false)
   const [key, setKey] = useState('')
   const [masked, setMasked] = useState('')
   const [configured, setConfigured] = useState(false)
-  const [showPanel, setShowPanel] = useState(true)
+
+  const patchAi = onAiChange
+  const session = getActiveSession(ai)
+  const { selected, samples, catalog, showPanel, sessions, activeSessionId } = ai
+  const { mode, message, sql, items, detailContext, detailSteps, error } = session
+
+  const sortedSessions = useMemo(
+    () => [...sessions].sort((a, b) => b.updatedAt - a.updatedAt),
+    [sessions],
+  )
+
+  const patchSession = useCallback(
+    (patch: Parameters<typeof patchActiveSession>[1], aiPatch?: Partial<AiShellState>) => {
+      patchAi((current) => {
+        const next = patchActiveSession(current, patch)
+        return aiPatch ? { ...next, ...aiPatch } : next
+      })
+    },
+    [patchAi],
+  )
+
+  const formatSessionTime = (value: number) =>
+    new Date(value).toLocaleString(localeTag(locale), {
+      day: '2-digit',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
 
   const lastAi = useMemo(() => [...items].reverse().find((item) => item.role === 'ai'), [items])
-  const panelContext = lastAi?.context || preview
-  const panelSteps = busy ? undefined : lastAi?.steps || previewSteps
+  const panelContext = lastAi?.context || detailContext
+  const panelSteps = busy ? undefined : lastAi?.steps || detailSteps
+  const showProcess = busy || detailBusy
   const defaultDb = selected[0] || 'master'
+  const selectedKey = selected.join('|')
 
   const mentionTables = useMemo(
     () => parseMentionTables(message, defaultDb),
     [message, defaultDb],
   )
 
-  const loadPreview = useCallback(async () => {
-    if (!selected.length) {
-      setPreview([])
-      setPreviewSteps([])
-      return
-    }
-    setPreviewBusy(true)
-    try {
-      const result = await api.aiContext({
-        databases: selected,
-        tables: mentionTables,
-        message,
-        include_samples: samples,
-      })
-      setPreview(result.context)
-      setPreviewSteps(result.steps)
-    } catch {
-      setPreview([])
-      setPreviewSteps([])
-    } finally {
-      setPreviewBusy(false)
-    }
-  }, [selected, mentionTables, message, samples])
-
   useEffect(() => {
+    setBusy(false)
+    setCatalogBusy(false)
+    setDetailBusy(false)
     void api.databases().then((r) => {
       const user = r.databases.filter((db) => !db.is_system)
       setDatabases(user)
-      setSelected(user.slice(0, 1).map((db) => db.name))
+      onAiChange((current) => {
+        if (current.selected.length) return current
+        if (!user.length) return current
+        return { ...current, selected: user.slice(0, 1).map((db) => db.name) }
+      })
     })
+  }, [connectionId, onAiChange])
+
+  useEffect(() => {
     void api.aiSettings().then((s) => {
       setConfigured(s.configured)
       setMasked(s.masked)
@@ -173,22 +178,90 @@ export function AiView({
   }, [])
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      void loadPreview()
-    }, 350)
-    return () => window.clearTimeout(timer)
-  }, [loadPreview])
+    if (!active) return
+    if (!selected.length) {
+      patchAi((current) => ({
+        ...patchActiveSession(current, { detailContext: [], detailSteps: [] }),
+        catalog: [],
+      }))
+      return
+    }
+    let cancelled = false
+    setCatalogBusy(true)
+    void api
+      .aiCatalog({ databases: selected })
+      .then((result) => {
+        if (cancelled) return
+        patchAi((current) => ({
+          ...patchActiveSession(current, { detailContext: [], detailSteps: [] }),
+          catalog: result.catalog,
+        }))
+      })
+      .catch(() => {
+        if (cancelled) return
+        patchAi((current) => ({
+          ...patchActiveSession(current, { detailContext: [], detailSteps: [] }),
+          catalog: [],
+        }))
+      })
+      .finally(() => {
+        if (!cancelled) setCatalogBusy(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [active, selectedKey, connectionId, patchAi, selected])
+
+  const loadDetailContext = useCallback(async () => {
+    if (!selected.length) {
+      patchSession({ detailContext: [], detailSteps: [] })
+      return
+    }
+    setDetailBusy(true)
+    try {
+      const result = await api.aiContext({
+        databases: selected,
+        tables: mentionTables,
+        message,
+        include_samples: samples,
+      })
+      patchSession(
+        {
+          detailContext: result.context,
+          detailSteps: result.steps,
+        },
+        { catalog: result.catalog.length ? result.catalog : catalog },
+      )
+    } catch {
+      patchSession({ detailContext: [], detailSteps: [] })
+    } finally {
+      setDetailBusy(false)
+    }
+  }, [catalog, mentionTables, message, patchSession, samples, selected])
 
   const toggleDb = (name: string) => {
-    setSelected((cur) => (cur.includes(name) ? cur.filter((item) => item !== name) : [...cur, name]))
+    patchAi((current) => ({
+      ...current,
+      selected: current.selected.includes(name)
+        ? current.selected.filter((item) => item !== name)
+        : [...current.selected, name],
+    }))
   }
 
   const ask = async () => {
     setBusy(true)
-    setError(null)
+    patchSession({ error: null })
     const prompt = message.trim()
-    if (mode === 'query') setItems((cur) => [...cur, { role: 'user', text: prompt }])
-    else setItems((cur) => [...cur, { role: 'user', text: prompt || t('ai.pasteSql') }])
+    patchSession((current) => ({
+      ...current,
+      items: [
+        ...current.items,
+        {
+          role: 'user',
+          text: mode === 'query' ? prompt : prompt || t('ai.pasteSql'),
+        },
+      ],
+    }))
     try {
       const reply = await api.aiAsk({
         mode,
@@ -198,30 +271,35 @@ export function AiView({
         include_samples: samples,
         sql: mode === 'analyze' ? sql : undefined,
       })
-      setItems((cur) => [
-        ...cur,
-        {
-          role: 'ai',
-          text: reply.explanation,
-          sql: reply.sql,
-          notes: reply.notes,
-          warnings: reply.warnings,
-          used_objects: reply.used_objects,
-          context: reply.context,
-          steps: reply.steps,
-          model: reply.model,
-        },
-      ])
-      if (reply.context) {
-        setPreview(reply.context)
-        setPreviewSteps(reply.steps || [])
-      }
-      setShowPanel(true)
+      patchSession((current) => {
+        const nextItems = [
+          ...current.items,
+          {
+            role: 'ai' as const,
+            text: reply.explanation,
+            sql: reply.sql,
+            notes: reply.notes,
+            warnings: reply.warnings,
+            used_objects: reply.used_objects,
+            context: reply.context,
+            steps: reply.steps,
+            model: reply.model,
+          },
+        ]
+        return {
+          ...current,
+          items: nextItems,
+          title: chatSessionTitle(nextItems, current.title),
+          detailContext: reply.context || current.detailContext,
+          detailSteps: reply.steps || current.detailSteps,
+          message: mode === 'query' ? '' : current.message,
+        }
+      })
+      patchAi({ showPanel: true })
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('error.apiUnreachable'))
+      patchSession({ error: err instanceof Error ? err.message : t('error.apiUnreachable') })
     } finally {
       setBusy(false)
-      if (mode === 'query') setMessage('')
     }
   }
 
@@ -235,7 +313,7 @@ export function AiView({
           variant="outline"
           size="sm"
           className="ml-auto lg:hidden"
-          onClick={() => setShowPanel((value) => !value)}
+          onClick={() => patchAi({ showPanel: !showPanel })}
         >
           {showPanel ? t('ai.hideContext') : t('ai.showContext')}
         </Button>
@@ -250,14 +328,72 @@ export function AiView({
       ) : null}
       <div className="flex min-h-0 flex-1 flex-col xl:flex-row">
         <aside className="flex max-h-[36vh] w-full shrink-0 flex-col border-b border-border xl:max-h-none xl:w-56 xl:border-r xl:border-b-0">
+          <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+            <div className="font-mono text-[10px] tracking-widest text-muted-foreground">{t('ai.history')}</div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-auto h-7 px-2"
+              disabled={busy}
+              onClick={() => patchAi((current) => addChatSession(current))}
+            >
+              <Plus className="size-3" />
+              {t('ai.newChat')}
+            </Button>
+          </div>
+          <ScrollArea className="max-h-32 shrink-0 border-b border-border xl:max-h-44">
+            <div className="space-y-1 p-2">
+              {sortedSessions.map((entry) => {
+                const activeSession = entry.id === activeSessionId
+                const turns = entry.items.filter((item) => item.role === 'user').length
+                return (
+                  <div
+                    key={entry.id}
+                    className={cn(
+                      'flex items-start gap-1 rounded border px-2 py-1.5',
+                      activeSession
+                        ? 'border-primary/40 bg-accent text-primary'
+                        : 'border-border bg-background/50 hover:bg-accent/40',
+                    )}
+                  >
+                    <button
+                      type="button"
+                      className="min-w-0 flex-1 text-left"
+                      disabled={busy}
+                      onClick={() => patchAi((current) => switchChatSession(current, entry.id))}
+                    >
+                      <div className="truncate font-mono text-[11px]">{entry.title}</div>
+                      <div className="mt-0.5 font-mono text-[9px] text-muted-foreground">
+                        {formatSessionTime(entry.updatedAt)}
+                        {turns ? ` · ${t('ai.sessionTurns', { n: turns })}` : ` · ${t('ai.sessionEmpty')}`}
+                      </div>
+                    </button>
+                    <button
+                      type="button"
+                      className="shrink-0 rounded p-0.5 hover:bg-background/80"
+                      aria-label={t('ai.deleteSession')}
+                      disabled={busy}
+                      onClick={() => patchAi((current) => removeChatSession(current, entry.id))}
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+          </ScrollArea>
           <div className="border-b border-border px-3 py-2 font-mono text-[10px] tracking-widest text-muted-foreground">
             {t('ai.scope')}
           </div>
           <div className="flex flex-wrap gap-1 px-3 py-2">
-            <Button variant="outline" size="sm" onClick={() => setSelected(databases.map((db) => db.name))}>
+            <Button variant="outline" size="sm" onClick={() => patchAi({ selected: databases.map((db) => db.name) })}>
               {t('ai.allDb')}
             </Button>
-            <Button variant="outline" size="sm" onClick={() => setSelected(databases.slice(0, 1).map((db) => db.name))}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => patchAi({ selected: databases.slice(0, 1).map((db) => db.name) })}
+            >
               {t('ai.oneDb')}
             </Button>
           </div>
@@ -270,7 +406,11 @@ export function AiView({
             ))}
           </ScrollArea>
           <label className="flex items-center gap-2 border-t border-border px-3 py-2 font-mono text-[10px] text-muted-foreground">
-            <input type="checkbox" checked={samples} onChange={(e) => setSamples(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={samples}
+              onChange={(e) => patchAi({ samples: e.target.checked })}
+            />
             {t('ai.samples')}
           </label>
           <div className="space-y-2 border-t border-border px-3 py-2">
@@ -296,7 +436,12 @@ export function AiView({
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="flex flex-wrap gap-1 border-b border-border px-3 py-2">
             {(['query', 'analyze'] as const).map((value) => (
-              <Button key={value} variant={mode === value ? 'default' : 'outline'} size="sm" onClick={() => setMode(value)}>
+              <Button
+                key={value}
+                variant={mode === value ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => patchSession({ mode: value })}
+              >
                 {t(`ai.mode.${value}`)}
               </Button>
             ))}
@@ -349,7 +494,7 @@ export function AiView({
           {mode === 'analyze' ? (
             <textarea
               value={sql}
-              onChange={(e) => setSql(e.target.value)}
+              onChange={(e) => patchSession({ sql: e.target.value })}
               placeholder={t('ai.pasteSql')}
               className="h-24 shrink-0 resize-none border-t border-border bg-background/40 p-3 font-mono text-xs outline-none"
             />
@@ -357,8 +502,9 @@ export function AiView({
           <div className="flex shrink-0 gap-2 border-t border-border p-3">
             <AiMentionInput
               value={message}
-              onChange={setMessage}
-              context={preview}
+              onChange={(value) => patchSession({ message: value })}
+              catalog={catalog}
+              context={panelContext.length ? panelContext : undefined}
               databases={selected}
               placeholder={t('ai.placeholder')}
               disabled={busy || !selected.length}
@@ -376,18 +522,45 @@ export function AiView({
         {showPanel ? (
           <aside className="flex max-h-[42vh] w-full shrink-0 flex-col border-t border-border xl:max-h-none xl:w-80 xl:border-t-0 xl:border-l">
             <div className="border-b border-border px-3 py-2 font-mono text-[10px] tracking-widest text-muted-foreground">
-              {t('ai.preview')}
+              {t('ai.catalog')}
             </div>
-            <ScrollArea className="max-h-40 shrink-0 border-b border-border px-3 py-2 xl:max-h-48">
-              <ProcessSteps steps={panelSteps} busy={busy || previewBusy} t={t} />
-            </ScrollArea>
+            <div className="space-y-2 border-b border-border px-3 py-2">
+              <p className="font-mono text-[11px] text-foreground">
+                {catalogBusy
+                  ? t('common.loading')
+                  : t('ai.catalogSummary', { n: catalog.length, d: selected.length })}
+              </p>
+              <p className="font-mono text-[10px] text-muted-foreground">{t('ai.catalogHint')}</p>
+              {mentionTables.length ? (
+                <Button variant="outline" size="sm" disabled={detailBusy} onClick={() => void loadDetailContext()}>
+                  {detailBusy ? t('common.loading') : t('ai.loadContext')}
+                </Button>
+              ) : null}
+            </div>
+            {showProcess ? (
+              <>
+                <div className="border-b border-border px-3 py-2 font-mono text-[10px] tracking-widest text-muted-foreground">
+                  {t('ai.process')}
+                </div>
+                <ScrollArea className="max-h-36 shrink-0 border-b border-border px-3 py-2">
+                  <ProcessSteps steps={panelSteps} busy={busy || detailBusy} t={t} />
+                </ScrollArea>
+              </>
+            ) : null}
+            <div className="border-b border-border px-3 py-2 font-mono text-[10px] tracking-widest text-muted-foreground">
+              {t('ai.contextDetail')}
+            </div>
             <ScrollArea className="min-h-0 flex-1 px-3 py-2">
-              <ContextTree
-                context={panelContext}
-                usedObjects={lastAi?.used_objects}
-                loading={previewBusy && !panelContext.length}
-                t={t}
-              />
+              {panelContext.length ? (
+                <ContextTree
+                  context={panelContext}
+                  usedObjects={lastAi?.used_objects}
+                  loading={detailBusy}
+                  t={t}
+                />
+              ) : (
+                <p className="font-mono text-[10px] text-muted-foreground">{t('ai.contextIdle')}</p>
+              )}
             </ScrollArea>
           </aside>
         ) : null}

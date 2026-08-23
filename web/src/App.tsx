@@ -4,13 +4,15 @@ import {
   HelpCircle,
   LogOut,
   Moon,
+  Plus,
   RefreshCw,
   Server,
   Sparkles,
   Sun,
   Terminal,
+  X,
 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { LocaleSelect } from '@/components/locale-select'
 import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
@@ -18,6 +20,7 @@ import { Separator } from '@/components/ui/separator'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { api, setCsrf, type Connection, type Session } from '@/lib/api'
 import { useLocale } from '@/lib/i18n'
+import { createDefaultShell, normalizeAiState, openSqlInShell, patchAiState, type ShellState } from '@/lib/shell-state'
 import { useTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 import { BrowseView } from '@/views/browse-view'
@@ -26,8 +29,6 @@ import { JobsView } from '@/views/jobs-view'
 import { AiView } from '@/views/ai-view'
 import { ServerView } from '@/views/server-view'
 import { SqlView } from '@/views/sql-view'
-
-type View = 'browse' | 'sql' | 'ai' | 'jobs' | 'server'
 
 export default function App() {
   const { t } = useLocale()
@@ -80,10 +81,10 @@ export default function App() {
     <TooltipProvider>
       <Console
         session={session}
-        onReload={() => void boot()}
+        onReload={boot}
         onAdd={() => setAdding(true)}
         onLogout={() => {
-          void api.disconnect(session.connection_id, false).then((next) => {
+          void api.disconnect(undefined, true).then((next) => {
             setSession(next.connected ? { ...next, connected: true } : null)
           })
         }}
@@ -101,22 +102,80 @@ function Console({
   onSession,
 }: {
   session: Session
-  onReload: () => void
+  onReload: () => Promise<void>
   onAdd: () => void
   onLogout: () => void
   onSession: (session: Session | null) => void
 }) {
   const { t } = useLocale()
   const { theme, toggle } = useTheme()
-  const [view, setView] = useState<View>('browse')
   const [help, setHelp] = useState(false)
   const [status, setStatus] = useState(t('footer.ready'))
-  const [sqlSeed, setSqlSeed] = useState<{ sql: string; db: string } | null>(null)
   const [jobTick, setJobTick] = useState(0)
   const [loading, setLoading] = useState(false)
+  const [shellByConn, setShellByConn] = useState<Record<string, ShellState>>({})
+
   const connections = session.connections || []
+  const connId = session.connection_id || connections[0]?.id || 'none'
   const active = session.connection
-  const connKey = session.connection_id || 'none'
+  const shell = useMemo(() => {
+    const raw = shellByConn[connId] || createDefaultShell()
+    return { ...raw, ai: normalizeAiState(raw.ai) }
+  }, [connId, shellByConn])
+
+  useEffect(() => {
+    setShellByConn((prev) => {
+      const next = { ...prev }
+      for (const conn of connections) {
+        if (!next[conn.id]) {
+          next[conn.id] = createDefaultShell()
+        } else {
+          next[conn.id] = { ...next[conn.id], ai: normalizeAiState(next[conn.id].ai) }
+        }
+      }
+      for (const id of Object.keys(next)) {
+        if (!connections.some((conn) => conn.id === id)) delete next[id]
+      }
+      return next
+    })
+  }, [connections])
+
+  const patchShell = useCallback((patch: ShellState | ((current: ShellState) => ShellState)) => {
+    setShellByConn((prev) => {
+      const current = prev[connId] || createDefaultShell()
+      const nextShell = typeof patch === 'function' ? patch(current) : patch
+      return { ...prev, [connId]: nextShell }
+    })
+  }, [connId])
+
+  const patchAi = useCallback((patch: Parameters<typeof patchAiState>[1]) => {
+    patchShell((shell) => patchAiState(shell, patch))
+  }, [patchShell])
+
+  const setView = (view: ShellState['view']) => {
+    patchShell((current) => ({ ...current, view }))
+  }
+
+  const openSql = (sql: string, database: string) => {
+    patchShell((current) => openSqlInShell(current, sql, database))
+  }
+
+  const switchConn = (id: string) => {
+    if (id === connId) return
+    void api.switchConnection(id).then((next) => onSession({ ...session, ...next, connected: true }))
+  }
+
+  const closeConn = (id: string) => {
+    void api.disconnect(id, false).then((next) => {
+      if (!next.connected) {
+        onSession(null)
+        return
+      }
+      onSession({ ...session, ...next, connected: true })
+    })
+  }
+
+  const view = shell.view
 
   return (
     <div className="corner-frame flex h-full flex-col bg-background/85 text-foreground">
@@ -127,21 +186,8 @@ function Console({
           {t('common.adminConsole')}
         </span>
         <div className="ml-auto flex min-w-0 items-center gap-1.5 sm:gap-2">
-          <select
-            className="hidden max-w-48 truncate border border-border bg-background/70 px-2 py-1 font-mono text-[11px] sm:block"
-            value={session.connection_id}
-            onChange={(e) => {
-              setSqlSeed(null)
-              void api.switchConnection(e.target.value).then((next) => onSession({ ...session, ...next, connected: true }))
-            }}
-          >
-            {connections.map((c: Connection) => (
-              <option key={c.id} value={c.id}>
-                {c.label}
-              </option>
-            ))}
-          </select>
-          <Button variant="outline" size="sm" onClick={onAdd}>
+          <Button variant="outline" size="sm" className="hidden sm:inline-flex" onClick={onAdd}>
+            <Plus />
             {t('connect.new')}
           </Button>
           <LocaleSelect className="hidden w-36 sm:block" />
@@ -152,9 +198,8 @@ function Console({
                 size="icon"
                 onClick={() => {
                   setLoading(true)
-                  onReload()
                   setJobTick((n) => n + 1)
-                  setLoading(false)
+                  void onReload().finally(() => setLoading(false))
                 }}
               >
                 <RefreshCw className={cn(loading && 'animate-spin')} />
@@ -189,6 +234,36 @@ function Console({
         </div>
       </header>
 
+      <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border bg-card/70 px-2 py-1">
+        {connections.map((conn: Connection) => (
+          <div
+            key={conn.id}
+            className={cn(
+              'flex max-w-[240px] shrink-0 items-center gap-1 rounded border px-2 py-1 font-mono text-[10px]',
+              conn.id === connId
+                ? 'border-primary/40 bg-accent text-primary'
+                : 'border-border bg-background/50 text-muted-foreground hover:bg-accent/40',
+            )}
+          >
+            <button type="button" className="min-w-0 truncate" onClick={() => switchConn(conn.id)}>
+              {conn.label}
+            </button>
+            <button
+              type="button"
+              className="shrink-0 rounded p-0.5 hover:bg-background/80"
+              aria-label={t('shell.closeConnection')}
+              onClick={() => closeConn(conn.id)}
+            >
+              <X className="size-3" />
+            </button>
+          </div>
+        ))}
+        <Button variant="outline" size="sm" className="shrink-0 sm:hidden" onClick={onAdd}>
+          <Plus />
+          {t('connect.new')}
+        </Button>
+      </div>
+
       <div className="flex min-h-0 min-w-0 flex-1 flex-col md:flex-row">
         <aside className="flex shrink-0 flex-row overflow-x-auto border-b border-border bg-card/60 md:w-56 md:flex-col md:overflow-visible md:border-r md:border-b-0">
           <div className="hidden px-3 py-2 font-mono text-[10px] tracking-[0.2em] text-muted-foreground md:block">
@@ -210,37 +285,31 @@ function Console({
         </aside>
 
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'browse' ? 'flex' : 'hidden')}>
-          <BrowseView
-            key={connKey}
-            onOpenSql={(sql, database) => {
-              setSqlSeed({ sql, db: database })
-              setView('sql')
-            }}
-            onStatus={setStatus}
-          />
+          <BrowseView key={`browse-${connId}`} active={view === 'browse'} onOpenSql={openSql} onStatus={setStatus} />
         </div>
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'sql' ? 'flex' : 'hidden')}>
-          <SqlView key={connKey} initialSql={sqlSeed?.sql} initialDb={sqlSeed?.db} />
+          <SqlView active={view === 'sql'} shell={shell} onShellChange={(next) => patchShell(next)} />
         </div>
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'ai' ? 'flex' : 'hidden')}>
           <AiView
-            key={connKey}
-            onOpenSql={(sql, database) => {
-              setSqlSeed({ sql, db: database })
-              setView('sql')
-            }}
+            active={view === 'ai'}
+            connectionId={connId}
+            ai={shell.ai}
+            onAiChange={patchAi}
+            onOpenSql={openSql}
           />
         </div>
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'jobs' ? 'flex' : 'hidden')}>
-          <JobsView key={connKey} tick={jobTick} />
+          <JobsView key={`jobs-${connId}`} active={view === 'jobs'} tick={jobTick} />
         </div>
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'server' ? 'flex' : 'hidden')}>
-          <ServerView key={connKey} tick={jobTick} />
+          <ServerView key={`server-${connId}`} active={view === 'server'} tick={jobTick} />
         </div>
       </div>
 
       <footer className="flex h-7 shrink-0 items-center gap-3 border-t border-border bg-card/90 px-3 font-mono text-[10px] text-muted-foreground sm:px-4">
         <span>127.0.0.1</span>
+        <span className="truncate">{active?.display_server || active?.server}</span>
         <span className="ml-auto truncate">{status}</span>
       </footer>
       <Dialog

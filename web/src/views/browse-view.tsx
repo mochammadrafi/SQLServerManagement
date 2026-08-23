@@ -36,9 +36,11 @@ function objectMeta(item: CatalogObject, kind: string) {
 }
 
 export function BrowseView({
+  active: _active,
   onOpenSql,
   onStatus,
 }: {
+  active?: boolean
   onOpenSql: (sql: string, database: string) => void
   onStatus: (text: string) => void
 }) {

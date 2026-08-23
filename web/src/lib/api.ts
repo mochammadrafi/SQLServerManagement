@@ -93,6 +93,20 @@ export type AiContextDb = {
   foreign_keys: AiForeignKey[]
 }
 
+export type AiCatalogItem = {
+  database: string
+  schema: string
+  name: string
+  kind: string
+  row_count?: number | null
+}
+
+export type AiContextReply = {
+  context: AiContextDb[]
+  steps: AiStep[]
+  catalog: AiCatalogItem[]
+}
+
 export type AiReply = {
   explanation: string
   sql: string[]
@@ -319,8 +333,13 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ api_key: apiKey, model }),
     }),
+  aiCatalog: (body: Record<string, unknown>) =>
+    request<{ catalog: AiCatalogItem[] }>('/api/v1/ai/catalog', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   aiContext: (body: Record<string, unknown>) =>
-    request<{ context: AiContextDb[]; steps: AiStep[] }>('/api/v1/ai/context', {
+    request<AiContextReply>('/api/v1/ai/context', {
       method: 'POST',
       body: JSON.stringify(body),
     }),

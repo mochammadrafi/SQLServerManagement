@@ -54,6 +54,14 @@ export type AiContextDb = {
   foreign_keys: AiForeignKey[];
 };
 
+export type AiCatalogItem = {
+  database: string;
+  schema: string;
+  name: string;
+  kind: string;
+  row_count?: number | null;
+};
+
 const SQL_CONTINUATION =
   /^(FROM|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN|JOIN|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|UNION)/i;
 
@@ -88,14 +96,47 @@ function wantsJoin(message: string, pinnedCount: number) {
   return /\b(join|relasi|hubung|gabung|combine|link|inner|left|right|outer|cross)\b/i.test(message);
 }
 
+function splitMentionParts(raw: string): string[] {
+  const parts: string[] = [];
+  let cur = "";
+  let bracket = false;
+  for (const ch of raw) {
+    if (ch === "[") {
+      bracket = true;
+      cur += ch;
+      continue;
+    }
+    if (ch === "]") {
+      bracket = false;
+      cur += ch;
+      continue;
+    }
+    if (ch === "." && !bracket) {
+      parts.push(unquoteMentionPart(cur));
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) parts.push(unquoteMentionPart(cur));
+  return parts.map((part) => part.trim()).filter(Boolean);
+}
+
+function unquoteMentionPart(part: string) {
+  const text = part.trim();
+  if (text.startsWith("[") && text.endsWith("]")) return text.slice(1, -1);
+  return text;
+}
+
 function mentionTables(message: string, databases: string[]) {
   const defaultDb = databases[0] || "";
   const tables: { database?: string; schema: string; name: string }[] = [];
   const seen = new Set<string>();
-  for (const match of message.matchAll(/@([A-Za-z0-9_$-]+(?:\.[A-Za-z0-9_$-]+){1,2})/g)) {
+  const re = /@((?:\[[^\]]+\]|[^.@\s]+)(?:\.(?:\[[^\]]+\]|[^.@\s]+)){0,2})/g;
+  for (const match of message.matchAll(re)) {
     const raw = match[1];
     if (!raw) continue;
-    const parts = raw.split(".");
+    const parts = splitMentionParts(raw);
     if (parts.length === 3) {
       const key = `${parts[0]}|${parts[1]}|${parts[2]}`.toLowerCase();
       if (seen.has(key)) continue;
@@ -383,8 +424,49 @@ export async function gatherContext(client: SqlServerClient, ask: AiAsk) {
   return { context, steps };
 }
 
+export async function listCatalogIndex(client: SqlServerClient, databases?: string[]) {
+  let dbs = (databases || []).map((name) => String(name || "").trim()).filter(Boolean);
+  if (!dbs.length) {
+    const all = await client.listDatabases();
+    dbs = all
+      .filter((row) => !systemDbs().has(String((row as { name?: string }).name || "").toLowerCase()))
+      .map((row) => String((row as { name?: string }).name || ""));
+  }
+  dbs = dbs.slice(0, 8);
+  const catalog: AiCatalogItem[] = [];
+  for (const database of dbs) {
+    const listed = await client.listObjects(database, true);
+    for (const bucket of ["tables", "views"] as const) {
+      const kind = bucket === "tables" ? "table" : "view";
+      for (const item of (listed.objects[bucket] || []) as {
+        schema?: string;
+        name?: string;
+        is_system?: boolean;
+        row_count?: number | null;
+      }[]) {
+        if (item.is_system) continue;
+        const name = String(item.name || "");
+        if (!name) continue;
+        catalog.push({
+          database,
+          schema: String(item.schema || "dbo"),
+          name,
+          kind,
+          row_count: item.row_count ?? null,
+        });
+      }
+    }
+  }
+  return catalog;
+}
+
 export async function previewAiContext(client: SqlServerClient, ask: AiAsk) {
-  return gatherContext(client, { ...ask, mode: "query" });
+  const databases = (ask.databases || []).map((name) => String(name || "").trim()).filter(Boolean).slice(0, 8);
+  const [catalog, gathered] = await Promise.all([
+    listCatalogIndex(client, databases),
+    gatherContext(client, ask),
+  ]);
+  return { ...gathered, catalog };
 }
 
 function compactContextText(context: AiContextDb[]) {

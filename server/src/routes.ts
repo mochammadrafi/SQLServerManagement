@@ -32,7 +32,7 @@ import {
 } from "./sql/export.js";
 import { existingStartDir, listFolders, pickFolder } from "./sql/fs.js";
 import { deleteProfile, getProfile, listProfiles, readPassword, upsertProfile } from "./sql/profiles.js";
-import { askAi, previewAiContext } from "./sql/ai.js";
+import { askAi, listCatalogIndex, previewAiContext } from "./sql/ai.js";
 import { openaiStatus, saveOpenAiKey } from "./sql/openai.js";
 
 function body<T>(request: FastifyRequest): T {
@@ -307,6 +307,11 @@ export async function registerRoutes(app: FastifyInstance) {
   app.post("/api/v1/ai/settings", async (request) => {
     const payload = body<{ api_key?: string; model?: string }>(request);
     return ok("AI settings saved", saveOpenAiKey(String(payload.api_key || ""), payload.model));
+  });
+  app.post("/api/v1/ai/catalog", async (request) => {
+    const client = await clientOf(request);
+    const payload = body<{ databases?: string[] }>(request);
+    return ok("Catalog ready", { catalog: await listCatalogIndex(client, payload.databases) });
   });
   app.post("/api/v1/ai/context", async (request) => {
     const client = await clientOf(request);

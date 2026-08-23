@@ -7,7 +7,7 @@ import { api, type Job } from '@/lib/api'
 import { useLocale } from '@/lib/i18n'
 import { fmtBytes } from '@/lib/utils'
 
-export function JobsView({ tick }: { tick: number }) {
+export function JobsView({ active, tick }: { active?: boolean; tick: number }) {
   const { t } = useLocale()
   const [jobs, setJobs] = useState<Job[]>([])
   const [loading, setLoading] = useState(true)
@@ -19,10 +19,11 @@ export function JobsView({ tick }: { tick: number }) {
       .finally(() => setLoading(false))
 
   useEffect(() => {
+    if (!active) return
     void load()
     const timer = window.setInterval(() => void load(), 2000)
     return () => window.clearInterval(timer)
-  }, [tick])
+  }, [active, tick])
 
   return (
     <section className="flex min-h-0 min-w-0 flex-1 flex-col">
