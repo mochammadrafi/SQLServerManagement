@@ -52,11 +52,57 @@ export type Meta = {
   openai?: { configured: boolean; masked: string; model: string; source: string }
 }
 
+export type AiStep = {
+  id: string
+  label: string
+  detail?: string
+  ms?: number
+}
+
+export type AiColumn = {
+  name: string
+  type: string
+  nullable?: boolean
+}
+
+export type AiForeignKey = {
+  from: string
+  to: string
+  columns: string[]
+  constraint?: string
+}
+
+export type AiContextObject = {
+  database: string
+  schema: string
+  name: string
+  kind: string
+  row_count?: number | null
+  size_kb?: number | null
+  pk?: string[]
+  columns: AiColumn[]
+  sample?: { columns: string[]; rows: unknown[][] }
+  reason?: string
+}
+
+export type AiContextDb = {
+  database: string
+  object_count: number
+  fk_count: number
+  objects: AiContextObject[]
+  foreign_keys: AiForeignKey[]
+}
+
 export type AiReply = {
   explanation: string
   sql: string[]
   notes: string[]
+  warnings?: string[]
+  used_objects?: string[]
   mode: string
+  model?: string
+  steps?: AiStep[]
+  context?: AiContextDb[]
   scanned: { database: string; tables: number; objects: string[] }[]
 }
 
@@ -272,6 +318,11 @@ export const api = {
     request<{ configured: boolean; masked: string; model: string; source: string }>('/api/v1/ai/settings', {
       method: 'POST',
       body: JSON.stringify({ api_key: apiKey, model }),
+    }),
+  aiContext: (body: Record<string, unknown>) =>
+    request<{ context: AiContextDb[]; steps: AiStep[] }>('/api/v1/ai/context', {
+      method: 'POST',
+      body: JSON.stringify(body),
     }),
   aiAsk: (body: Record<string, unknown>) =>
     request<AiReply>('/api/v1/ai/ask', { method: 'POST', body: JSON.stringify(body) }),

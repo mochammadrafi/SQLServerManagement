@@ -56,7 +56,10 @@ export function saveOpenAiKey(apiKey: string, model?: string) {
   return openaiStatus();
 }
 
-export async function chatOpenAi(messages: { role: "system" | "user" | "assistant"; content: string }[]) {
+export async function chatOpenAi(
+  messages: { role: "system" | "user" | "assistant"; content: string }[],
+  opts?: { json?: boolean; temperature?: number },
+) {
   const store = loadStore();
   if (!store.apiKey) {
     throw new ClientError(
@@ -72,8 +75,9 @@ export async function chatOpenAi(messages: { role: "system" | "user" | "assistan
     },
     body: JSON.stringify({
       model: store.model || DEFAULT_MODEL,
-      temperature: 0.2,
+      temperature: opts?.temperature ?? 0.15,
       messages,
+      ...(opts?.json ? { response_format: { type: "json_object" } } : {}),
     }),
   });
   const data = (await res.json()) as {

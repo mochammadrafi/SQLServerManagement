@@ -32,7 +32,7 @@ import {
 } from "./sql/export.js";
 import { existingStartDir, listFolders, pickFolder } from "./sql/fs.js";
 import { deleteProfile, getProfile, listProfiles, readPassword, upsertProfile } from "./sql/profiles.js";
-import { askAi } from "./sql/ai.js";
+import { askAi, previewAiContext } from "./sql/ai.js";
 import { openaiStatus, saveOpenAiKey } from "./sql/openai.js";
 
 function body<T>(request: FastifyRequest): T {
@@ -308,10 +308,27 @@ export async function registerRoutes(app: FastifyInstance) {
     const payload = body<{ api_key?: string; model?: string }>(request);
     return ok("AI settings saved", saveOpenAiKey(String(payload.api_key || ""), payload.model));
   });
+  app.post("/api/v1/ai/context", async (request) => {
+    const client = await clientOf(request);
+    const payload = body<{
+      message?: string;
+      databases?: string[];
+      tables?: { database?: string; schema: string; name: string }[];
+      include_samples?: boolean;
+    }>(request);
+    const result = await previewAiContext(client, {
+      message: payload.message,
+      databases: payload.databases,
+      tables: payload.tables,
+      includeSamples: payload.include_samples,
+      mode: "query",
+    });
+    return ok("Context ready", result);
+  });
   app.post("/api/v1/ai/ask", async (request) => {
     const client = await clientOf(request);
     const payload = body<{
-      mode?: "query" | "analyze" | "join" | "scan";
+      mode?: "query" | "analyze";
       message?: string;
       databases?: string[];
       tables?: { database?: string; schema: string; name: string }[];

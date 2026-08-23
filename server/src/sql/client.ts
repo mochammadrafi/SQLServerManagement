@@ -526,6 +526,32 @@ ORDER BY c.ORDINAL_POSITION`,
     );
   }
 
+  async listForeignKeys(database: string) {
+    const db = qident(assertDb(database));
+    return this.queryDicts(
+      `SELECT
+    ps.name AS from_schema,
+    po.name AS from_table,
+    pc.name AS from_column,
+    rs.name AS to_schema,
+    ro.name AS to_table,
+    rc.name AS to_column,
+    fk.name AS constraint_name
+FROM ${db}.sys.foreign_keys AS fk
+JOIN ${db}.sys.foreign_key_columns AS fkc ON fkc.constraint_object_id = fk.object_id
+JOIN ${db}.sys.tables AS po ON po.object_id = fk.parent_object_id
+JOIN ${db}.sys.schemas AS ps ON ps.schema_id = po.schema_id
+JOIN ${db}.sys.columns AS pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+JOIN ${db}.sys.tables AS ro ON ro.object_id = fk.referenced_object_id
+JOIN ${db}.sys.schemas AS rs ON rs.schema_id = ro.schema_id
+JOIN ${db}.sys.columns AS rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
+WHERE po.is_ms_shipped = 0 AND ro.is_ms_shipped = 0
+ORDER BY ps.name, po.name, fkc.constraint_column_id`,
+      undefined,
+      5000,
+    );
+  }
+
   async listSessions() {
     return this.queryDicts(
       `SELECT
