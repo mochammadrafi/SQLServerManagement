@@ -1,8 +1,6 @@
-import { yupResolver } from '@hookform/resolvers/yup'
 import { Moon, Sun, Terminal } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { Controller, useForm, type DefaultValues } from 'react-hook-form'
-import * as yup from 'yup'
 import { LocaleSelect } from '@/components/locale-select'
 import { Button } from '@/components/ui/button'
 import { DynamicSelect } from '@/components/ui/dynamic-select'
@@ -12,11 +10,10 @@ import { PasswordInput } from '@/components/ui/password-input'
 import { api, setCsrf, type Meta, type Profile } from '@/lib/api'
 import { useLocale } from '@/lib/i18n'
 import { useTheme } from '@/lib/theme'
-import { useRevalidateOnLocale } from '@/lib/yup-locale'
 
 type ConnectForm = {
   server: string
-  port: number
+  port: string
   instance: string
   auth: 'sql' | 'windows'
   username: string
@@ -26,9 +23,11 @@ type ConnectForm = {
   remember_password: boolean
 }
 
+type ConnectPayload = Omit<ConnectForm, 'port'> & { port: number }
+
 const DEFAULTS: DefaultValues<ConnectForm> = {
   server: 'localhost',
-  port: 1433,
+  port: '1433',
   instance: '',
   auth: 'sql',
   username: 'sa',
@@ -41,7 +40,7 @@ const DEFAULTS: DefaultValues<ConnectForm> = {
 function profileValues(profile: Profile): ConnectForm {
   return {
     server: profile.server,
-    port: profile.port || 1433,
+    port: String(profile.port || 1433),
     instance: profile.instance || '',
     auth: profile.auth === 'windows' ? 'windows' : 'sql',
     username: profile.username || 'sa',
@@ -49,6 +48,23 @@ function profileValues(profile: Profile): ConnectForm {
     database: profile.database || 'master',
     encrypt: profile.encrypt,
     remember_password: profile.remember_password,
+  }
+}
+
+function parsePort(raw: string | number | undefined): number {
+  const text = String(raw ?? '').trim()
+  if (!text) return 1433
+  const port = Number.parseInt(text, 10)
+  return Number.isFinite(port) ? port : 1433
+}
+
+function normalizeValues(raw: ConnectForm): ConnectPayload {
+  return {
+    ...raw,
+    server: raw.server.trim(),
+    database: raw.database.trim() || 'master',
+    port: parsePort(raw.port),
+    auth: raw.auth === 'windows' ? 'windows' : 'sql',
   }
 }
 
@@ -64,48 +80,20 @@ export function ConnectView({
   const [meta, setMeta] = useState<Meta | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [profileId, setProfileId] = useState('')
-  const schema = useMemo(
-    () =>
-      yup.object({
-        server: yup.string().trim().required(),
-        port: yup
-          .number()
-          .transform((_value, originalValue) => {
-            if (originalValue === '' || originalValue === null || originalValue === undefined) return undefined
-            const parsed = Number(originalValue)
-            return Number.isNaN(parsed) ? undefined : parsed
-          })
-          .min(1)
-          .max(65535)
-          .required(),
-        instance: yup.string().default(''),
-        auth: yup
-          .string()
-          .transform((value) => (value === 'windows' ? 'windows' : 'sql'))
-          .oneOf(['sql', 'windows'])
-          .required(),
-        username: yup.string().default(''),
-        password: yup.string().default(''),
-        database: yup.string().trim().required(),
-        encrypt: yup.boolean().default(false),
-        remember_password: yup.boolean().default(false),
-      }),
-    [],
-  )
   const {
     register,
     control,
-    handleSubmit,
     reset,
     setValue,
+    getValues,
+    setError: setFieldError,
+    clearErrors,
     watch,
-    trigger,
-    formState: { errors, isSubmitting, isSubmitted },
+    formState: { errors, isSubmitting },
   } = useForm<ConnectForm>({
-    resolver: yupResolver(schema),
     defaultValues: DEFAULTS,
+    shouldUnregister: false,
   })
-  useRevalidateOnLocale(trigger, isSubmitted)
   const auth = watch('auth')
 
   useEffect(() => {
@@ -122,9 +110,10 @@ export function ConnectView({
   const fill = (profile: Profile) => {
     setProfileId(profile.id)
     reset(profileValues(profile))
+    clearErrors()
   }
 
-  const connectNow = async (values: ConnectForm, id?: string) => {
+  const connectNow = async (values: ConnectPayload, id?: string) => {
     setError(null)
     try {
       const result = await api.connect({ ...values, profile_id: id || '' })
@@ -135,7 +124,31 @@ export function ConnectView({
     }
   }
 
-  const submit = handleSubmit((values) => connectNow(values, profileId))
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    clearErrors()
+    setError(null)
+
+    const raw = getValues()
+    const values = normalizeValues(raw)
+    let blocked = false
+
+    if (!values.server) {
+      setFieldError('server', { type: 'required', message: t('validation.required') })
+      blocked = true
+    }
+    if (!values.database) {
+      setFieldError('database', { type: 'required', message: t('validation.required') })
+      blocked = true
+    }
+    if (values.port < 1 || values.port > 65535) {
+      setFieldError('port', { type: 'validate', message: t('validation.invalid') })
+      blocked = true
+    }
+    if (blocked) return
+
+    await connectNow(values, profileId)
+  }
 
   return (
     <div className="corner-frame flex h-full flex-col bg-background/85 text-foreground">
@@ -178,7 +191,7 @@ export function ConnectView({
                     onClick={() => {
                       fill(profile)
                       if (profile.auth === 'windows' || profile.has_password) {
-                        void connectNow(profileValues(profile), profile.id)
+                        void connectNow(normalizeValues(profileValues(profile)), profile.id)
                       }
                     }}
                   >
@@ -203,18 +216,18 @@ export function ConnectView({
           <div className="mt-3 grid grid-cols-[1fr_6rem] gap-2">
             <div>
               <div className="font-mono text-[10px] text-muted-foreground">{t('connect.server')}</div>
-              <Input className="mt-1" {...register('server')} />
+              <Input className="mt-1" autoComplete="off" {...register('server')} />
               <FieldError message={errors.server?.message} />
             </div>
             <div>
               <div className="font-mono text-[10px] text-muted-foreground">{t('connect.port')}</div>
-              <Input className="mt-1" type="number" min={1} max={65535} {...register('port')} />
+              <Input className="mt-1" inputMode="numeric" autoComplete="off" {...register('port')} />
               <FieldError message={errors.port?.message} />
             </div>
           </div>
           <div className="mt-3">
             <div className="font-mono text-[10px] text-muted-foreground">{t('connect.instance')}</div>
-            <Input className="mt-1" placeholder="SQLEXPRESS" {...register('instance')} />
+            <Input className="mt-1" placeholder="SQLEXPRESS" autoComplete="off" {...register('instance')} />
           </div>
           <div className="mt-3">
             <div className="font-mono text-[10px] text-muted-foreground">{t('connect.authMode')}</div>
@@ -239,11 +252,11 @@ export function ConnectView({
             <>
               <div className="mt-3">
                 <div className="font-mono text-[10px] text-muted-foreground">{t('connect.username')}</div>
-                <Input className="mt-1" {...register('username')} />
+                <Input className="mt-1" autoComplete="username" {...register('username')} />
               </div>
               <div className="mt-3">
                 <div className="font-mono text-[10px] text-muted-foreground">{t('common.password')}</div>
-                <PasswordInput className="mt-1" {...register('password')} />
+                <PasswordInput className="mt-1" autoComplete="current-password" {...register('password')} />
               </div>
               <label className="mt-2 flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
                 <input type="checkbox" {...register('remember_password')} />
@@ -253,7 +266,7 @@ export function ConnectView({
           ) : null}
           <div className="mt-3">
             <div className="font-mono text-[10px] text-muted-foreground">{t('connect.database')}</div>
-            <Input className="mt-1" {...register('database')} />
+            <Input className="mt-1" autoComplete="off" {...register('database')} />
             <FieldError message={errors.database?.message} />
           </div>
           <label className="mt-2 flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
