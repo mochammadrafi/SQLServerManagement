@@ -3,37 +3,38 @@ setlocal
 title SQL Server Management
 cd /d "%~dp0"
 
-where python >nul 2>&1
+where node >nul 2>&1
 if errorlevel 1 (
-  echo Python tidak ditemukan.
-  echo Install Python 3.8.10 dari https://www.python.org/downloads/release/python-3810/
-  echo Centang "Add Python to PATH" saat install.
+  echo Node.js 18 x64 is required for Windows Server 2012 R2.
+  echo Download: https://nodejs.org/dist/v18.20.8/node-v18.20.8-x64.msi
+  echo Node 18.0.0+ also works. Node 20+ does not support this OS.
   pause
   exit /b 1
 )
 
-if not exist ".venv\Scripts\python.exe" (
-  echo Membuat virtual environment...
-  python -m venv .venv
+for /f "tokens=1 delims=." %%A in ('node -p "process.versions.node"') do set NODE_MAJOR=%%A
+if not "%NODE_MAJOR%"=="18" (
+  echo This app targets Node.js 18. Found:
+  node -v
+  echo Install Node 18 x64: https://nodejs.org/dist/v18.20.8/node-v18.20.8-x64.msi
+  pause
+  exit /b 1
+)
+
+if not exist "node_modules" (
+  echo Installing dependencies...
+  call npm install
   if errorlevel 1 (
-    echo Gagal membuat virtual environment.
+    echo npm install failed.
     pause
     exit /b 1
   )
-  echo Menginstall dependensi...
-  ".venv\Scripts\python.exe" -m pip install --upgrade pip
-  ".venv\Scripts\python.exe" -m pip install -r requirements-windows.txt
-  if errorlevel 1 (
-    echo pyodbc gagal. Mencoba tanpa ODBC (SQL Authentication saja)...
-    ".venv\Scripts\python.exe" -m pip install -r requirements.txt
-    if errorlevel 1 (
-      echo pip install gagal. Lihat README.
-      pause
-      exit /b 1
-    )
-  )
 )
 
-start "" "http://127.0.0.1:5050"
-".venv\Scripts\python.exe" run.py
+if not exist "web\dist" (
+  call npm run build -w web
+)
+
+start "" "http://127.0.0.1:8000"
+call npm start
 if errorlevel 1 pause

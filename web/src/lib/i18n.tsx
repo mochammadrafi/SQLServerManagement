@@ -1,0 +1,382 @@
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import * as yup from 'yup'
+
+export const LOCALES = ['en', 'ru', 'de', 'id'] as const
+export type Locale = (typeof LOCALES)[number]
+
+const KEY = 'sqlsm-locale'
+
+const BCP47: Record<Locale, string> = {
+  en: 'en-US',
+  ru: 'ru-RU',
+  de: 'de-DE',
+  id: 'id-ID',
+}
+
+export const LOCALE_OPTIONS: { value: Locale; label: string }[] = [
+  { value: 'en', label: 'English' },
+  { value: 'ru', label: 'Русский' },
+  { value: 'de', label: 'Deutsch' },
+  { value: 'id', label: 'Indonesia' },
+]
+
+type Dict = Record<string, string>
+
+const en: Dict = {
+  'boot.checking': 'checking session…',
+  'common.adminConsole': 'sql console',
+  'common.reload': 'Reload',
+  'common.themeLight': 'Light mode',
+  'common.themeDark': 'Dark mode',
+  'common.logout': 'Disconnect',
+  'common.loading': 'loading…',
+  'common.loadingData': 'loading data…',
+  'common.filter': 'filter…',
+  'common.close': 'close',
+  'common.cancel': 'cancel',
+  'common.save': 'save',
+  'common.create': 'new',
+  'common.prev': 'prev',
+  'common.next': 'next',
+  'common.select': 'select…',
+  'common.search': 'search…',
+  'common.empty': 'none',
+  'common.language': 'Language',
+  'common.showPassword': 'Show password',
+  'common.hidePassword': 'Hide password',
+  'common.auth': 'AUTH',
+  'common.password': 'PASSWORD',
+  'validation.required': 'This field is required',
+  'validation.invalid': 'Invalid value',
+  'validation.number': 'Enter a number',
+  'validation.min': 'Must be at least {min}',
+  'validation.max': 'Must be at most {max}',
+  'nav.modules': 'MODULES',
+  'nav.session': 'SESSION',
+  'nav.browse': 'Browse',
+  'nav.sql': 'SQL',
+  'nav.jobs': 'Jobs',
+  'nav.server': 'Server',
+  'nav.connected': 'connected',
+  'error.apiUnreachable': 'API unreachable',
+  'error.apiOffline': 'API is not connected. Start uvicorn on :8000',
+  'connect.subtitle': 'Connect to SQL Server',
+  'connect.submit': 'Connect',
+  'connect.checking': 'connecting…',
+  'connect.failed': 'Connection failed',
+  'connect.server': 'SERVER',
+  'connect.port': 'PORT',
+  'connect.instance': 'INSTANCE',
+  'connect.authMode': 'AUTHENTICATION',
+  'connect.windows': 'Windows Authentication',
+  'connect.sql': 'SQL Server Authentication',
+  'connect.username': 'USERNAME',
+  'connect.database': 'DATABASE',
+  'connect.encrypt': 'TLS encryption',
+  'connect.remember': 'Remember password on this computer',
+  'connect.profiles': 'SAVED',
+  'connect.delete': 'delete',
+  'connect.windowsOnly': 'Windows Authentication is only available on Windows.',
+  'connect.driver': 'ODBC: {name}',
+  'connect.noDriver': 'No SQL Server ODBC driver. SQL Auth can still use pymssql.',
+  'connect.help': 'Local console for SQL Server 2012+. Browse, query, export, backup.',
+  'header.jobs': '{n} jobs',
+  'header.dbs': '{n} db',
+  'footer.ready': 'ready',
+  'browse.hint': 'object explorer · keyset paging',
+  'browse.search': 'find database / schema / table…',
+  'browse.system': 'system objects',
+  'browse.loadAll': 'load all',
+  'browse.empty': 'Select a database, then a table. One page loads — never the full 100M rows.',
+  'browse.noTables': 'No tables.',
+  'browse.tables': 'TABLES',
+  'browse.views': 'VIEWS',
+  'browse.procs': 'PROCEDURES',
+  'browse.exportTable': 'export table',
+  'browse.exportDb': 'export database',
+  'browse.backup': 'backup',
+  'browse.openSql': 'open in SQL',
+  'browse.script': 'SELECT script',
+  'browse.where': 'WHERE',
+  'browse.page': 'page',
+  'browse.rows': '{n} rows',
+  'browse.loadingPage': 'loading page…',
+  'browse.loadingCatalog': 'loading catalog…',
+  'sql.hint': 'F5 / Ctrl+Enter · Esc cancels · SELECT without TOP is capped at 1000',
+  'sql.run': 'run',
+  'sql.running': 'running…',
+  'sql.cancel': 'cancel',
+  'sql.new': 'new query',
+  'sql.empty': 'Run a query, or open a table from Browse.',
+  'sql.database': 'DATABASE',
+  'jobs.hint': 'exports and backups',
+  'jobs.empty': 'No export jobs yet.',
+  'jobs.pause': 'pause',
+  'jobs.resume': 'resume',
+  'jobs.cancel': 'cancel',
+  'jobs.skip': 'skip current',
+  'jobs.download': 'download',
+  'jobs.loading': 'loading jobs…',
+  'server.hint': 'version, edition, sessions',
+  'server.sessions': 'SESSIONS',
+  'server.loading': 'loading server…',
+  'export.title': 'EXPORT TABLE',
+  'export.dbTitle': 'EXPORT DATABASE',
+  'export.backupTitle': 'BACKUP',
+  'export.columns': 'COLUMNS',
+  'export.all': 'all',
+  'export.none': 'none',
+  'export.filename': 'FILE NAME',
+  'export.folder': 'FOLDER',
+  'export.browse': 'browse…',
+  'export.chunk': 'SPLIT',
+  'export.chunkSize': 'per file size',
+  'export.chunkRows': 'per row count',
+  'export.chunkNone': 'single file',
+  'export.batch': 'ROWS PER FETCH',
+  'export.gzip': 'gzip compress',
+  'export.nolock': 'NOLOCK / read uncommitted',
+  'export.workers': 'WORKERS',
+  'export.views': 'include views',
+  'export.start': 'start export',
+  'export.startDb': 'start database export',
+  'export.startBackup': 'start backup',
+  'export.compress': 'compress backup',
+  'folder.title': 'PICK FOLDER',
+  'folder.up': 'up',
+  'folder.use': 'use this folder',
+  'help.title': 'HOW TO USE',
+  'help.body':
+    'Browse opens one page at a time. Use WHERE + export for large tables. DELETE/UPDATE/DROP run as written — no undo. Multiple connections stay open until you disconnect.',
+  'detail.title': 'CELL',
+  'help.open': 'Help',
+}
+
+const id: Dict = {
+  ...en,
+  'boot.checking': 'memeriksa sesi…',
+  'common.adminConsole': 'konsol sql',
+  'common.reload': 'Muat ulang',
+  'common.themeLight': 'Mode terang',
+  'common.themeDark': 'Mode gelap',
+  'common.logout': 'Putuskan',
+  'common.loading': 'memuat…',
+  'common.loadingData': 'memuat data…',
+  'common.filter': 'filter…',
+  'common.close': 'tutup',
+  'common.cancel': 'batal',
+  'common.save': 'simpan',
+  'common.create': 'baru',
+  'common.prev': 'prev',
+  'common.next': 'next',
+  'common.select': 'pilih…',
+  'common.search': 'cari…',
+  'common.empty': 'tidak ada',
+  'common.language': 'Bahasa',
+  'common.showPassword': 'Tampilkan password',
+  'common.hidePassword': 'Sembunyikan password',
+  'error.apiUnreachable': 'API tidak terjangkau',
+  'error.apiOffline': 'API tidak terhubung. Jalankan uvicorn di :8000',
+  'connect.subtitle': 'Hubungkan ke SQL Server',
+  'connect.submit': 'Hubungkan',
+  'connect.checking': 'menghubungkan…',
+  'connect.failed': 'Koneksi gagal',
+  'connect.windows': 'Windows Authentication',
+  'connect.sql': 'SQL Server Authentication',
+  'connect.encrypt': 'Enkripsi TLS',
+  'connect.remember': 'Ingat password di komputer ini',
+  'connect.delete': 'hapus',
+  'connect.windowsOnly': 'Windows Authentication hanya aktif di Windows.',
+  'connect.noDriver': 'ODBC SQL Server belum terdeteksi. SQL Auth tetap bisa lewat pymssql.',
+  'connect.help': 'Konsol lokal untuk SQL Server 2012+. Jelajah, query, export, backup.',
+  'header.jobs': '{n} job',
+  'header.dbs': '{n} db',
+  'footer.ready': 'siap',
+  'browse.hint': 'object explorer · keyset paging',
+  'browse.search': 'cari database / schema / tabel…',
+  'browse.system': 'objek sistem',
+  'browse.loadAll': 'muat semua',
+  'browse.empty': 'Pilih database, lalu tabel. Satu halaman dimuat — bukan 100 juta baris sekaligus.',
+  'browse.noTables': 'Tidak ada tabel.',
+  'browse.exportTable': 'export tabel',
+  'browse.exportDb': 'export database',
+  'browse.backup': 'backup',
+  'browse.openSql': 'buka di SQL',
+  'browse.script': 'skrip SELECT',
+  'browse.loadingPage': 'memuat halaman…',
+  'browse.loadingCatalog': 'memuat katalog…',
+  'sql.hint': 'F5 / Ctrl+Enter · Esc batal · SELECT tanpa TOP dipotong 1000 baris',
+  'sql.run': 'jalankan',
+  'sql.running': 'berjalan…',
+  'sql.cancel': 'batal',
+  'sql.new': 'query baru',
+  'sql.empty': 'Jalankan query, atau buka tabel dari Browse.',
+  'jobs.hint': 'export dan backup',
+  'jobs.empty': 'Belum ada job export.',
+  'jobs.pause': 'jeda',
+  'jobs.resume': 'lanjut',
+  'jobs.cancel': 'batal',
+  'jobs.skip': 'lewati saat ini',
+  'jobs.download': 'unduh',
+  'jobs.loading': 'memuat job…',
+  'server.hint': 'versi, edisi, sesi',
+  'server.loading': 'memuat server…',
+  'export.all': 'semua',
+  'export.none': 'kosong',
+  'export.browse': 'pilih…',
+  'export.chunkSize': 'per ukuran file',
+  'export.chunkRows': 'per jumlah baris',
+  'export.chunkNone': 'satu file',
+  'export.start': 'mulai export',
+  'export.startDb': 'mulai export database',
+  'export.startBackup': 'mulai backup',
+  'export.compress': 'kompres backup',
+  'folder.up': 'naik',
+  'folder.use': 'pakai folder ini',
+  'help.title': 'CARA PAKAI',
+  'help.body':
+    'Browse membuka satu halaman per kali. Pakai WHERE + export untuk tabel besar. DELETE/UPDATE/DROP jalan apa adanya — tidak ada undo. Beberapa koneksi tetap terbuka sampai diputus.',
+  'help.open': 'Bantuan',
+}
+
+const de: Dict = {
+  ...en,
+  'boot.checking': 'Sitzung wird geprüft…',
+  'common.adminConsole': 'SQL-Konsole',
+  'common.reload': 'Neu laden',
+  'common.themeLight': 'Heller Modus',
+  'common.themeDark': 'Dunkler Modus',
+  'common.logout': 'Trennen',
+  'common.loading': 'lädt…',
+  'common.close': 'schließen',
+  'common.cancel': 'abbrechen',
+  'common.create': 'neu',
+  'common.prev': 'zurück',
+  'common.next': 'weiter',
+  'common.select': 'wählen…',
+  'common.search': 'suchen…',
+  'common.empty': 'keine',
+  'common.language': 'Sprache',
+  'connect.subtitle': 'Mit SQL Server verbinden',
+  'connect.submit': 'Verbinden',
+  'connect.checking': 'verbinden…',
+  'connect.failed': 'Verbindung fehlgeschlagen',
+  'browse.empty': 'Datenbank wählen, dann Tabelle. Eine Seite wird geladen — nie 100 Mio. Zeilen.',
+  'sql.run': 'ausführen',
+  'sql.running': 'läuft…',
+  'sql.cancel': 'abbrechen',
+  'jobs.pause': 'pause',
+  'jobs.resume': 'fortsetzen',
+  'help.open': 'Hilfe',
+}
+
+const ru: Dict = {
+  ...en,
+  'boot.checking': 'проверка сессии…',
+  'common.adminConsole': 'sql-консоль',
+  'common.reload': 'Обновить',
+  'common.themeLight': 'Светлая тема',
+  'common.themeDark': 'Тёмная тема',
+  'common.logout': 'Отключить',
+  'common.loading': 'загрузка…',
+  'common.close': 'закрыть',
+  'common.cancel': 'отмена',
+  'common.create': 'новый',
+  'common.prev': 'назад',
+  'common.next': 'далее',
+  'common.select': 'выбрать…',
+  'common.search': 'поиск…',
+  'common.empty': 'пусто',
+  'common.language': 'Язык',
+  'connect.subtitle': 'Подключение к SQL Server',
+  'connect.submit': 'Подключить',
+  'connect.checking': 'подключение…',
+  'connect.failed': 'Ошибка подключения',
+  'browse.empty': 'Выберите базу, затем таблицу. Загружается одна страница — не 100 млн строк.',
+  'sql.run': 'выполнить',
+  'sql.running': 'выполнение…',
+  'sql.cancel': 'отмена',
+  'jobs.pause': 'пауза',
+  'jobs.resume': 'продолжить',
+  'help.open': 'Справка',
+}
+
+const DICTS: Record<Locale, Dict> = { en, ru, de, id }
+
+function isLocale(value: string | null): value is Locale {
+  return Boolean(value && LOCALES.includes(value as Locale))
+}
+
+export function detectLocale(): Locale {
+  if (typeof localStorage !== 'undefined') {
+    const saved = localStorage.getItem(KEY)
+    if (isLocale(saved)) return saved
+  }
+  const nav = typeof navigator !== 'undefined' ? navigator.language.toLowerCase() : 'en'
+  if (nav.startsWith('ru')) return 'ru'
+  if (nav.startsWith('de')) return 'de'
+  if (nav.startsWith('id')) return 'id'
+  return 'en'
+}
+
+export function localeTag(locale: Locale) {
+  return BCP47[locale]
+}
+
+function applyYupLocale(t: (key: string, vars?: Record<string, string | number>) => string) {
+  yup.setLocale({
+    mixed: {
+      default: () => t('validation.invalid'),
+      required: () => t('validation.required'),
+      notType: () => t('validation.number'),
+      oneOf: () => t('validation.required'),
+    },
+    string: {
+      min: ({ min }) => t('validation.min', { min }),
+      max: ({ max }) => t('validation.max', { max }),
+    },
+    number: {
+      min: ({ min }) => t('validation.min', { min }),
+      max: ({ max }) => t('validation.max', { max }),
+    },
+  })
+}
+
+function format(template: string, vars?: Record<string, string | number>) {
+  if (!vars) return template
+  return Object.entries(vars).reduce(
+    (acc, [key, value]) => acc.replaceAll(`{${key}}`, String(value)),
+    template,
+  )
+}
+
+type Ctx = {
+  locale: Locale
+  setLocale: (locale: Locale) => void
+  t: (key: string, vars?: Record<string, string | number>) => string
+}
+
+const LocaleContext = createContext<Ctx | null>(null)
+
+export function LocaleProvider({ children }: { children: ReactNode }) {
+  const [locale, setLocaleState] = useState<Locale>(() => detectLocale())
+
+  useEffect(() => {
+    localStorage.setItem(KEY, locale)
+    document.documentElement.lang = locale
+  }, [locale])
+
+  const value = useMemo<Ctx>(() => {
+    const t: Ctx['t'] = (key, vars) => format(DICTS[locale][key] ?? DICTS.en[key] ?? key, vars)
+    applyYupLocale(t)
+    return { locale, setLocale: setLocaleState, t }
+  }, [locale])
+
+  return <LocaleContext.Provider value={value}>{children}</LocaleContext.Provider>
+}
+
+export function useLocale() {
+  const ctx = useContext(LocaleContext)
+  if (!ctx) throw new Error('useLocale requires LocaleProvider')
+  return ctx
+}

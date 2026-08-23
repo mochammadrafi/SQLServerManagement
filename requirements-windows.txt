@@ -1,3 +1,0 @@
--r requirements.txt
-pyodbc==4.0.39
-pymssql==2.2.11

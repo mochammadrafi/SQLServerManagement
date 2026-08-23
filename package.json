@@ -1,0 +1,21 @@
+{
+  "name": "sqlsm",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Local SQL Server management console",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c green,cyan \"npm run dev -w server\" \"npm run dev -w web\"",
+    "build": "npm run build -w web && npm run build -w server",
+    "start": "npm run start -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=18.0.0 <19"
+  }
+}

@@ -1,0 +1,167 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* SIGINT dark — phosphor on navy-black */
+html.dark {
+  color-scheme: dark;
+  --background: 5 7 11;
+  --foreground: 212 245 228;
+  --card: 10 16 24;
+  --card-foreground: 212 245 228;
+  --popover: 10 16 24;
+  --popover-foreground: 212 245 228;
+  --primary: 61 255 154;
+  --primary-foreground: 3 20 12;
+  --secondary: 16 28 40;
+  --secondary-foreground: 158 224 200;
+  --muted: 12 20 28;
+  --muted-foreground: 109 138 124;
+  --accent: 18 36 28;
+  --accent-foreground: 125 255 196;
+  --destructive: 255 77 106;
+  --border: 26 51 64;
+  --input: 26 51 64;
+  --ring: 61 255 154;
+  --warn: 245 197 66;
+  --cred: 255 107 122;
+  --intel: 92 225 230;
+  --grid: rgba(61, 255, 154, 0.045);
+  --scan: rgba(0, 6, 10, 0.22);
+  --glow: rgba(61, 255, 154, 0.4);
+}
+
+/* Briefing light — paper / ink / forest */
+html.light,
+:root {
+  color-scheme: light;
+  --background: 239 233 216;
+  --foreground: 21 36 28;
+  --card: 247 242 228;
+  --card-foreground: 21 36 28;
+  --popover: 247 242 228;
+  --popover-foreground: 21 36 28;
+  --primary: 13 107 69;
+  --primary-foreground: 244 240 226;
+  --secondary: 228 221 208;
+  --secondary-foreground: 28 51 40;
+  --muted: 232 225 208;
+  --muted-foreground: 90 110 98;
+  --accent: 220 232 223;
+  --accent-foreground: 13 107 69;
+  --destructive: 180 35 24;
+  --border: 201 192 168;
+  --input: 201 192 168;
+  --ring: 13 107 69;
+  --warn: 154 103 0;
+  --cred: 180 35 24;
+  --intel: 14 116 144;
+  --grid: rgba(13, 107, 69, 0.07);
+  --scan: transparent;
+  --glow: rgba(13, 107, 69, 0.25);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: rgb(var(--background));
+  color: rgb(var(--foreground));
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  overflow: hidden;
+}
+
+body::before {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 24px 24px;
+  z-index: 0;
+}
+
+html.dark body::after {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent 2px,
+    var(--scan) 3px
+  );
+  z-index: 50;
+  mix-blend-mode: multiply;
+}
+
+html.light body::after {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at 0 0, rgba(13, 107, 69, 0.06), transparent 40%),
+    radial-gradient(ellipse at 100% 0, rgba(180, 35, 24, 0.04), transparent 35%);
+  z-index: 0;
+}
+
+#root {
+  position: relative;
+  z-index: 1;
+}
+
+.title-glitch {
+  font-family: "Share Tech Mono", "JetBrains Mono", ui-monospace, monospace;
+  letter-spacing: 0.2em;
+  text-shadow:
+    0 0 10px var(--glow),
+    1px 0 0 rgba(92, 225, 230, 0.5),
+    -1px 0 0 rgba(255, 107, 122, 0.35);
+}
+
+html.light .title-glitch {
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.6);
+  letter-spacing: 0.16em;
+}
+
+.corner-frame {
+  position: relative;
+}
+
+.corner-frame::before,
+.corner-frame::after {
+  content: "";
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-color: rgb(var(--primary));
+  pointer-events: none;
+}
+
+.corner-frame::before {
+  top: 4px;
+  left: 4px;
+  border-top: 1px solid;
+  border-left: 1px solid;
+}
+
+.corner-frame::after {
+  top: 4px;
+  right: 4px;
+  border-top: 1px solid;
+  border-right: 1px solid;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+}

@@ -2,11 +2,25 @@
 set -e
 cd "$(dirname "$0")"
 
-if [ ! -x .venv/bin/python ]; then
-  python3 -m venv .venv
-  .venv/bin/pip install -U pip
-  .venv/bin/pip install -r requirements.txt
-  .venv/bin/pip install pymssql || echo "pymssql belum terpasang. UI tetap jalan; koneksi SQL butuh driver."
+if ! command -v node >/dev/null 2>&1; then
+  echo "Node.js 18 is required (Windows Server 2012 R2)."
+  echo "https://nodejs.org/dist/v18.20.8/node-v18.20.8-x64.msi"
+  exit 1
 fi
 
-.venv/bin/python run.py
+MAJOR=$(node -p "process.versions.node.split('.')[0]")
+if [ "$MAJOR" != "18" ]; then
+  echo "This app targets Node.js 18. Found $(node -v)."
+  echo "Install Node 18 x64: https://nodejs.org/dist/v18.20.8/"
+  exit 1
+fi
+
+if [ ! -d node_modules ]; then
+  npm install
+fi
+
+if [ ! -d web/dist ]; then
+  npm run build -w web
+fi
+
+npm start
