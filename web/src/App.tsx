@@ -12,7 +12,6 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { LocaleSelect } from '@/components/locale-select'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
 import { Separator } from '@/components/ui/separator'
@@ -34,6 +33,7 @@ export default function App() {
   const { t } = useLocale()
   const [ready, setReady] = useState(false)
   const [session, setSession] = useState<Session | null>(null)
+  const [adding, setAdding] = useState(false)
 
   const boot = useCallback(async () => {
     try {
@@ -61,14 +61,16 @@ export default function App() {
     )
   }
 
-  if (!session?.connected) {
+  if (!session?.connected || adding) {
     return (
       <TooltipProvider>
         <ConnectView
           onAuthed={() => {
+            setAdding(false)
             setReady(false)
             void boot()
           }}
+          onCancel={session?.connected ? () => setAdding(false) : undefined}
         />
       </TooltipProvider>
     )
@@ -79,9 +81,10 @@ export default function App() {
       <Console
         session={session}
         onReload={() => void boot()}
+        onAdd={() => setAdding(true)}
         onLogout={() => {
-          void api.disconnect(undefined, false).then(() => {
-            setSession(null)
+          void api.disconnect(session.connection_id, false).then((next) => {
+            setSession(next.connected ? { ...next, connected: true } : null)
           })
         }}
         onSession={setSession}
@@ -93,11 +96,13 @@ export default function App() {
 function Console({
   session,
   onReload,
+  onAdd,
   onLogout,
   onSession,
 }: {
   session: Session
   onReload: () => void
+  onAdd: () => void
   onLogout: () => void
   onSession: (session: Session | null) => void
 }) {
@@ -111,6 +116,7 @@ function Console({
   const [loading, setLoading] = useState(false)
   const connections = session.connections || []
   const active = session.connection
+  const connKey = session.connection_id || 'none'
 
   return (
     <div className="corner-frame flex h-full flex-col bg-background/85 text-foreground">
@@ -121,25 +127,23 @@ function Console({
           {t('common.adminConsole')}
         </span>
         <div className="ml-auto flex min-w-0 items-center gap-1.5 sm:gap-2">
-          {connections.length > 1 ? (
-            <select
-              className="hidden max-w-48 truncate border border-border bg-background/70 px-2 py-1 font-mono text-[11px] sm:block"
-              value={session.connection_id}
-              onChange={(e) => {
-                void api.switchConnection(e.target.value).then((next) => onSession({ ...session, ...next, connected: true }))
-              }}
-            >
-              {connections.map((c: Connection) => (
-                <option key={c.id} value={c.id}>
-                  {c.label}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <Badge variant="live" className="hidden max-w-52 truncate lg:inline-flex">
-              {active?.label}
-            </Badge>
-          )}
+          <select
+            className="hidden max-w-48 truncate border border-border bg-background/70 px-2 py-1 font-mono text-[11px] sm:block"
+            value={session.connection_id}
+            onChange={(e) => {
+              setSqlSeed(null)
+              void api.switchConnection(e.target.value).then((next) => onSession({ ...session, ...next, connected: true }))
+            }}
+          >
+            {connections.map((c: Connection) => (
+              <option key={c.id} value={c.id}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+          <Button variant="outline" size="sm" onClick={onAdd}>
+            {t('connect.new')}
+          </Button>
           <LocaleSelect className="hidden w-36 sm:block" />
           <Tooltip>
             <TooltipTrigger asChild>
@@ -207,6 +211,7 @@ function Console({
 
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'browse' ? 'flex' : 'hidden')}>
           <BrowseView
+            key={connKey}
             onOpenSql={(sql, database) => {
               setSqlSeed({ sql, db: database })
               setView('sql')
@@ -215,10 +220,11 @@ function Console({
           />
         </div>
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'sql' ? 'flex' : 'hidden')}>
-          <SqlView initialSql={sqlSeed?.sql} initialDb={sqlSeed?.db} />
+          <SqlView key={connKey} initialSql={sqlSeed?.sql} initialDb={sqlSeed?.db} />
         </div>
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'ai' ? 'flex' : 'hidden')}>
           <AiView
+            key={connKey}
             onOpenSql={(sql, database) => {
               setSqlSeed({ sql, db: database })
               setView('sql')
@@ -226,10 +232,10 @@ function Console({
           />
         </div>
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'jobs' ? 'flex' : 'hidden')}>
-          <JobsView tick={jobTick} />
+          <JobsView key={connKey} tick={jobTick} />
         </div>
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'server' ? 'flex' : 'hidden')}>
-          <ServerView tick={jobTick} />
+          <ServerView key={connKey} tick={jobTick} />
         </div>
       </div>
 

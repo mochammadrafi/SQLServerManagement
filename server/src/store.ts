@@ -101,14 +101,16 @@ export async function disconnect(request: FastifyRequest, target = "", closeAll 
   const store = STORE.get(sid);
   if (!store) return { connected: false, connections: [] };
   const remaining = { ...store.connections };
+  const id = closeAll ? "" : target || store.active || "";
   if (closeAll) {
     await Promise.all(Object.values(remaining).map((item) => item.client?.close()));
     store.connections = {};
     store.active = null;
-  } else if (target && remaining[target]) {
-    await remaining[target].client?.close();
-    delete remaining[target];
+  } else if (id && remaining[id]) {
+    await remaining[id].client?.close();
+    delete remaining[id];
     store.connections = remaining;
+    if (store.active === id) store.active = Object.values(remaining)[0]?.id || null;
   }
   const left = Object.values(store.connections);
   if (left.length) {

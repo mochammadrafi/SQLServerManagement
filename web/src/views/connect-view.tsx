@@ -14,7 +14,13 @@ import { useLocale } from '@/lib/i18n'
 import { useTheme } from '@/lib/theme'
 import { useRevalidateOnLocale } from '@/lib/yup-locale'
 
-export function ConnectView({ onAuthed }: { onAuthed: () => void }) {
+export function ConnectView({
+  onAuthed,
+  onCancel,
+}: {
+  onAuthed: () => void
+  onCancel?: () => void
+}) {
   const { t } = useLocale()
   const { theme, toggle } = useTheme()
   const [meta, setMeta] = useState<Meta | null>(null)
@@ -67,7 +73,6 @@ export function ConnectView({ onAuthed }: { onAuthed: () => void }) {
         setCsrf(data.csrf_token)
         setMeta(data)
         if (!data.windows) setValue('auth', 'sql')
-        if (data.profiles[0]) fill(data.profiles[0])
       })
       .catch((err) => setError(err instanceof Error ? err.message : t('error.apiUnreachable')))
   }, [setValue, t])
@@ -85,16 +90,18 @@ export function ConnectView({ onAuthed }: { onAuthed: () => void }) {
     setValue('remember_password', profile.remember_password)
   }
 
-  const submit = handleSubmit(async (values) => {
+  const connectNow = async (values: Record<string, unknown>, id?: string) => {
     setError(null)
     try {
-      const result = await api.connect({ ...values, profile_id: profileId })
+      const result = await api.connect({ ...values, profile_id: id || '' })
       if (result.csrf_token) setCsrf(result.csrf_token)
       onAuthed()
     } catch (err) {
       setError(err instanceof Error ? err.message : t('connect.failed'))
     }
-  })
+  }
+
+  const submit = handleSubmit((values) => connectNow(values, profileId))
 
   return (
     <div className="corner-frame flex h-full flex-col bg-background/85 text-foreground">
@@ -105,6 +112,11 @@ export function ConnectView({ onAuthed }: { onAuthed: () => void }) {
           {t('common.adminConsole')}
         </span>
         <div className="ml-auto flex items-center gap-2">
+          {onCancel ? (
+            <Button variant="outline" size="sm" type="button" onClick={onCancel}>
+              {t('common.cancel')}
+            </Button>
+          ) : null}
           <LocaleSelect className="w-36" />
           <Button variant="outline" size="icon" onClick={toggle} aria-label={t('common.themeDark')}>
             {theme === 'dark' ? <Sun /> : <Moon />}
@@ -131,7 +143,9 @@ export function ConnectView({ onAuthed }: { onAuthed: () => void }) {
                     className="min-w-0 flex-1 truncate border border-border px-2 py-1 text-left font-mono text-[11px] hover:bg-accent/40"
                     onClick={() => {
                       fill(profile)
-                      if (profile.auth === 'windows' || profile.has_password) void submit()
+                      if (profile.auth === 'windows' || profile.has_password) {
+                        void handleSubmit((values) => connectNow(values, profile.id))()
+                      }
                     }}
                   >
                     {profile.label}
