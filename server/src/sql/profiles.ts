@@ -12,7 +12,13 @@ function encryptSecret(text: string): string {
   const data = Buffer.from(text, "utf8");
   const out = Buffer.alloc(data.length);
   for (let i = 0; i < data.length; i += 1) out[i] = data[i] ^ key[i % key.length];
-  return PREFIX + out.toString("base64url");
+  return PREFIX + out.toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+function decodeUrlSafe(text: string): Buffer {
+  const padded = text.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - (padded.length % 4));
+  return Buffer.from(padded + pad, "base64");
 }
 
 export function decryptSecret(blob: string): string {
@@ -20,7 +26,7 @@ export function decryptSecret(blob: string): string {
   const text = String(blob);
   if (!text.startsWith(PREFIX)) return text;
   const key = secretKey();
-  const data = Buffer.from(text.slice(PREFIX.length), "base64url");
+  const data = decodeUrlSafe(text.slice(PREFIX.length));
   const out = Buffer.alloc(data.length);
   for (let i = 0; i < data.length; i += 1) out[i] = data[i] ^ key[i % key.length];
   return out.toString("utf8");

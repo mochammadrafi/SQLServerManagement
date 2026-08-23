@@ -10,6 +10,7 @@ import { settings } from "./config.js";
 import { ClientError } from "./errors.js";
 import { fail, ok } from "./responses.js";
 import { registerRoutes } from "./routes.js";
+import { loadMsnodesqlv8, pickOdbcDrivers } from "./sql/odbc.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const webDist = join(root, "web", "dist");
@@ -72,6 +73,9 @@ async function main() {
   console.log("SQL Server Management");
   console.log(`API: ${url}`);
   console.log(`UI (dev): http://127.0.0.1:5173`);
+  const odbc = process.platform === "win32" ? pickOdbcDrivers()[0] : "";
+  if (odbc && loadMsnodesqlv8()) console.log(`SQL: ODBC ${odbc}`);
+  else console.log("SQL: tedious (install msnodesqlv8 on Windows to match the old Python/ODBC login)");
   console.log("Press Ctrl+C to stop.");
   console.log("");
 }

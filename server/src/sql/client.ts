@@ -10,6 +10,7 @@ import {
   splitBatches,
   validateWhere,
 } from "./ident.js";
+import { loadMsnodesqlv8, odbcConnectionString, pickOdbcDrivers } from "./odbc.js";
 
 export type ConnectionConfig = {
   server: string;
@@ -46,32 +47,19 @@ export function publicConfig(cfg: ConnectionConfig) {
   };
 }
 
-function configToPool(cfg: ConnectionConfig): sql.config {
+function isLoginError(exc: unknown): boolean {
+  const text = String(exc instanceof Error ? exc.message : exc || "").toLowerCase();
+  return text.includes("login failed") || text.includes("cannot open database") || text.includes("18456") || text.includes("4060");
+}
+
+function tediousConfig(cfg: ConnectionConfig): sql.config {
   const host = (cfg.server || "").trim();
   const instance = (cfg.instance || "").trim();
   if (cfg.auth === "windows") {
-    if (process.platform !== "win32") {
-      throw new ClientError(
-        "Windows Authentication is only available on Windows.",
-        "From macOS/Linux use a SQL login.",
-      );
-    }
-    return {
-      server: host,
-      port: instance ? undefined : Number(cfg.port || 1433),
-      database: cfg.database || "master",
-      options: {
-        encrypt: Boolean(cfg.encrypt),
-        trustServerCertificate: true,
-        enableArithAbort: true,
-        appName: "SQLSM",
-        instanceName: instance || undefined,
-        trustedConnection: true,
-      },
-      connectionTimeout: 15000,
-      requestTimeout: 300000,
-      driver: "msnodesqlv8",
-    } as sql.config;
+    throw new ClientError(
+      "Windows Authentication needs the ODBC driver (msnodesqlv8).",
+      "On Windows Server 2012 R2 run npm install in this folder so msnodesqlv8 can load.",
+    );
   }
   if (!(cfg.username || "").trim()) {
     throw new ClientError("SQL username is required.");
@@ -81,17 +69,64 @@ function configToPool(cfg: ConnectionConfig): sql.config {
     port: instance ? undefined : Number(cfg.port || 1433),
     user: cfg.username.trim(),
     password: cfg.password || "",
-    database: cfg.database || "master",
+    database: cfg.database || undefined,
     options: {
       encrypt: Boolean(cfg.encrypt),
       trustServerCertificate: true,
       enableArithAbort: true,
       appName: "SQLSM",
       instanceName: instance || undefined,
+      tdsVersion: "7_4",
+      fallbackToDefaultDb: true,
+      cryptoCredentialsDetails: cfg.encrypt ? { minVersion: "TLSv1" } : {},
     },
     connectionTimeout: 15000,
     requestTimeout: 300000,
-  };
+  } as sql.config;
+}
+
+async function openPool(cfg: ConnectionConfig): Promise<{
+  pool: sql.ConnectionPool;
+  backend: string;
+  driverName: string;
+  sql: typeof sql;
+}> {
+  if (cfg.auth === "windows" && process.platform !== "win32") {
+    throw new ClientError(
+      "Windows Authentication is only available on Windows.",
+      "From macOS/Linux use a SQL login.",
+    );
+  }
+  if (cfg.auth === "sql" && !(cfg.username || "").trim()) {
+    throw new ClientError("SQL username is required.");
+  }
+
+  if (process.platform === "win32") {
+    const sqlv8 = loadMsnodesqlv8();
+    const drivers = pickOdbcDrivers();
+    if (sqlv8 && drivers.length) {
+      let lastErr: unknown;
+      for (const driver of drivers) {
+        try {
+          const pool = new sqlv8.ConnectionPool({
+            connectionString: odbcConnectionString(cfg, driver, serverAddress(cfg)),
+            connectionTimeout: 15000,
+            requestTimeout: 300000,
+          } as unknown as sql.config);
+          await pool.connect();
+          return { pool, backend: "msnodesqlv8", driverName: driver, sql: sqlv8 };
+        } catch (err) {
+          lastErr = err;
+          if (isLoginError(err)) break;
+        }
+      }
+      if (lastErr && (cfg.auth === "windows" || isLoginError(lastErr))) throw lastErr;
+    }
+  }
+
+  const pool = new sql.ConnectionPool(tediousConfig(cfg));
+  await pool.connect();
+  return { pool, backend: "mssql/tedious", driverName: "tedious", sql };
 }
 
 function asInt(value: unknown): number | null {
@@ -131,9 +166,10 @@ export class SqlServerClient {
   async connect(): Promise<void> {
     if (this.pool?.connected) return;
     try {
-      this.pool = await new sql.ConnectionPool(configToPool(this.cfg)).connect();
-      this.backend = this.cfg.auth === "windows" ? "msnodesqlv8" : "mssql/tedious";
-      this.driverName = this.backend;
+      const opened = await openPool(this.cfg);
+      this.pool = opened.pool;
+      this.backend = opened.backend;
+      this.driverName = opened.driverName;
     } catch (exc) {
       const { message, hint } = explainError(exc);
       throw new ClientError(message, hint, isTransient(exc));
@@ -161,7 +197,7 @@ export class SqlServerClient {
     let killed = 0;
     if (this.spid) {
       try {
-        const extra = await new sql.ConnectionPool(configToPool(this.cfg)).connect();
+        const extra = (await openPool(this.cfg)).pool;
         try {
           await extra.request().query(`KILL ${this.spid}`);
           killed = 1;

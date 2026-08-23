@@ -51,8 +51,10 @@ export function explainError(exc: unknown): { message: string; hint?: string } {
   const message = String(exc instanceof Error ? exc.message : exc || "SQL error");
   const lower = message.toLowerCase();
   let hint: string | undefined;
-  if (lower.includes("login failed")) {
-    hint = "Check username/password, or use Windows Authentication. Mixed Mode is required for SQL logins.";
+  if (lower.includes("cannot open database") || lower.includes("4060") || lower.includes("default database")) {
+    hint = "This login cannot open that database. Set DATABASE to the login default (not master unless the login can use it).";
+  } else if (lower.includes("login failed")) {
+    hint = "Wrong password, or the login cannot open the selected database. Re-type the password even if a saved profile is selected.";
   } else if (lower.includes("connection refused") || lower.includes("econnrefused")) {
     hint = "SQL Server is not accepting connections. Enable TCP/IP and open port 1433.";
   } else if (lower.includes("timeout") || lower.includes("etimeout")) {

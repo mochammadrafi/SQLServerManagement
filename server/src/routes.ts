@@ -15,6 +15,7 @@ import {
   verifyCsrf,
 } from "./store.js";
 import { type ConnectionConfig, connectClient } from "./sql/client.js";
+import { listOdbcDrivers, loadMsnodesqlv8, pickOdbcDrivers } from "./sql/odbc.js";
 import {
   cancelJob,
   exportLimits,
@@ -53,8 +54,11 @@ export async function registerRoutes(app: FastifyInstance) {
     ok("Ready", {
       platform: process.platform,
       windows: process.platform === "win32",
-      odbc_drivers: [],
-      preferred_driver: process.platform === "win32" ? "msnodesqlv8 / tedious" : "tedious",
+      odbc_drivers: listOdbcDrivers(),
+      preferred_driver:
+        process.platform === "win32"
+          ? pickOdbcDrivers()[0] || (loadMsnodesqlv8() ? "msnodesqlv8" : "tedious")
+          : "tedious",
       default_folder: existingStartDir(""),
       profiles: listProfiles(),
       csrf_token: csrfToken(request),

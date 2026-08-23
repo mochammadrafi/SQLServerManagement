@@ -5,14 +5,21 @@ import { join } from "node:path";
 
 export const STORE_DIR = join(homedir(), ".sqlsm");
 
-function loadSecret(): string {
-  const env = process.env.SQLSM_SECRET;
-  if (env) return env;
+function stripBytes(buf: Buffer): Buffer {
+  let start = 0;
+  let end = buf.length;
+  const ws = (b: number) => b === 0x09 || b === 0x0a || b === 0x0b || b === 0x0c || b === 0x0d || b === 0x20;
+  while (start < end && ws(buf[start])) start += 1;
+  while (end > start && ws(buf[end - 1])) end -= 1;
+  return buf.subarray(start, end);
+}
+
+function loadSecretFile(): Buffer {
   const path = join(STORE_DIR, "secret");
   try {
     if (existsSync(path)) {
-      const raw = readFileSync(path);
-      if (raw.length) return raw.toString("utf8");
+      const raw = stripBytes(readFileSync(path));
+      if (raw.length) return raw;
     }
     mkdirSync(STORE_DIR, { recursive: true });
     const raw = randomBytes(32);
@@ -22,17 +29,19 @@ function loadSecret(): string {
     } catch {
       /* ignore */
     }
-    return raw.toString("hex");
+    return raw;
   } catch {
-    return randomBytes(24).toString("hex");
+    return randomBytes(24);
   }
 }
+
+const secretFile = loadSecretFile();
 
 export const settings = {
   appName: "SQL Server Management",
   host: process.env.SQLSM_HOST || "127.0.0.1",
   port: Number(process.env.SQLSM_PORT || 8000),
-  secret: loadSecret(),
+  secret: process.env.SQLSM_SECRET || secretFile.toString("hex"),
   idleSec: Number(process.env.SQLSM_IDLE_SEC || 7200),
   allowRemote: process.env.SQLSM_ALLOW_REMOTE === "1",
   exportDir:
@@ -44,5 +53,5 @@ export const settings = {
 };
 
 export function secretKey(): Buffer {
-  return createHash("sha256").update(settings.secret).digest();
+  return createHash("sha256").update(secretFile).digest();
 }
