@@ -38,6 +38,15 @@ export type JobPublic = {
   where?: string;
 };
 
+type ExportTableState = {
+  schema: string;
+  name: string;
+  status?: string;
+  rows_written?: number;
+  last_key?: Record<string, unknown> | null;
+  keys?: string[];
+};
+
 type Job = {
   id: string;
   sid: string;
@@ -61,7 +70,7 @@ type Job = {
   bytesWritten: number;
   rowCountEstimate: number | null;
   parts: { name: string; rows: number; bytes: number; path: string }[];
-  tables: { schema: string; name: string; status?: string; rows_written?: number }[];
+  tables: ExportTableState[];
   tablesDone: number;
   error: string | null;
   hint: string | null;
@@ -98,7 +107,7 @@ type JobSnapshot = {
   bytesWritten: number;
   rowCountEstimate: number | null;
   parts: { name: string; rows: number; bytes: number; path: string }[];
-  tables: { schema: string; name: string; status?: string; rows_written?: number }[];
+  tables: ExportTableState[];
   tablesDone: number;
   error: string | null;
   hint: string | null;
@@ -113,6 +122,69 @@ type JobSnapshot = {
 const JOBS = new Map<string, Job>();
 const PERSISTED = new Map<string, JobSnapshot>();
 const JOB_STORE_DIR = join(STORE_DIR, "export-jobs");
+const CHECKPOINT_ROWS = 500;
+
+function createJobLock() {
+  let tail = Promise.resolve();
+  return {
+    run<T>(fn: () => T | Promise<T>): Promise<T> {
+      const run = tail.then(() => fn());
+      tail = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    },
+  };
+}
+
+type JobLock = ReturnType<typeof createJobLock>;
+
+function nextPartIndex(job: Job, prefix: string) {
+  const base = safeName(prefix);
+  let max = 0;
+  for (const part of job.parts) {
+    if (!part.name.startsWith(`${base}_part-`)) continue;
+    const tail = part.name.slice(`${base}_part-`.length);
+    const num = Number.parseInt(tail.split(".")[0] || "", 10);
+    if (Number.isFinite(num)) max = Math.max(max, num);
+  }
+  return max + 1;
+}
+
+function migrateLegacyTableKeys(job: Job) {
+  if (job.kind !== "export_db" || !job.lastKey) return;
+  const open = job.tables.filter(
+    (table) =>
+      table.status !== "done" &&
+      table.status !== "cancelled" &&
+      !job.skip.has(`${table.schema}\0${table.name}`),
+  );
+  if (open.some((table) => table.last_key)) return;
+  const running = open.filter((table) => table.status === "running");
+  const target = running.length === 1 ? running[0] : open.length === 1 ? open[0] : null;
+  if (!target) return;
+  target.last_key = job.lastKey;
+  if (job.keys.length) target.keys = [...job.keys];
+}
+
+function pickNextTable(job: Job): ExportTableState | null {
+  for (const table of job.tables) {
+    if (job.skip.has(`${table.schema}\0${table.name}`)) continue;
+    if (table.status === "done" || table.status === "cancelled" || table.status === "running") continue;
+    return table;
+  }
+  return null;
+}
+
+function refreshCurrentObject(job: Job) {
+  const labels = job.tables.filter((table) => table.status === "running").map((table) => `${table.schema}.${table.name}`);
+  if (!labels.length) {
+    job.current = undefined;
+    return;
+  }
+  job.current = labels.length <= 3 ? labels.join(", ") : `${labels.slice(0, 3).join(", ")} +${labels.length - 3}`;
+}
 
 function now() {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
@@ -218,7 +290,7 @@ function snapshotFromJob(job: Job): JobSnapshot {
 }
 
 function hydrateJob(snap: JobSnapshot, cfg: ConnectionConfig): Job {
-  return {
+  const job: Job = {
     id: snap.id,
     sid: snap.sid,
     cfg,
@@ -254,6 +326,8 @@ function hydrateJob(snap: JobSnapshot, cfg: ConnectionConfig): Job {
     skip: new Set(snap.skip || []),
     backupFiles: snap.backupFiles ? [...snap.backupFiles] : undefined,
   };
+  migrateLegacyTableKeys(job);
+  return job;
 }
 
 function persistJob(job: Job) {
@@ -400,10 +474,24 @@ async function writeCsvPart(
   table: string,
   columns: string[],
   prefix: string,
+  opts: {
+    lock?: JobLock;
+    tableEntry?: ExportTableState;
+    orderKeys: string[];
+    startKey?: Record<string, unknown> | null;
+  },
 ) {
-  let partIndex = job.parts.length + 1;
+  const lock = opts.lock;
+  const tableEntry = opts.tableEntry;
+  const orderKeys = opts.orderKeys;
+  let lastKey = opts.startKey ?? null;
+  let partIndex = lock
+    ? await lock.run(() => nextPartIndex(job, prefix))
+    : nextPartIndex(job, prefix);
   let rowsInPart = 0;
   let bytesInPart = 0;
+  let rowsSinceCheckpoint = 0;
+  let tableRows = 0;
   const ext = job.gzip ? ".csv.gz" : ".csv";
   const openPart = () => {
     const name = `${safeName(prefix)}_part-${String(partIndex).padStart(5, "0")}${ext}`;
@@ -419,18 +507,45 @@ async function writeCsvPart(
     return { name, path, file, gzip, target };
   };
   let current = openPart();
-  const rotate = () => {
+  const pushPart = async () => {
+    const part = { name: current.name, rows: rowsInPart, bytes: bytesInPart, path: current.path };
+    if (lock) {
+      await lock.run(() => {
+        job.parts.push(part);
+      });
+    } else {
+      job.parts.push(part);
+    }
+  };
+  const rotate = async () => {
     current.target.end();
-    job.parts.push({ name: current.name, rows: rowsInPart, bytes: bytesInPart, path: current.path });
+    await pushPart();
     partIndex += 1;
     current = openPart();
   };
+  const checkpoint = async (force = false) => {
+    if (!force && rowsSinceCheckpoint < CHECKPOINT_ROWS) return;
+    rowsSinceCheckpoint = 0;
+    const snapshotKey = lastKey;
+    const flush = () => {
+      if (tableEntry) {
+        tableEntry.last_key = snapshotKey;
+        tableEntry.keys = [...orderKeys];
+        tableEntry.rows_written = tableRows;
+      }
+      job.lastKey = snapshotKey;
+      job.keys = [...orderKeys];
+      saveMeta(job);
+    };
+    if (lock) await lock.run(flush);
+    else flush();
+  };
   for await (const batch of client.iterTableRows(job.database, schema, table, columns, {
     where: job.where,
-    orderKeys: job.keys,
+    orderKeys,
     nolock: job.nolock,
     batchSize: job.batchSize,
-    after: job.lastKey,
+    after: lastKey,
     shouldStop: () => job.cancel || job.skip.has(`${schema}\0${table}`),
   })) {
     await waitIfPaused(job);
@@ -445,91 +560,188 @@ async function writeCsvPart(
         (job.chunkRows && rowsInPart >= job.chunkRows) ||
         (job.chunkBytes && bytesInPart + size >= job.chunkBytes)
       ) {
-        rotate();
+        await rotate();
       }
       current.target.write(line);
       rowsInPart += 1;
       bytesInPart += size;
-      job.rowsWritten += 1;
-      job.bytesWritten += size;
-      if (job.keys.length) {
-        job.lastKey = Object.fromEntries(job.keys.map((key, index) => [key, row[columns.indexOf(key)] ?? row[index]]));
+      tableRows += 1;
+      rowsSinceCheckpoint += 1;
+      const applyCounts = () => {
+        job.rowsWritten += 1;
+        job.bytesWritten += size;
+      };
+      if (lock) await lock.run(applyCounts);
+      else applyCounts();
+      if (orderKeys.length) {
+        lastKey = Object.fromEntries(orderKeys.map((key, index) => [key, row[columns.indexOf(key)] ?? row[index]]));
       }
+      await checkpoint();
     }
-    saveMeta(job);
+    await checkpoint(true);
   }
   current.target.end();
   if (rowsInPart || !job.parts.length) {
-    job.parts.push({ name: current.name, rows: rowsInPart, bytes: bytesInPart, path: current.path });
+    await pushPart();
   }
+  if (tableEntry) {
+    const done = () => {
+      tableEntry.rows_written = tableRows;
+      tableEntry.last_key = null;
+    };
+    if (lock) await lock.run(done);
+    else done();
+  }
+}
+
+async function exportDatabaseTable(
+  job: Job,
+  client: SqlServerClient,
+  table: ExportTableState,
+  lock: JobLock,
+) {
+  refreshCurrentObject(job);
+  await lock.run(() => saveMeta(job));
+
+  const cols = await client.listColumns(job.database, table.schema, table.name);
+  const names = cols.map((col) => String(col.name || "")).filter(Boolean);
+  let orderKeys = table.keys?.length ? [...table.keys] : [];
+  if (!orderKeys.length) {
+    const stats = await client.tableStats(job.database, table.schema, table.name);
+    orderKeys = stats.keys;
+    table.keys = [...orderKeys];
+  }
+
+  const startKey = table.last_key ?? null;
+
+  const prefix = job.filePrefix
+    ? `${job.filePrefix}_${table.schema}.${table.name}`
+    : `${table.schema}.${table.name}`;
+
+  await writeCsvPart(job, client, table.schema, table.name, names, prefix, {
+    lock,
+    tableEntry: table,
+    orderKeys,
+    startKey,
+  });
+
+  await lock.run(() => {
+    if (job.cancel || job.skip.has(`${table.schema}\0${table.name}`)) {
+      table.status = "cancelled";
+    } else {
+      table.status = "done";
+      table.last_key = null;
+      job.tablesDone += 1;
+    }
+    refreshCurrentObject(job);
+    saveMeta(job);
+  });
+}
+
+async function runExportDatabase(job: Job) {
+  migrateLegacyTableKeys(job);
+  const pending = job.tables.filter(
+    (table) =>
+      !job.skip.has(`${table.schema}\0${table.name}`) &&
+      table.status !== "done" &&
+      table.status !== "cancelled",
+  ).length;
+  const workerCount = Math.min(job.workers, Math.max(1, pending));
+  const lock = createJobLock();
+  let firstError: unknown = null;
+
+  const worker = async () => {
+    const client = await connectClient(job.cfg, settings.exportQueryTimeoutSec);
+    try {
+      while (!job.cancel && !firstError) {
+        await waitIfPaused(job);
+        if (job.cancel || firstError) break;
+
+        const table = await lock.run(() => {
+          const next = pickNextTable(job);
+          if (!next) return null;
+          next.status = "running";
+          refreshCurrentObject(job);
+          return next;
+        });
+        if (!table) break;
+
+        try {
+          await exportDatabaseTable(job, client, table, lock);
+        } catch (exc) {
+          await lock.run(() => {
+            table.status = "running";
+            if (!firstError) {
+              firstError = exc;
+              job.cancel = true;
+            }
+            refreshCurrentObject(job);
+            saveMeta(job);
+          });
+        }
+      }
+    } finally {
+      await client.close();
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  if (firstError) throw firstError;
 }
 
 async function runExport(job: Job) {
   job.status = "running";
   job.startedAt = job.startedAt || now();
   saveMeta(job);
-  const client = await connectClient(job.cfg, settings.exportQueryTimeoutSec);
   try {
     if (job.kind === "backup") {
-      job.current = job.database;
-      job.parts = [];
-      const files = job.backupFiles || [];
-      if (!files.length) throw new ClientError("Backup file list is empty.");
-      const disks = files.map((file) => `DISK = N'${file.replaceAll("'", "''")}'`).join(", ");
-      const dbSql = qident(job.database);
-      let sqlText = `BACKUP DATABASE ${dbSql} TO ${disks} WITH INIT, STATS = 10`;
-      if (job.gzip) sqlText += ", COMPRESSION";
+      const client = await connectClient(job.cfg, settings.exportQueryTimeoutSec);
       try {
-        await client.execute(sqlText, { maxRows: 1, database: "master" });
-      } catch (exc) {
-        const text = String(exc instanceof Error ? exc.message : exc || "").toLowerCase();
-        if (job.gzip && text.includes("compression")) {
-          await client.execute(`BACKUP DATABASE ${dbSql} TO ${disks} WITH INIT, STATS = 10`, {
-            maxRows: 1,
-            database: "master",
-          });
-        } else {
-          throw exc;
+        job.current = job.database;
+        job.parts = [];
+        const files = job.backupFiles || [];
+        if (!files.length) throw new ClientError("Backup file list is empty.");
+        const disks = files.map((file) => `DISK = N'${file.replaceAll("'", "''")}'`).join(", ");
+        const dbSql = qident(job.database);
+        let sqlText = `BACKUP DATABASE ${dbSql} TO ${disks} WITH INIT, STATS = 10`;
+        if (job.gzip) sqlText += ", COMPRESSION";
+        try {
+          await client.execute(sqlText, { maxRows: 1, database: "master" });
+        } catch (exc) {
+          const text = String(exc instanceof Error ? exc.message : exc || "").toLowerCase();
+          if (job.gzip && text.includes("compression")) {
+            await client.execute(`BACKUP DATABASE ${dbSql} TO ${disks} WITH INIT, STATS = 10`, {
+              maxRows: 1,
+              database: "master",
+            });
+          } else {
+            throw exc;
+          }
         }
-      }
-      for (const file of files) {
-        job.parts.push({
-          name: file.split(/[\\/]/).pop() || "backup.bak",
-          rows: 0,
-          bytes: 0,
-          path: file,
-        });
+        for (const file of files) {
+          job.parts.push({
+            name: file.split(/[\\/]/).pop() || "backup.bak",
+            rows: 0,
+            bytes: 0,
+            path: file,
+          });
+        }
+      } finally {
+        await client.close();
       }
     } else if (job.kind === "export_db") {
-      for (const table of job.tables) {
-        if (job.cancel) break;
-        if (job.skip.has(`${table.schema}\0${table.name}`)) continue;
-        if (table.status === "done") continue;
-        await waitIfPaused(job);
-        job.current = `${table.schema}.${table.name}`;
-        const resumingTable = table.status === "running";
-        table.status = "running";
-        if (!resumingTable || !job.lastKey) job.lastKey = null;
-        const cols = await client.listColumns(job.database, table.schema, table.name);
-        const names = cols.map((col) => String(col.name || "")).filter(Boolean);
-        const stats = await client.tableStats(job.database, table.schema, table.name);
-        job.keys = stats.keys;
-        const prefix = job.filePrefix
-          ? `${job.filePrefix}_${table.schema}.${table.name}`
-          : `${table.schema}.${table.name}`;
-        await writeCsvPart(job, client, table.schema, table.name, names, prefix);
-        if (job.cancel) {
-          table.status = "cancelled";
-        } else {
-          table.status = "done";
-          job.lastKey = null;
-          job.tablesDone += 1;
-        }
-        saveMeta(job);
-      }
+      await runExportDatabase(job);
     } else {
-      job.current = `${job.schema}.${job.table}`;
-      await writeCsvPart(job, client, job.schema, job.table, job.columns, job.filePrefix);
+      const client = await connectClient(job.cfg, settings.exportQueryTimeoutSec);
+      try {
+        job.current = `${job.schema}.${job.table}`;
+        await writeCsvPart(job, client, job.schema, job.table, job.columns, job.filePrefix, {
+          orderKeys: job.keys,
+          startKey: job.lastKey,
+        });
+      } finally {
+        await client.close();
+      }
     }
     job.status = job.cancel ? "cancelled" : "done";
   } catch (exc) {
@@ -540,7 +752,6 @@ async function runExport(job: Job) {
     job.finishedAt = now();
     job.current = undefined;
     saveMeta(job);
-    await client.close();
   }
 }
 
@@ -832,6 +1043,10 @@ export function resumeJob(sid: string, id: string, cfg?: ConnectionConfig) {
 
   if (job.kind === "backup") {
     job.parts = [];
+  } else if (job.kind === "export_db") {
+    for (const table of job.tables) {
+      if (table.status === "running") table.status = "queued";
+    }
   } else if (job.kind === "export" && !job.lastKey) {
     job.parts = [];
     job.rowsWritten = 0;
