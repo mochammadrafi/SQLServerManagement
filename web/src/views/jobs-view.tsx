@@ -56,6 +56,7 @@ export function JobsView({ active, tick }: { active?: boolean; tick: number }) {
                   <div className="mt-1 font-mono text-[10px] text-muted-foreground">{job.current_object}</div>
                 ) : null}
                 {job.error ? <div className="mt-1 font-mono text-[11px] text-destructive">{job.error}</div> : null}
+                {job.hint ? <div className="mt-1 font-mono text-[10px] text-muted-foreground">{job.hint}</div> : null}
                 <div className="mt-2 flex flex-wrap gap-1">
                   {job.can_pause ? (
                     <Button variant="outline" size="sm" onClick={() => void api.pauseJob(job.id).then(() => load())}>
@@ -66,7 +67,7 @@ export function JobsView({ active, tick }: { active?: boolean; tick: number }) {
                   {job.can_resume ? (
                     <Button variant="outline" size="sm" onClick={() => void api.resumeJob(job.id).then(() => load())}>
                       <Play />
-                      {t('jobs.resume')}
+                      {t(job.status === 'paused' ? 'jobs.resume' : 'jobs.retry')}
                     </Button>
                   ) : null}
                   {job.can_cancel ? (

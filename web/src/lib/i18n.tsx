@@ -127,6 +127,7 @@ const en: Dict = {
   'jobs.empty': 'No export jobs yet.',
   'jobs.pause': 'pause',
   'jobs.resume': 'resume',
+  'jobs.retry': 'retry',
   'jobs.cancel': 'cancel',
   'jobs.skip': 'skip current',
   'jobs.download': 'download',
@@ -331,6 +332,7 @@ const id: Dict = {
   'jobs.empty': 'Belum ada job export.',
   'jobs.pause': 'jeda',
   'jobs.resume': 'lanjut',
+  'jobs.retry': 'coba lagi',
   'jobs.cancel': 'batal',
   'jobs.skip': 'lewati saat ini',
   'jobs.download': 'unduh',
@@ -476,6 +478,7 @@ const de: Dict = {
   'sql.cancel': 'abbrechen',
   'jobs.pause': 'pause',
   'jobs.resume': 'fortsetzen',
+  'jobs.retry': 'erneut versuchen',
   'help.open': 'Hilfe',
 }
 
@@ -507,6 +510,7 @@ const ru: Dict = {
   'sql.cancel': 'отмена',
   'jobs.pause': 'пауза',
   'jobs.resume': 'продолжить',
+  'jobs.retry': 'повторить',
   'help.open': 'Справка',
 }
 

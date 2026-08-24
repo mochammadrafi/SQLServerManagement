@@ -19,11 +19,10 @@ import { listOdbcDrivers, loadMsnodesqlv8, pickOdbcDrivers } from "./sql/odbc.js
 import {
   cancelJob,
   exportLimits,
-  getJob,
+  getJobPublic,
   jobPartPath,
   listJobs,
   pauseJob,
-  publicJob,
   resumeJob,
   skipCurrent,
   startBackup,
@@ -270,7 +269,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.get("/api/v1/export/:id", async (request) => {
     const { id } = request.params as { id: string };
-    return ok("Export", { job: publicJob(getJob(sidOf(request), id)) });
+    return ok("Export", { job: getJobPublic(sidOf(request), id) });
   });
 
   app.post("/api/v1/export/:id/cancel", async (request) => {
@@ -294,7 +293,7 @@ export async function registerRoutes(app: FastifyInstance) {
   app.get("/api/v1/export/:id/parts/:name", async (request, reply) => {
     const { id, name } = request.params as { id: string; name: string };
     const path = jobPartPath(sidOf(request), id, name);
-    const job = getJob(sidOf(request), id);
+    const job = getJobPublic(sidOf(request), id);
     return reply.header("Content-Disposition", `attachment; filename="${job.table}_${name}"`).send(createReadStream(path));
   });
 

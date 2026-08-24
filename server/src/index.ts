@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +37,21 @@ async function main() {
       secure: false,
       path: "/",
     },
+  });
+
+  app.addHook("onRequest", async (request, reply) => {
+    let owner = request.cookies?.sqlsm_owner;
+    if (!owner) {
+      owner = randomBytes(16).toString("hex");
+      reply.setCookie("sqlsm_owner", owner, {
+        path: "/",
+        httpOnly: true,
+        sameSite: "lax",
+        secure: false,
+        maxAge: 60 * 60 * 24 * 365 * 10,
+      });
+    }
+    (request.session as { sid?: string }).sid = owner;
   });
 
   app.setErrorHandler((error, _request, reply) => {

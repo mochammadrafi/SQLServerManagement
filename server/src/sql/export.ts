@@ -1,8 +1,8 @@
-import { createWriteStream, mkdirSync, existsSync, writeFileSync } from "node:fs";
+import { createWriteStream, mkdirSync, existsSync, writeFileSync, readdirSync, readFileSync, chmodSync } from "node:fs";
 import { createGzip } from "node:zlib";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { settings } from "../config.js";
+import { settings, STORE_DIR } from "../config.js";
 import { ClientError } from "../errors.js";
 import { type ConnectionConfig, SqlServerClient, connectClient } from "./client.js";
 import { csvValue, qident, validateWhere } from "./ident.js";
@@ -76,7 +76,43 @@ type Job = {
   backupFiles?: string[];
 };
 
+type JobSnapshot = {
+  id: string;
+  sid: string;
+  kind: Job["kind"];
+  status: JobStatus;
+  database: string;
+  schema: string;
+  table: string;
+  columns: string[];
+  where: string;
+  folder: string;
+  gzip: boolean;
+  nolock: boolean;
+  chunkRows: number;
+  chunkBytes: number;
+  batchSize: number;
+  filePrefix: string;
+  workers: number;
+  rowsWritten: number;
+  bytesWritten: number;
+  rowCountEstimate: number | null;
+  parts: { name: string; rows: number; bytes: number; path: string }[];
+  tables: { schema: string; name: string; status?: string; rows_written?: number }[];
+  tablesDone: number;
+  error: string | null;
+  hint: string | null;
+  startedAt: string;
+  finishedAt: string;
+  backupFiles?: string[];
+  lastKey?: Record<string, unknown> | null;
+  keys?: string[];
+  skip?: string[];
+};
+
 const JOBS = new Map<string, Job>();
+const PERSISTED = new Map<string, JobSnapshot>();
+const JOB_STORE_DIR = join(STORE_DIR, "export-jobs");
 
 function now() {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
@@ -110,7 +146,159 @@ function normalizeChunks(chunkRows: number, chunkBytes: number) {
   return { chunkRows: rows, chunkBytes: bytes };
 }
 
-export function publicJob(job: Job): JobPublic {
+function canResumeStatus(status: JobStatus) {
+  return ["paused", "error", "cancelled"].includes(status);
+}
+
+function publicJobFromSnapshot(snap: JobSnapshot): JobPublic {
+  const folder = snap.folder.replace(/[\\/]+$/, "");
+  return {
+    id: snap.id,
+    status: snap.status,
+    database: snap.database,
+    schema: snap.schema,
+    table: snap.table,
+    kind: snap.kind,
+    folder: folder.split(/[\\/]/).pop() || "",
+    rows_written: snap.rowsWritten,
+    bytes_written: snap.bytesWritten,
+    row_count_estimate: snap.rowCountEstimate,
+    parts: snap.parts.map((part) => ({ name: part.name, rows: part.rows, bytes: part.bytes })),
+    error: snap.error,
+    hint: snap.hint,
+    started_at: snap.startedAt,
+    finished_at: snap.finishedAt,
+    tables_total: snap.kind === "export_db" ? snap.tables.length : null,
+    tables_done: snap.tablesDone,
+    current_object: undefined,
+    can_pause: false,
+    can_resume: canResumeStatus(snap.status),
+    can_cancel: false,
+    gzip: snap.gzip,
+    workers: snap.workers,
+    columns: snap.columns,
+    where: snap.where,
+  };
+}
+
+function snapshotFromJob(job: Job): JobSnapshot {
+  return {
+    id: job.id,
+    sid: job.sid,
+    kind: job.kind,
+    status: job.status,
+    database: job.database,
+    schema: job.schema,
+    table: job.table,
+    columns: job.columns,
+    where: job.where,
+    folder: job.folder,
+    gzip: job.gzip,
+    nolock: job.nolock,
+    chunkRows: job.chunkRows,
+    chunkBytes: job.chunkBytes,
+    batchSize: job.batchSize,
+    filePrefix: job.filePrefix,
+    workers: job.workers,
+    rowsWritten: job.rowsWritten,
+    bytesWritten: job.bytesWritten,
+    rowCountEstimate: job.rowCountEstimate,
+    parts: job.parts.map((part) => ({ ...part })),
+    tables: job.tables.map((table) => ({ ...table })),
+    tablesDone: job.tablesDone,
+    error: job.error,
+    hint: job.hint,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    backupFiles: job.backupFiles ? [...job.backupFiles] : undefined,
+    lastKey: job.lastKey,
+    keys: [...job.keys],
+    skip: [...job.skip],
+  };
+}
+
+function hydrateJob(snap: JobSnapshot, cfg: ConnectionConfig): Job {
+  return {
+    id: snap.id,
+    sid: snap.sid,
+    cfg,
+    kind: snap.kind,
+    status: snap.status,
+    database: snap.database,
+    schema: snap.schema,
+    table: snap.table,
+    columns: [...snap.columns],
+    where: snap.where,
+    folder: snap.folder,
+    gzip: snap.gzip,
+    nolock: snap.nolock,
+    chunkRows: snap.chunkRows,
+    chunkBytes: snap.chunkBytes,
+    batchSize: snap.batchSize,
+    filePrefix: snap.filePrefix,
+    workers: snap.workers,
+    rowsWritten: snap.rowsWritten,
+    bytesWritten: snap.bytesWritten,
+    rowCountEstimate: snap.rowCountEstimate,
+    parts: snap.parts.map((part) => ({ ...part })),
+    tables: snap.tables.map((table) => ({ ...table })),
+    tablesDone: snap.tablesDone,
+    error: snap.error,
+    hint: snap.hint,
+    startedAt: snap.startedAt,
+    finishedAt: snap.finishedAt,
+    lastKey: snap.lastKey ?? null,
+    keys: [...(snap.keys || [])],
+    pause: false,
+    cancel: false,
+    skip: new Set(snap.skip || []),
+    backupFiles: snap.backupFiles ? [...snap.backupFiles] : undefined,
+  };
+}
+
+function persistJob(job: Job) {
+  const snap = snapshotFromJob(job);
+  mkdirSync(JOB_STORE_DIR, { recursive: true });
+  const path = join(JOB_STORE_DIR, `${snap.id}.json`);
+  writeFileSync(path, JSON.stringify(snap));
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    /* ignore */
+  }
+  PERSISTED.set(snap.id, snap);
+}
+
+function loadPersistedJobs() {
+  mkdirSync(JOB_STORE_DIR, { recursive: true });
+  for (const name of readdirSync(JOB_STORE_DIR)) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const snap = JSON.parse(readFileSync(join(JOB_STORE_DIR, name), "utf8")) as JobSnapshot;
+      if (!snap?.id) continue;
+      if (["running", "queued", "paused", "cancelling"].includes(snap.status)) {
+        snap.status = "error";
+        snap.error = "Server restarted while this job was active.";
+        snap.hint = "Use Retry to continue from the last saved progress.";
+        snap.finishedAt = snap.finishedAt || now();
+        writeFileSync(join(JOB_STORE_DIR, `${snap.id}.json`), JSON.stringify(snap));
+      }
+      PERSISTED.set(snap.id, snap);
+    } catch {
+      /* ignore corrupt snapshot */
+    }
+  }
+}
+
+function findJob(sid: string, id: string) {
+  const live = JOBS.get(id);
+  if (live?.sid === sid) return { live, snap: snapshotFromJob(live) };
+  const snap = PERSISTED.get(id);
+  if (snap?.sid === sid) return { live: undefined, snap };
+  throw new ClientError("Export job not found.");
+}
+
+function publicJobLive(job: Job): JobPublic {
   const folder = job.folder.replace(/[\\/]+$/, "");
   return {
     id: job.id,
@@ -132,9 +320,7 @@ export function publicJob(job: Job): JobPublic {
     tables_done: job.tablesDone,
     current_object: job.current || null,
     can_pause: job.kind !== "backup" && ["queued", "running"].includes(job.status),
-    can_resume:
-      job.status === "paused" ||
-      (job.kind !== "backup" && ["error", "cancelled"].includes(job.status) && Boolean(job.lastKey || job.parts.length)),
+    can_resume: canResumeStatus(job.status),
     can_cancel: ["queued", "running", "paused", "cancelling"].includes(job.status),
     gzip: job.gzip,
     workers: job.workers,
@@ -143,8 +329,13 @@ export function publicJob(job: Job): JobPublic {
   };
 }
 
+export function publicJob(job: Job): JobPublic {
+  return publicJobLive(job);
+}
+
 function saveMeta(job: Job) {
   writeFileSync(join(job.folder, "meta.json"), JSON.stringify(publicJob(job), null, 2));
+  persistJob(job);
 }
 
 export function exportLimits() {
@@ -159,7 +350,23 @@ export function exportLimits() {
 }
 
 export function listJobs(sid: string) {
-  return [...JOBS.values()].filter((job) => job.sid === sid).map(publicJob);
+  const seen = new Set<string>();
+  const rows: JobPublic[] = [];
+  for (const job of JOBS.values()) {
+    if (job.sid !== sid) continue;
+    seen.add(job.id);
+    rows.push(publicJob(job));
+  }
+  for (const snap of PERSISTED.values()) {
+    if (snap.sid !== sid || seen.has(snap.id)) continue;
+    rows.push(publicJobFromSnapshot(snap));
+  }
+  return rows.sort((a, b) => String(b.started_at || "").localeCompare(String(a.started_at || "")));
+}
+
+export function getJobPublic(sid: string, id: string) {
+  const hit = findJob(sid, id);
+  return hit.live ? publicJob(hit.live) : publicJobFromSnapshot(hit.snap!);
 }
 
 export function getJob(sid: string, id: string) {
@@ -169,8 +376,9 @@ export function getJob(sid: string, id: string) {
 }
 
 export function jobPartPath(sid: string, id: string, name: string) {
-  const job = getJob(sid, id);
-  const part = job.parts.find((item) => item.name === name);
+  const hit = findJob(sid, id);
+  const parts = hit.live?.parts || hit.snap?.parts || [];
+  const part = parts.find((item) => item.name === name);
   if (!part || !existsSync(part.path)) throw new ClientError("Export file not found.");
   return part.path;
 }
@@ -264,6 +472,7 @@ async function runExport(job: Job) {
   try {
     if (job.kind === "backup") {
       job.current = job.database;
+      job.parts = [];
       const files = job.backupFiles || [];
       if (!files.length) throw new ClientError("Backup file list is empty.");
       const disks = files.map((file) => `DISK = N'${file.replaceAll("'", "''")}'`).join(", ");
@@ -295,10 +504,12 @@ async function runExport(job: Job) {
       for (const table of job.tables) {
         if (job.cancel) break;
         if (job.skip.has(`${table.schema}\0${table.name}`)) continue;
+        if (table.status === "done") continue;
         await waitIfPaused(job);
         job.current = `${table.schema}.${table.name}`;
+        const resumingTable = table.status === "running";
         table.status = "running";
-        job.lastKey = null;
+        if (!resumingTable || !job.lastKey) job.lastKey = null;
         const cols = await client.listColumns(job.database, table.schema, table.name);
         const names = cols.map((col) => String(col.name || "")).filter(Boolean);
         const stats = await client.tableStats(job.database, table.schema, table.name);
@@ -307,8 +518,13 @@ async function runExport(job: Job) {
           ? `${job.filePrefix}_${table.schema}.${table.name}`
           : `${table.schema}.${table.name}`;
         await writeCsvPart(job, client, table.schema, table.name, names, prefix);
-        table.status = job.cancel ? "cancelled" : "done";
-        job.tablesDone += 1;
+        if (job.cancel) {
+          table.status = "cancelled";
+        } else {
+          table.status = "done";
+          job.lastKey = null;
+          job.tablesDone += 1;
+        }
         saveMeta(job);
       }
     } else {
@@ -338,9 +554,12 @@ function register(sid: string, job: Job) {
   return job;
 }
 
-function assertNoActiveExport(sid: string) {
+function assertNoActiveExport(sid: string, exceptId?: string) {
   const active = [...JOBS.values()].filter(
-    (item) => item.sid === sid && ["queued", "running", "paused", "cancelling"].includes(item.status),
+    (item) =>
+      item.sid === sid &&
+      item.id !== exceptId &&
+      ["queued", "running", "paused", "cancelling"].includes(item.status),
   );
   if (active.length) {
     throw new ClientError(
@@ -589,16 +808,39 @@ export function pauseJob(sid: string, id: string) {
 }
 
 export function resumeJob(sid: string, id: string, cfg?: ConnectionConfig) {
-  const job = getJob(sid, id);
-  if (cfg) job.cfg = cfg;
+  if (!cfg) throw new ClientError("Not connected to SQL Server.", "Reconnect and try again.");
+  assertNoActiveExport(sid, id);
+
+  let job = JOBS.get(id);
+  if (!job || job.sid !== sid) {
+    const snap = PERSISTED.get(id);
+    if (!snap || snap.sid !== sid) throw new ClientError("Export job not found.");
+    if (!canResumeStatus(snap.status)) throw new ClientError("Job cannot be resumed.");
+    job = hydrateJob(snap, cfg);
+    JOBS.set(job.id, job);
+  } else {
+    job.cfg = cfg;
+  }
+
+  if (!canResumeStatus(job.status)) throw new ClientError("Job cannot be resumed.");
+
   job.pause = false;
   job.cancel = false;
-  if (["paused", "error", "cancelled"].includes(job.status)) {
-    job.status = "queued";
-    job.error = null;
-    void runExport(job);
+  job.error = null;
+  job.hint = null;
+  job.finishedAt = "";
+
+  if (job.kind === "backup") {
+    job.parts = [];
+  } else if (job.kind === "export" && !job.lastKey) {
+    job.parts = [];
+    job.rowsWritten = 0;
+    job.bytesWritten = 0;
   }
+
+  job.status = "queued";
   saveMeta(job);
+  void runExport(job);
   return publicJob(job);
 }
 
@@ -609,3 +851,5 @@ export function skipCurrent(sid: string, id: string, schema: string, name: strin
   job.skip.add(`${schema}\0${name}`);
   return publicJob(job);
 }
+
+loadPersistedJobs();
