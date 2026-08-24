@@ -119,6 +119,10 @@ export type SchemaCacheStatus = {
   columns: number
   samples: number
   foreign_keys: number
+  phase?: 'meta' | 'tables'
+  current_table?: string
+  tables_done?: number
+  tables_total?: number
   progress?: number
   error?: string | null
 }

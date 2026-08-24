@@ -57,6 +57,8 @@ export function explainError(exc: unknown): { message: string; hint?: string } {
     hint = "Wrong password, or the login cannot open the selected database. Re-type the password even if a saved profile is selected.";
   } else if (lower.includes("connection refused") || lower.includes("econnrefused")) {
     hint = "SQL Server is not accepting connections. Enable TCP/IP and open port 1433.";
+  } else if (lower.includes("query timeout")) {
+    hint = "Query took too long. For large databases, raise SQLSM_QUERY_TIMEOUT_SEC (default 600) and retry. Schema cache skips row counts and uses fast TOP 3 samples.";
   } else if (lower.includes("timeout") || lower.includes("etimeout")) {
     hint = "Timeout. Check firewall, IP, port, or named instance / SQL Browser.";
   } else if (lower.includes("ssl") || lower.includes("certificate") || lower.includes("encrypt")) {

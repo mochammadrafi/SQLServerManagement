@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 import { createRequire } from "node:module";
 import type sql from "mssql";
+import { settings } from "../config.js";
 
 const require = createRequire(import.meta.url);
 
@@ -58,7 +59,8 @@ export function odbcConnectionString(
     `Driver={${driver}}`,
     `Server=${server}`,
     `Database=${cfg.database || "master"}`,
-    "Connection Timeout=15",
+    `Connection Timeout=${settings.connectionTimeoutSec}`,
+    `Query Timeout=${settings.queryTimeoutSec}`,
     "APP=SQLSM",
   ];
   if (cfg.auth === "windows") {

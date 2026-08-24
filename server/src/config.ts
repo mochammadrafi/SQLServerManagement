@@ -50,6 +50,8 @@ export const settings = {
   maxWorkers: Number(process.env.SQLSM_MAX_WORKERS || 32),
   maxJobs: Number(process.env.SQLSM_MAX_JOBS || 24),
   defaultBatch: Number(process.env.SQLSM_EXPORT_BATCH || 10000),
+  connectionTimeoutSec: Number(process.env.SQLSM_CONNECTION_TIMEOUT_SEC || 30),
+  queryTimeoutSec: Number(process.env.SQLSM_QUERY_TIMEOUT_SEC || 600),
 };
 
 export function secretKey(): Buffer {

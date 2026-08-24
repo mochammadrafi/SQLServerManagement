@@ -8,7 +8,7 @@ const CACHE_ROOT = join(STORE_DIR, "schema-cache");
 const CACHE_VERSION = 1;
 const TTL_MS = Number(process.env.SQLSM_SCHEMA_CACHE_TTL_SEC || 86400) * 1000;
 const SAMPLE_SIZE = 3;
-const SAMPLE_CONCURRENCY = 6;
+const META_PROGRESS_END = 12;
 
 export type SchemaCacheColumn = {
   name: string;
@@ -52,6 +52,10 @@ export type SchemaCacheStatus = {
   columns: number;
   samples: number;
   foreign_keys: number;
+  phase?: "meta" | "tables";
+  current_table?: string;
+  tables_done?: number;
+  tables_total?: number;
   progress?: number;
   error?: string | null;
 };
@@ -59,8 +63,12 @@ export type SchemaCacheStatus = {
 type BuildJob = {
   status: "running" | "done" | "error";
   database: string;
+  phase: "meta" | "tables";
+  meta_step?: string;
+  current_table?: string;
   tables_total: number;
   tables_done: number;
+  progress: number;
   started_at: number;
   error?: string;
 };
@@ -147,26 +155,14 @@ export function schemaCacheStatus(cfg: ConnectionConfig, database: string): Sche
     columns,
     samples,
     foreign_keys: entry?.foreign_keys.length || 0,
-    progress:
-      job?.status === "running" && job.tables_total
-        ? Math.min(100, Math.round((job.tables_done / job.tables_total) * 100))
-        : undefined,
+    phase: job?.status === "running" ? job.phase : undefined,
+    current_table:
+      job?.status === "running" ? job.current_table || job.meta_step : undefined,
+    tables_done: job?.status === "running" ? job.tables_done : undefined,
+    tables_total: job?.status === "running" ? job.tables_total : undefined,
+    progress: job?.status === "running" ? job.progress : undefined,
     error: job?.status === "error" ? job.error || "build failed" : null,
   };
-}
-
-async function mapPool<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>) {
-  const out: R[] = new Array(items.length);
-  let index = 0;
-  async function run() {
-    while (index < items.length) {
-      const current = index;
-      index += 1;
-      out[current] = await worker(items[current]);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => run()));
-  return out;
 }
 
 export async function buildSchemaCache(cfg: ConnectionConfig, client: SqlServerClient, database: string) {
@@ -177,18 +173,32 @@ export async function buildSchemaCache(cfg: ConnectionConfig, client: SqlServerC
   const job: BuildJob = {
     status: "running",
     database,
+    phase: "meta",
+    meta_step: "catalog",
     tables_total: 0,
     tables_done: 0,
+    progress: 1,
     started_at: Date.now(),
   };
   BUILD_JOBS.set(jobKey, job);
 
   try {
-    const [catalog, foreignKeys, allColumns] = await Promise.all([
-      client.listObjects(database, true),
-      client.listForeignKeys(database),
-      client.listAllColumns(database),
-    ]);
+    job.meta_step = "catalog";
+    job.progress = 2;
+    const catalog = await client.listObjects(database, false);
+
+    job.meta_step = "foreign_keys";
+    job.progress = 5;
+    const foreignKeys = await client.listForeignKeys(database);
+
+    job.meta_step = "columns";
+    job.progress = 8;
+    const allColumns = await client.listAllColumns(database);
+
+    job.meta_step = "primary_keys";
+    job.progress = 10;
+    const primaryKeys = await client.listPrimaryKeyIndex(database);
+    job.progress = META_PROGRESS_END;
 
     const groupedFk = new Map<string, SchemaCacheForeignKey>();
     for (const row of foreignKeys) {
@@ -216,6 +226,18 @@ export async function buildSchemaCache(cfg: ConnectionConfig, client: SqlServerC
       columnsByTable.set(key, list);
     }
 
+    const pkByTable = new Map<string, string[]>();
+    for (const row of primaryKeys) {
+      const schema = String(row.table_schema || "dbo");
+      const table = String(row.table_name || "");
+      const column = String(row.column_name || "");
+      if (!table || !column) continue;
+      const key = tableKey(schema, table);
+      const list = pkByTable.get(key) || [];
+      list.push(column);
+      pkByTable.set(key, list);
+    }
+
     const tables: SchemaCacheTable[] = [];
     for (const bucket of ["tables", "views"] as const) {
       const kind = bucket === "tables" ? "table" : "view";
@@ -241,27 +263,31 @@ export async function buildSchemaCache(cfg: ConnectionConfig, client: SqlServerC
       }
     }
 
+    job.phase = "tables";
+    job.meta_step = undefined;
     job.tables_total = tables.length;
+    job.tables_done = 0;
 
-    await mapPool(tables, SAMPLE_CONCURRENCY, async (table) => {
-      try {
-        table.pk = table.kind === "table" ? await client.keyColumns(database, table.schema, table.name) : [];
-      } catch {
-        table.pk = [];
-      }
+    for (const table of tables) {
+      job.current_table = `${table.schema}.${table.name}`;
+
+      table.pk = table.kind === "table" ? pkByTable.get(tableKey(table.schema, table.name)) || [] : [];
       if (table.kind === "table") {
         try {
-          const page = await client.pageTable(database, table.schema, table.name, { pageSize: SAMPLE_SIZE });
-          table.sample = {
-            columns: (page.columns || []).map((name) => String(name)),
-            rows: (page.rows || []).slice(0, SAMPLE_SIZE),
-          };
+          table.sample = await client.sampleTableRows(database, table.schema, table.name, SAMPLE_SIZE);
         } catch {
-          /* skip sample */
+          /* skip sample on timeout or permission errors */
         }
       }
+
       job.tables_done += 1;
-    });
+      job.progress =
+        META_PROGRESS_END +
+        Math.round((job.tables_done / Math.max(job.tables_total, 1)) * (100 - META_PROGRESS_END));
+    }
+
+    job.progress = 100;
+    job.current_table = undefined;
 
     const entry: SchemaCacheEntry = {
       version: CACHE_VERSION,

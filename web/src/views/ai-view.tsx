@@ -26,6 +26,24 @@ import { cn } from '@/lib/utils'
 
 const LIVE_STEPS = ['scope', 'catalog', 'columns', 'samples', 'model', 'validate'] as const
 
+function formatCacheBuilding(
+  row: SchemaCacheStatus,
+  t: (key: string, vars?: Record<string, string | number>) => string,
+) {
+  if (row.phase === 'tables' && row.tables_total) {
+    return t('ai.cacheBuildingTable', {
+      done: row.tables_done || 0,
+      total: row.tables_total,
+      table: row.current_table || '…',
+      n: row.progress || 0,
+    })
+  }
+  return t('ai.cacheBuildingMeta', {
+    n: row.progress || 0,
+    step: row.current_table || '…',
+  })
+}
+
 function ProcessSteps({
   steps,
   busy,
@@ -179,7 +197,7 @@ export function AiView({
 
   useEffect(() => {
     if (!active || !cacheStatus.some((row) => row.building)) return
-    const timer = window.setInterval(() => refreshCacheStatus(), 2000)
+    const timer = window.setInterval(() => refreshCacheStatus(), 1000)
     return () => window.clearInterval(timer)
   }, [active, cacheStatus, refreshCacheStatus])
 
@@ -465,7 +483,7 @@ export function AiView({
                   <div className="truncate text-foreground">{db}</div>
                   <div className="mt-0.5 text-muted-foreground">
                     {row?.building
-                      ? t('ai.cacheBuilding', { n: row.progress || 0 })
+                      ? formatCacheBuilding(row, t)
                       : row?.ready
                         ? t('ai.cacheReady', {
                             tables: row.tables,
@@ -479,7 +497,10 @@ export function AiView({
               )
             })}
             <Button variant="outline" size="sm" className="w-full" disabled={!selected.length || busy} onClick={buildSchemaCache}>
-              {cacheStatus.some((row) => row.building) ? t('ai.cacheBuilding', { n: 0 }) : t('ai.buildCache')}
+              {(() => {
+                const buildingRow = cacheStatus.find((row) => row.building)
+                return buildingRow ? formatCacheBuilding(buildingRow, t) : t('ai.buildCache')
+              })()}
             </Button>
           </div>
           <div className="space-y-2 border-t border-border px-3 py-2">

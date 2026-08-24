@@ -1,5 +1,6 @@
 import sql from "mssql";
 import { ClientError, explainError, isCancelled, isTransient } from "../errors.js";
+import { settings } from "../config.js";
 import {
   assertDb,
   jsonSafe,
@@ -81,8 +82,8 @@ function tediousConfig(cfg: ConnectionConfig): sql.config {
       fallbackToDefaultDb: true,
       cryptoCredentialsDetails: cfg.encrypt ? { minVersion: "TLSv1" } : {},
     },
-    connectionTimeout: 15000,
-    requestTimeout: 300000,
+    connectionTimeout: settings.connectionTimeoutSec * 1000,
+    requestTimeout: settings.queryTimeoutSec * 1000,
   } as sql.config;
 }
 
@@ -111,8 +112,8 @@ async function openPool(cfg: ConnectionConfig): Promise<{
         try {
           const pool = new sqlv8.ConnectionPool({
             connectionString: odbcConnectionString(cfg, driver, serverAddress(cfg)),
-            connectionTimeout: 15000,
-            requestTimeout: 300000,
+            connectionTimeout: settings.connectionTimeoutSec * 1000,
+            requestTimeout: settings.queryTimeoutSec * 1000,
           } as unknown as sql.config);
           await pool.connect();
           return { pool, backend: "msnodesqlv8", driverName: driver, sql: sqlv8 };
@@ -688,6 +689,19 @@ WHERE s.name = ${qstr(schema)} AND o.name = ${qstr(table)} AND p.index_id IN (0,
       row_count: rowCount,
       keys,
       paging: keys.length ? "keyset" : "offset",
+    };
+  }
+
+  async sampleTableRows(database: string, schema: string, table: string, limit = 3) {
+    let pageSize = Math.trunc(limit);
+    if (pageSize < 1) pageSize = 1;
+    if (pageSize > 10) pageSize = 10;
+    const sqlText = `SELECT TOP ${pageSize} * FROM ${qname(database, schema, table)} WITH (NOLOCK)`;
+    const data = await this.execute(sqlText, { maxRows: pageSize });
+    const first = data.result_sets[0] || { columns: [], rows: [] };
+    return {
+      columns: (first.columns || []).map((name) => String(name)),
+      rows: (first.rows || []).slice(0, pageSize),
     };
   }
 
