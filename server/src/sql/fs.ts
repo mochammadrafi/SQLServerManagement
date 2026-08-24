@@ -49,7 +49,15 @@ export function folderShortcuts() {
     ["Documents", join(home, "Documents")],
     ["App data", defaultDataFolder()],
   ];
-  if (process.platform === "darwin") candidates.push(["Volumes", "/Volumes"]);
+  if (process.platform === "win32") {
+    for (let code = 65; code <= 90; code += 1) {
+      const letter = String.fromCharCode(code);
+      const root = `${letter}:\\`;
+      if (existsSync(root)) candidates.push([`Disk ${letter}`, root]);
+    }
+  } else if (process.platform === "darwin") {
+    candidates.push(["Volumes", "/Volumes"]);
+  }
   const items: { name: string; path: string; kind: string }[] = [];
   const seen = new Set<string>();
   for (const [name, path] of candidates) {
@@ -61,12 +69,19 @@ export function folderShortcuts() {
   return items;
 }
 
+function isWindowsDriveRoot(folder: string) {
+  return /^[A-Za-z]:\\?$/.test(folder.replace(/\\+$/, ""));
+}
+
 export function listFolders(path: string) {
   const text = (path || "").trim();
+  if (process.platform === "win32" && (!text || text === "\\")) {
+    return { path: "", parent: "", entries: folderShortcuts(), shortcuts: [] };
+  }
   let folder = text ? normalizeDir(text) : existingStartDir("");
   if (!existsSync(folder)) folder = existingStartDir("");
   let parent = dirname(folder);
-  if (folder === "/" || /^[A-Za-z]:\\?$/.test(folder)) parent = "";
+  if (folder === "/" || isWindowsDriveRoot(folder)) parent = "";
   let names: string[] = [];
   try {
     names = readdirSync(folder);

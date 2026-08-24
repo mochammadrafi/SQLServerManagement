@@ -63,10 +63,10 @@ export function FolderPicker({
       }
     >
       <div className="mb-2 flex items-center gap-2 font-mono text-[11px]">
-        <Button variant="outline" size="sm" disabled={!parent} onClick={() => go(parent)}>
+        <Button variant="outline" size="sm" disabled={!parent && !path} onClick={() => go(parent)}>
           {t('folder.up')}
         </Button>
-        <span className="truncate text-muted-foreground">{path}</span>
+        <span className="truncate text-muted-foreground">{path || t('folder.roots')}</span>
       </div>
       <div className="mb-2 flex flex-wrap gap-1">
         {shortcuts.map((item) => (

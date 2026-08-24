@@ -158,6 +158,7 @@ const en: Dict = {
   'export.compress': 'compress backup',
   'folder.title': 'PICK FOLDER',
   'folder.up': 'up',
+  'folder.roots': 'pick disk or folder',
   'folder.use': 'use this folder',
   'help.title': 'HOW TO USE',
   'help.body':
@@ -334,6 +335,7 @@ const id: Dict = {
   'export.startBackup': 'mulai backup',
   'export.compress': 'kompres backup',
   'folder.up': 'naik',
+  'folder.roots': 'pilih disk atau folder',
   'folder.use': 'pakai folder ini',
   'help.title': 'CARA PAKAI',
   'help.body':
