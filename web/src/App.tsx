@@ -285,7 +285,16 @@ function Console({
         </aside>
 
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'browse' ? 'flex' : 'hidden')}>
-          <BrowseView key={`browse-${connId}`} active={view === 'browse'} onOpenSql={openSql} onStatus={setStatus} />
+          <BrowseView
+            key={`browse-${connId}`}
+            active={view === 'browse'}
+            onOpenSql={openSql}
+            onStatus={setStatus}
+            onExportStarted={() => {
+              setView('jobs')
+              setJobTick((tick) => tick + 1)
+            }}
+          />
         </div>
         <div className={cn('min-h-0 min-w-0 flex-1', view === 'sql' ? 'flex' : 'hidden')}>
           <SqlView active={view === 'sql'} shell={shell} onShellChange={(next) => patchShell(next)} />

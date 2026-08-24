@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { settings } from "../config.js";
 import { ClientError } from "../errors.js";
 import { type ConnectionConfig, SqlServerClient, connectClient } from "./client.js";
-import { csvValue } from "./ident.js";
+import { csvValue, qident, validateWhere } from "./ident.js";
 import { ensureWritableDir, safeName } from "./fs.js";
 
 type JobStatus = "queued" | "running" | "paused" | "cancelling" | "cancelled" | "error" | "done";
@@ -73,6 +73,7 @@ type Job = {
   cancel: boolean;
   skip: Set<string>;
   current?: string;
+  backupFiles?: string[];
 };
 
 const JOBS = new Map<string, Job>();
@@ -81,10 +82,32 @@ function now() {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
 }
 
-function jobFolder(root: string, name: string) {
-  const dest = join(ensureWritableDir(root), `${safeName(name)}-${randomBytes(3).toString("hex")}`);
+function jobStamp() {
+  const d = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+function exportDestFolder(root: string, name: string) {
+  const base = ensureWritableDir(root || settings.exportDir);
+  const dest = join(base, `${safeName(name)}_${jobStamp()}`);
   mkdirSync(dest, { recursive: true });
   return dest;
+}
+
+function clampBatchSize(value: number) {
+  const limits = exportLimits();
+  return Math.min(limits.max_batch_size, Math.max(limits.min_batch_size, Math.trunc(value || limits.batch_size)));
+}
+
+function normalizeChunks(chunkRows: number, chunkBytes: number) {
+  let rows = Math.max(0, Math.trunc(chunkRows || 0));
+  let bytes = Math.max(0, Math.trunc(chunkBytes || 0));
+  if (rows > 5_000_000) rows = 5_000_000;
+  if (bytes && bytes < 64 * 1024 * 1024) {
+    throw new ClientError("Split size is too small.", "Minimum 64 MB to avoid thousands of tiny files.");
+  }
+  return { chunkRows: rows, chunkBytes: bytes };
 }
 
 export function publicJob(job: Job): JobPublic {
@@ -175,7 +198,7 @@ async function writeCsvPart(
   let bytesInPart = 0;
   const ext = job.gzip ? ".csv.gz" : ".csv";
   const openPart = () => {
-    const name = `${safeName(prefix)}-part-${String(partIndex).padStart(5, "0")}${ext}`;
+    const name = `${safeName(prefix)}_part-${String(partIndex).padStart(5, "0")}${ext}`;
     const path = join(job.folder, name);
     const file = createWriteStream(path);
     const gzip = job.gzip ? createGzip() : null;
@@ -237,17 +260,37 @@ async function runExport(job: Job) {
   job.status = "running";
   job.startedAt = job.startedAt || now();
   saveMeta(job);
-  const client = await connectClient(job.cfg);
+  const client = await connectClient(job.cfg, settings.exportQueryTimeoutSec);
   try {
     if (job.kind === "backup") {
       job.current = job.database;
-      const file = join(job.folder, `${safeName(job.database)}.bak`);
-      const compress = job.gzip ? ", COMPRESSION" : "";
-      await client.execute(
-        `BACKUP DATABASE ${job.database.includes("[") ? job.database : `[${job.database}]`} TO DISK = N'${file.replaceAll("'", "''")}' WITH INIT${compress}`,
-        { maxRows: 1 },
-      );
-      job.parts.push({ name: `${safeName(job.database)}.bak`, rows: 0, bytes: 0, path: file });
+      const files = job.backupFiles || [];
+      if (!files.length) throw new ClientError("Backup file list is empty.");
+      const disks = files.map((file) => `DISK = N'${file.replaceAll("'", "''")}'`).join(", ");
+      const dbSql = qident(job.database);
+      let sqlText = `BACKUP DATABASE ${dbSql} TO ${disks} WITH INIT, STATS = 10`;
+      if (job.gzip) sqlText += ", COMPRESSION";
+      try {
+        await client.execute(sqlText, { maxRows: 1, database: "master" });
+      } catch (exc) {
+        const text = String(exc instanceof Error ? exc.message : exc || "").toLowerCase();
+        if (job.gzip && text.includes("compression")) {
+          await client.execute(`BACKUP DATABASE ${dbSql} TO ${disks} WITH INIT, STATS = 10`, {
+            maxRows: 1,
+            database: "master",
+          });
+        } else {
+          throw exc;
+        }
+      }
+      for (const file of files) {
+        job.parts.push({
+          name: file.split(/[\\/]/).pop() || "backup.bak",
+          rows: 0,
+          bytes: 0,
+          path: file,
+        });
+      }
     } else if (job.kind === "export_db") {
       for (const table of job.tables) {
         if (job.cancel) break;
@@ -255,11 +298,15 @@ async function runExport(job: Job) {
         await waitIfPaused(job);
         job.current = `${table.schema}.${table.name}`;
         table.status = "running";
+        job.lastKey = null;
         const cols = await client.listColumns(job.database, table.schema, table.name);
         const names = cols.map((col) => String(col.name || "")).filter(Boolean);
         const stats = await client.tableStats(job.database, table.schema, table.name);
         job.keys = stats.keys;
-        await writeCsvPart(job, client, table.schema, table.name, names, `${table.schema}.${table.name}`);
+        const prefix = job.filePrefix
+          ? `${job.filePrefix}_${table.schema}.${table.name}`
+          : `${table.schema}.${table.name}`;
+        await writeCsvPart(job, client, table.schema, table.name, names, prefix);
         table.status = job.cancel ? "cancelled" : "done";
         job.tablesDone += 1;
         saveMeta(job);
@@ -291,6 +338,18 @@ function register(sid: string, job: Job) {
   return job;
 }
 
+function assertNoActiveExport(sid: string) {
+  const active = [...JOBS.values()].filter(
+    (item) => item.sid === sid && ["queued", "running", "paused", "cancelling"].includes(item.status),
+  );
+  if (active.length) {
+    throw new ClientError(
+      "Another export job is still running.",
+      "Wait for it to finish or cancel it first.",
+    );
+  }
+}
+
 export async function startExport(
   sid: string,
   cfg: ConnectionConfig,
@@ -309,6 +368,9 @@ export async function startExport(
     file_name?: string;
   },
 ) {
+  assertNoActiveExport(sid);
+  const where = validateWhere(body.where);
+  const chunks = normalizeChunks(Number(body.chunk_rows || 0), Number(body.chunk_bytes || 0));
   const probe = await connectClient(cfg);
   try {
     const allowed = (await probe.listColumns(body.database, body.schema, body.table)).map((col) => String(col.name || ""));
@@ -318,7 +380,7 @@ export async function startExport(
       .filter(Boolean) as string[];
     if (!picked.length) throw new ClientError("Pick at least one column.");
     const stats = await probe.tableStats(body.database, body.schema, body.table);
-    const dest = jobFolder(body.folder || settings.exportDir, body.table);
+    const dest = exportDestFolder(body.folder || settings.exportDir, body.table);
     const job: Job = {
       id: randomBytes(8).toString("hex"),
       sid,
@@ -329,13 +391,13 @@ export async function startExport(
       schema: body.schema,
       table: body.table,
       columns: picked,
-      where: body.where || "",
+      where,
       folder: dest,
       gzip: body.gzip !== false,
       nolock: body.nolock !== false,
-      chunkRows: Number(body.chunk_rows || 0),
-      chunkBytes: Number(body.chunk_bytes || 0),
-      batchSize: Number(body.batch_size || settings.defaultBatch),
+      chunkRows: chunks.chunkRows,
+      chunkBytes: chunks.chunkBytes,
+      batchSize: clampBatchSize(Number(body.batch_size || settings.defaultBatch)),
       filePrefix: body.file_name || body.table,
       workers: 1,
       rowsWritten: 0,
@@ -377,6 +439,8 @@ export async function startDatabaseExport(
     file_name?: string;
   },
 ) {
+  assertNoActiveExport(sid);
+  const chunks = normalizeChunks(Number(body.chunk_rows || 0), Number(body.chunk_bytes || 0));
   const probe = await connectClient(cfg);
   try {
     const catalog = await probe.listObjects(body.database, true);
@@ -393,7 +457,7 @@ export async function startDatabaseExport(
         })
       : available.filter((item) => !item.is_system);
     if (!picked.length) throw new ClientError("No tables to export.");
-    const dest = jobFolder(body.folder || settings.exportDir, body.database);
+    const dest = exportDestFolder(body.folder || settings.exportDir, body.database);
     const job: Job = {
       id: randomBytes(8).toString("hex"),
       sid,
@@ -408,11 +472,11 @@ export async function startDatabaseExport(
       folder: dest,
       gzip: body.gzip !== false,
       nolock: body.nolock !== false,
-      chunkRows: Number(body.chunk_rows || 0),
-      chunkBytes: Number(body.chunk_bytes || 0),
-      batchSize: Number(body.batch_size || settings.defaultBatch),
+      chunkRows: chunks.chunkRows,
+      chunkBytes: chunks.chunkBytes,
+      batchSize: clampBatchSize(Number(body.batch_size || settings.defaultBatch)),
       filePrefix: body.file_name || "",
-      workers: Number(body.workers || 3),
+      workers: Math.min(settings.maxWorkers, Math.max(1, Number(body.workers || 3))),
       rowsWritten: 0,
       bytesWritten: 0,
       rowCountEstimate: picked.reduce((sum, item) => sum + Number(item.row_count || 0), 0),
@@ -440,25 +504,50 @@ export async function startBackup(
   cfg: ConnectionConfig,
   body: { database: string; folder?: string; compress?: boolean; chunk_bytes?: number },
 ) {
-  const dest = jobFolder(body.folder || settings.exportDir, body.database);
+  assertNoActiveExport(sid);
+  const database = String(body.database || "").trim();
+  if (!database) throw new ClientError("Select a database for backup.");
+  const chunks = normalizeChunks(0, Number(body.chunk_bytes || 0));
+  const dest = ensureWritableDir(body.folder || settings.exportDir);
+  const probe = await connectClient(cfg);
+  let sizeBytes = 0;
+  try {
+    const dbs = (await probe.listDatabases()) as Array<{ name?: string; size_mb?: number | null }>;
+    for (const item of dbs) {
+      if (String(item.name || "") === database) {
+        sizeBytes = Math.trunc(Number(item.size_mb || 0) * 1024 * 1024);
+        break;
+      }
+    }
+  } finally {
+    await probe.close();
+  }
+  let partsN = 1;
+  if (chunks.chunkBytes && sizeBytes) partsN = Math.ceil(sizeBytes / chunks.chunkBytes);
+  else if (chunks.chunkBytes) partsN = 4;
+  partsN = Math.min(64, Math.max(1, partsN));
+  const stamp = jobStamp();
+  const files = Array.from({ length: partsN }, (_, index) =>
+    join(dest, `${safeName(database)}_${stamp}_${String(index + 1).padStart(2, "0")}.bak`),
+  );
   const job: Job = {
     id: randomBytes(8).toString("hex"),
     sid,
     cfg,
     kind: "backup",
     status: "queued",
-    database: body.database,
+    database,
     schema: "",
-    table: body.database,
+    table: database,
     columns: [],
     where: "",
     folder: dest,
     gzip: body.compress !== false,
     nolock: true,
     chunkRows: 0,
-    chunkBytes: Number(body.chunk_bytes || 0),
+    chunkBytes: chunks.chunkBytes,
     batchSize: settings.defaultBatch,
-    filePrefix: body.database,
+    filePrefix: database,
     workers: 1,
     rowsWritten: 0,
     bytesWritten: 0,
@@ -475,6 +564,7 @@ export async function startBackup(
     pause: false,
     cancel: false,
     skip: new Set(),
+    backupFiles: files,
   };
   return publicJob(register(sid, job));
 }

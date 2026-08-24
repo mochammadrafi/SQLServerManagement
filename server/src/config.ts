@@ -52,6 +52,7 @@ export const settings = {
   defaultBatch: Number(process.env.SQLSM_EXPORT_BATCH || 10000),
   connectionTimeoutSec: Number(process.env.SQLSM_CONNECTION_TIMEOUT_SEC || 30),
   queryTimeoutSec: Number(process.env.SQLSM_QUERY_TIMEOUT_SEC || 600),
+  exportQueryTimeoutSec: Number(process.env.SQLSM_EXPORT_QUERY_TIMEOUT_SEC || 86400),
 };
 
 export function secretKey(): Buffer {

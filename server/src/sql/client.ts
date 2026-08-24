@@ -54,7 +54,15 @@ function isLoginError(exc: unknown): boolean {
   return text.includes("login failed") || text.includes("cannot open database") || text.includes("18456") || text.includes("4060");
 }
 
-function tediousConfig(cfg: ConnectionConfig): sql.config {
+function poolTimeouts(queryTimeoutSec?: number) {
+  const sec = queryTimeoutSec ?? settings.queryTimeoutSec;
+  return {
+    connectionTimeout: settings.connectionTimeoutSec * 1000,
+    requestTimeout: sec * 1000,
+  };
+}
+
+function tediousConfig(cfg: ConnectionConfig, queryTimeoutSec?: number): sql.config {
   const host = (cfg.server || "").trim();
   const instance = (cfg.instance || "").trim();
   if (cfg.auth === "windows") {
@@ -82,12 +90,14 @@ function tediousConfig(cfg: ConnectionConfig): sql.config {
       fallbackToDefaultDb: true,
       cryptoCredentialsDetails: cfg.encrypt ? { minVersion: "TLSv1" } : {},
     },
-    connectionTimeout: settings.connectionTimeoutSec * 1000,
-    requestTimeout: settings.queryTimeoutSec * 1000,
+    ...poolTimeouts(queryTimeoutSec),
   } as sql.config;
 }
 
-async function openPool(cfg: ConnectionConfig): Promise<{
+async function openPool(
+  cfg: ConnectionConfig,
+  queryTimeoutSec?: number,
+): Promise<{
   pool: sql.ConnectionPool;
   backend: string;
   driverName: string;
@@ -111,9 +121,8 @@ async function openPool(cfg: ConnectionConfig): Promise<{
       for (const driver of drivers) {
         try {
           const pool = new sqlv8.ConnectionPool({
-            connectionString: odbcConnectionString(cfg, driver, serverAddress(cfg)),
-            connectionTimeout: settings.connectionTimeoutSec * 1000,
-            requestTimeout: settings.queryTimeoutSec * 1000,
+            connectionString: odbcConnectionString(cfg, driver, serverAddress(cfg), queryTimeoutSec),
+            ...poolTimeouts(queryTimeoutSec),
           } as unknown as sql.config);
           await pool.connect();
           return { pool, backend: "msnodesqlv8", driverName: driver, sql: sqlv8 };
@@ -126,7 +135,7 @@ async function openPool(cfg: ConnectionConfig): Promise<{
     }
   }
 
-  const pool = new sql.ConnectionPool(tediousConfig(cfg));
+  const pool = new sql.ConnectionPool(tediousConfig(cfg, queryTimeoutSec));
   await pool.connect();
   return { pool, backend: "mssql/tedious", driverName: "tedious", sql };
 }
@@ -183,6 +192,7 @@ function asDicts(data: { columns: string[]; rows: unknown[][] }): Record<string,
 
 export class SqlServerClient {
   cfg: ConnectionConfig;
+  queryTimeoutSec?: number;
   pool: sql.ConnectionPool | null = null;
   backend = "mssql/tedious";
   driverName = "tedious";
@@ -190,8 +200,9 @@ export class SqlServerClient {
   private cancelFlag = false;
   private spid: number | null = null;
 
-  constructor(cfg: ConnectionConfig) {
+  constructor(cfg: ConnectionConfig, queryTimeoutSec?: number) {
     this.cfg = cfg;
+    this.queryTimeoutSec = queryTimeoutSec;
   }
 
   isOpen(): boolean {
@@ -201,7 +212,7 @@ export class SqlServerClient {
   async connect(): Promise<void> {
     if (this.pool?.connected) return;
     try {
-      const opened = await openPool(this.cfg);
+      const opened = await openPool(this.cfg, this.queryTimeoutSec);
       this.pool = opened.pool;
       this.backend = opened.backend;
       this.driverName = opened.driverName;
@@ -826,9 +837,9 @@ WHERE s.name = ${qstr(schema)} AND o.name = ${qstr(table)} AND p.index_id IN (0,
     }
     let sqlText = `SELECT ${columns.map(qident).join(", ")} FROM ${tableSql}`;
     if (clauses.length) sqlText += ` WHERE ${clauses.join(" AND ")}`;
-    if (keys.length && (after || !whereSql)) {
+    if (keys.length) {
       sqlText += ` ORDER BY ${keys.map(qident).join(", ")}`;
-    } else if (whereSql && !after) {
+    } else if (whereSql) {
       sqlText += ` OPTION (FAST ${fetchN})`;
     }
     if (!this.pool?.connected) await this.connect();
@@ -872,8 +883,8 @@ WHERE s.name = ${qstr(schema)} AND o.name = ${qstr(table)} AND p.index_id IN (0,
   }
 }
 
-export async function connectClient(cfg: ConnectionConfig): Promise<SqlServerClient> {
-  const client = new SqlServerClient(cfg);
+export async function connectClient(cfg: ConnectionConfig, queryTimeoutSec?: number): Promise<SqlServerClient> {
+  const client = new SqlServerClient(cfg, queryTimeoutSec);
   await client.connect();
   return client;
 }

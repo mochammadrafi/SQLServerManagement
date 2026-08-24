@@ -1,16 +1,16 @@
 import { ChevronLeft, Database, RefreshCw, Search, Table2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { DataGrid } from '@/components/data-grid'
-import { FolderPicker } from '@/components/folder-picker'
+import { ExportDialog } from '@/components/export-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Dialog } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import {
   api,
   type CatalogObject,
   type DatabaseRow,
+  type Meta,
   type TablePage,
 } from '@/lib/api'
 import { useLocale } from '@/lib/i18n'
@@ -39,10 +39,12 @@ export function BrowseView({
   active: _active,
   onOpenSql,
   onStatus,
+  onExportStarted,
 }: {
   active?: boolean
   onOpenSql: (sql: string, database: string) => void
   onStatus: (text: string) => void
+  onExportStarted?: () => void
 }) {
   const { t } = useLocale()
   const [databases, setDatabases] = useState<DatabaseRow[]>([])
@@ -61,10 +63,8 @@ export function BrowseView({
   const [previewing, setPreviewing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [exportOpen, setExportOpen] = useState<'table' | 'db' | 'backup' | null>(null)
-  const [folderOpen, setFolderOpen] = useState(false)
-  const [folder, setFolder] = useState('')
-  const [fileName, setFileName] = useState('')
-  const [gzip, setGzip] = useState(true)
+  const [defaultFolder, setDefaultFolder] = useState('')
+  const [exportLimits, setExportLimits] = useState<Meta['export_limits']>()
 
   const loadDbs = async () => {
     setLoading(true)
@@ -81,6 +81,10 @@ export function BrowseView({
 
   useEffect(() => {
     void loadDbs()
+    void api.meta().then((meta) => {
+      setDefaultFolder(meta.default_folder || '')
+      setExportLimits(meta.export_limits)
+    })
   }, [])
 
   const visibleDbs = useMemo(
@@ -427,77 +431,21 @@ export function BrowseView({
           </ScrollArea>
         )}
       </section>
-      <Dialog
-        open={Boolean(exportOpen)}
-        title={
-          exportOpen === 'backup'
-            ? t('export.backupTitle')
-            : exportOpen === 'db'
-              ? t('export.dbTitle')
-              : t('export.title')
-        }
+      <ExportDialog
+        mode={exportOpen}
         onClose={() => setExportOpen(null)}
-        wide
-        footer={
-          <>
-            <Button variant="outline" onClick={() => setExportOpen(null)}>
-              {t('common.cancel')}
-            </Button>
-            <Button
-              onClick={() => {
-                void (async () => {
-                  if (exportOpen === 'backup' && selectedDb) {
-                    await api.startBackup({ database: selectedDb, folder, compress: gzip })
-                  } else if (exportOpen === 'db' && selectedDb) {
-                    await api.startDatabaseExport({
-                      database: selectedDb,
-                      tables: tables.map((item) => ({ schema: item.schema, name: item.name })),
-                      folder,
-                      gzip,
-                    })
-                  } else if (exportOpen === 'table' && table) {
-                    const cols = await api.columns(table.database, table.schema, table.name)
-                    await api.startExport({
-                      database: table.database,
-                      schema: table.schema,
-                      table: table.name,
-                      columns: cols.columns.map((c) => c.name),
-                      where,
-                      folder,
-                      file_name: fileName,
-                      gzip,
-                    })
-                  }
-                  setExportOpen(null)
-                })()
-              }}
-            >
-              {exportOpen === 'backup' ? t('export.startBackup') : exportOpen === 'db' ? t('export.startDb') : t('export.start')}
-            </Button>
-          </>
-        }
-      >
-        <div className="space-y-3">
-          <div>
-            <div className="font-mono text-[10px] text-muted-foreground">{t('export.filename')}</div>
-            <Input value={fileName} onChange={(e) => setFileName(e.target.value)} />
-          </div>
-          <div>
-            <div className="font-mono text-[10px] text-muted-foreground">{t('export.folder')}</div>
-            <div className="mt-1 flex gap-2">
-              <Input value={folder} onChange={(e) => setFolder(e.target.value)} />
-              <Button variant="outline" onClick={() => setFolderOpen(true)}>
-                {t('export.browse')}
-              </Button>
-            </div>
-          </div>
-          <label className="flex items-center gap-2 font-mono text-[11px]">
-            <input type="checkbox" checked={gzip} onChange={(e) => setGzip(e.target.checked)} />
-            {exportOpen === 'backup' ? t('export.compress') : t('export.gzip')}
-          </label>
-        </div>
-      </Dialog>
-      <FolderPicker open={folderOpen} start={folder} onClose={() => setFolderOpen(false)} onPick={setFolder} />
+        onStarted={onExportStarted}
+        defaultFolder={defaultFolder}
+        limits={exportLimits}
+        table={table || undefined}
+        rowCount={rowCount}
+        initialWhere={where}
+        database={selectedDb || undefined}
+        dbTables={tables}
+        dbViews={views}
+        databases={databases}
+        backupDatabase={selectedDb || undefined}
+      />
     </div>
   )
 }

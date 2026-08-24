@@ -54,13 +54,14 @@ export function odbcConnectionString(
   },
   driver: string,
   server: string,
+  queryTimeoutSec = settings.queryTimeoutSec,
 ): string {
   const parts = [
     `Driver={${driver}}`,
     `Server=${server}`,
     `Database=${cfg.database || "master"}`,
     `Connection Timeout=${settings.connectionTimeoutSec}`,
-    `Query Timeout=${settings.queryTimeoutSec}`,
+    `Query Timeout=${queryTimeoutSec}`,
     "APP=SQLSM",
   ];
   if (cfg.auth === "windows") {
