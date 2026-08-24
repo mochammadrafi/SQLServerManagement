@@ -1,6 +1,13 @@
 import { ClientError } from "../errors.js";
-import type { SqlServerClient } from "./client.js";
+import type { ConnectionConfig, SqlServerClient } from "./client.js";
 import { chatOpenAi, openaiStatus } from "./openai.js";
+import {
+  cacheCatalogItems,
+  isSchemaCacheFresh,
+  readSchemaCache,
+  type SchemaCacheEntry,
+  type SchemaCacheTable,
+} from "./schema-cache.js";
 
 export type AiMode = "query" | "analyze";
 
@@ -11,6 +18,14 @@ export type AiAsk = {
   tables?: { database?: string; schema: string; name: string }[];
   includeSamples?: boolean;
   sql?: string;
+  history?: { role: "user" | "ai"; text?: string; used_objects?: string[] }[];
+};
+
+export type AiInferredLink = {
+  from: string;
+  to: string;
+  columns: string[];
+  source: "column_name";
 };
 
 export type AiStep = {
@@ -52,6 +67,7 @@ export type AiContextDb = {
   fk_count: number;
   objects: AiContextObject[];
   foreign_keys: AiForeignKey[];
+  inferred_links?: AiInferredLink[];
 };
 
 export type AiCatalogItem = {
@@ -72,10 +88,12 @@ Return ONLY valid JSON with this shape:
 Accuracy rules (critical):
 - Target SQL Server 2012 only. Use TOP, ISNULL, CONVERT, CTEs. No STRING_AGG, OPENJSON, DROP IF EXISTS, GENERATE_SERIES.
 - Use ONLY tables, views, and columns listed in the catalog context below.
-- If the request needs objects not in context, explain what is missing in explanation and notes — do NOT invent names.
+- If the request needs objects not in context, explain what is missing in explanation and notes — do NOT invent names or columns.
 - Use three-part names [database].[schema].[object] when more than one database appears in context.
 - Default to SELECT. Write INSERT/UPDATE/DELETE only if the user explicitly asked.
-- When the request spans multiple tables, write JOINs using foreign keys and PKs from context. State assumptions in notes.
+- When the user asks about relationships, references, sekolah/pembimbing, or "where does X connect", explain the FK/inferred link graph in notes first, then write SQL that JOINs through lookup tables. Do NOT guess denormalized name columns unless they appear in context.
+- When the user asks to check all/related tables or continue a schema study, stay on the same table cluster from conversation history — never jump to an unrelated table.
+- When the request spans multiple tables, write JOINs using foreign keys, inferred links, and PKs from context. State assumptions in notes.
 - Put ONE complete runnable statement in sql[0]. Do NOT split SELECT / FROM / JOIN across multiple array items.
 - List every object you referenced in used_objects.`;
 
@@ -152,18 +170,182 @@ function mentionTables(message: string, databases: string[]) {
   return tables;
 }
 
-function mergePinnedTables(ask: AiAsk, databases: string[]) {
+function mergeFocusTables(ask: AiAsk, databases: string[]) {
+  const defaultDb = databases[0] || "";
   const seen = new Set<string>();
   const out: NonNullable<AiAsk["tables"]> = [];
   const push = (item: { database?: string; schema: string; name: string }) => {
-    const key = `${item.database || ""}|${item.schema}|${item.name}`.toLowerCase();
+    const db = item.database || defaultDb;
+    if (!db) return;
+    const key = `${db}|${item.schema}|${item.name}`.toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
-    out.push(item);
+    out.push({ database: db, schema: item.schema, name: item.name });
   };
   for (const item of ask.tables || []) push(item);
   for (const item of mentionTables(String(ask.message || ""), databases)) push(item);
-  return out.length ? out : undefined;
+  for (const turn of ask.history || []) {
+    if (turn.role === "user") {
+      for (const item of mentionTables(String(turn.text || ""), databases)) push(item);
+    }
+    for (const ref of turn.used_objects || []) {
+      const parsed = parseObjectRef(String(ref || ""), defaultDb);
+      if (parsed) push(parsed);
+    }
+  }
+  return out;
+}
+
+function parseObjectRef(ref: string, defaultDb: string) {
+  const parts = ref
+    .split(".")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length === 3) return { database: parts[0], schema: parts[1], name: parts[2] };
+  if (parts.length === 2 && defaultDb) return { database: defaultDb, schema: parts[0], name: parts[1] };
+  return null;
+}
+
+function wantsSchemaExplore(message: string, history: AiAsk["history"]) {
+  const blob = [message, ...(history || []).map((item) => String(item.text || ""))].join("\n").toLowerCase();
+  return /\b(semua\s+tabel|all\s+tables?|cek\s+di|relasi|referensi|foreign\s*key|hubung|nyambung|kemana|pembimbing|sekolah|struktur|schema|mapping|cocokkan|pelajari|lengkap|erd|diagram|jejak|lookup)\b/i.test(
+    blob,
+  );
+}
+
+type CatalogEntry = {
+  schema: string;
+  name: string;
+  kind: string;
+  row_count?: number | null;
+  size_kb?: number | null;
+};
+
+function expandFkNeighbors(
+  roots: Set<string>,
+  foreignKeys: AiForeignKey[],
+  maxHops: number,
+  maxTables: number,
+) {
+  const adj = new Map<string, Set<string>>();
+  const addEdge = (a: string, b: string) => {
+    if (!adj.has(a)) adj.set(a, new Set());
+    if (!adj.has(b)) adj.set(b, new Set());
+    adj.get(a)!.add(b);
+    adj.get(b)!.add(a);
+  };
+  for (const fk of foreignKeys) {
+    addEdge(fk.from.toLowerCase(), fk.to.toLowerCase());
+  }
+  const picked = new Set<string>(roots);
+  let frontier = [...roots];
+  for (let hop = 0; hop < maxHops && picked.size < maxTables && frontier.length; hop += 1) {
+    const next: string[] = [];
+    for (const node of frontier) {
+      for (const neighbor of adj.get(node) || []) {
+        if (picked.has(neighbor)) continue;
+        picked.add(neighbor);
+        next.push(neighbor);
+        if (picked.size >= maxTables) break;
+      }
+      if (picked.size >= maxTables) break;
+    }
+    frontier = next;
+  }
+  return picked;
+}
+
+function inferColumnLinks(objects: AiContextObject[]): AiInferredLink[] {
+  const pkOwners = new Map<string, { schema: string; name: string; pk: string }>();
+  for (const obj of objects) {
+    for (const pk of obj.pk || []) {
+      pkOwners.set(pk.toLowerCase(), { schema: obj.schema, name: obj.name, pk });
+    }
+  }
+  const links: AiInferredLink[] = [];
+  const seen = new Set<string>();
+  for (const obj of objects) {
+    for (const col of obj.columns) {
+      const colName = col.name.toLowerCase();
+      if (!colName.startsWith("id_")) continue;
+      const owner = pkOwners.get(colName);
+      if (!owner) continue;
+      const from = `${obj.schema}.${obj.name}`;
+      const to = `${owner.schema}.${owner.name}`;
+      if (from.toLowerCase() === to.toLowerCase()) continue;
+      const key = `${from}->${to}:${colName}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      links.push({
+        from,
+        to,
+        columns: [`${col.name}->${owner.pk}`],
+        source: "column_name",
+      });
+    }
+  }
+  return links.slice(0, 100);
+}
+
+async function buildPkColumnIndex(client: SqlServerClient, database: string) {
+  try {
+    const rows = await client.listPrimaryKeyIndex(database);
+    const pkByTable = new Map<string, string[]>();
+    const tableByPkColumn = new Map<string, { schema: string; name: string }[]>();
+    for (const row of rows) {
+      const schema = String(row.table_schema || "dbo");
+      const table = String(row.table_name || "");
+      const column = String(row.column_name || "");
+      if (!table || !column) continue;
+      const tableKey = fkKey(schema, table);
+      const cols = pkByTable.get(tableKey) || [];
+      cols.push(column);
+      pkByTable.set(tableKey, cols);
+      const owners = tableByPkColumn.get(column.toLowerCase()) || [];
+      owners.push({ schema, name: table });
+      tableByPkColumn.set(column.toLowerCase(), owners);
+    }
+    return { pkByTable, tableByPkColumn };
+  } catch {
+    return { pkByTable: new Map<string, string[]>(), tableByPkColumn: new Map<string, { schema: string; name: string }[]>() };
+  }
+}
+
+async function expandByIdColumns(
+  client: SqlServerClient,
+  database: string,
+  seedKeys: Set<string>,
+  catalogMap: Map<string, CatalogEntry>,
+  pickedNames: Set<string>,
+  maxAdd: number,
+) {
+  if (!seedKeys.size) return;
+  const { tableByPkColumn } = await buildPkColumnIndex(client, database);
+  let added = 0;
+  for (const key of seedKeys) {
+    const entry = catalogMap.get(key);
+    if (!entry) continue;
+    let columns: AiColumn[] = [];
+    try {
+      const cols = await client.listColumns(database, entry.schema, entry.name);
+      columns = cols.slice(0, 64).map((col) => formatColumn(col));
+    } catch {
+      continue;
+    }
+    for (const col of columns) {
+      if (added >= maxAdd) return;
+      const colName = col.name.toLowerCase();
+      if (!colName.startsWith("id_")) continue;
+      for (const owner of tableByPkColumn.get(colName) || []) {
+        const target = fkKey(owner.schema, owner.name);
+        if (target === key || pickedNames.has(target)) continue;
+        if (!catalogMap.has(target)) continue;
+        pickedNames.add(target);
+        added += 1;
+        if (added >= maxAdd) return;
+      }
+    }
+  }
 }
 
 function scoreObject(
@@ -215,7 +397,136 @@ function fkKey(schema: string, table: string) {
   return `${schema}.${table}`.toLowerCase();
 }
 
-export async function gatherContext(client: SqlServerClient, ask: AiAsk) {
+async function expandByIdColumnsFromCache(
+  cache: SchemaCacheEntry,
+  seedKeys: Set<string>,
+  catalogMap: Map<string, CatalogEntry>,
+  pickedNames: Set<string>,
+  maxAdd: number,
+) {
+  const tableByPkColumn = new Map<string, { schema: string; name: string }[]>();
+  for (const table of cache.tables) {
+    for (const pk of table.pk || []) {
+      const owners = tableByPkColumn.get(pk.toLowerCase()) || [];
+      owners.push({ schema: table.schema, name: table.name });
+      tableByPkColumn.set(pk.toLowerCase(), owners);
+    }
+  }
+  let added = 0;
+  for (const key of seedKeys) {
+    const table = cache.tables.find((row) => fkKey(row.schema, row.name) === key);
+    if (!table) continue;
+    for (const col of table.columns) {
+      if (added >= maxAdd) return;
+      const colName = col.name.toLowerCase();
+      if (!colName.startsWith("id_")) continue;
+      for (const owner of tableByPkColumn.get(colName) || []) {
+        const target = fkKey(owner.schema, owner.name);
+        if (target === key || pickedNames.has(target)) continue;
+        if (!catalogMap.has(target)) continue;
+        pickedNames.add(target);
+        added += 1;
+        if (added >= maxAdd) return;
+      }
+    }
+  }
+}
+
+async function loadDatabaseSources(
+  client: SqlServerClient,
+  cfg: ConnectionConfig | undefined,
+  database: string,
+  steps: AiStep[],
+  dbStarted: number,
+) {
+  const schemaCache = cfg ? readSchemaCache(cfg, database) : null;
+  if (schemaCache && isSchemaCacheFresh(schemaCache)) {
+    step(steps, `cache-${database}`, `Cache · ${database}`, `${schemaCache.tables.length} cached table(s)`, dbStarted);
+    const catalogMap = new Map<string, CatalogEntry>();
+    const cacheTableMap = new Map<string, SchemaCacheTable>();
+    for (const table of schemaCache.tables) {
+      const key = fkKey(table.schema, table.name);
+      catalogMap.set(key, {
+        schema: table.schema,
+        name: table.name,
+        kind: table.kind,
+        row_count: table.row_count ?? null,
+        size_kb: table.size_kb ?? null,
+      });
+      cacheTableMap.set(key, table);
+    }
+    return {
+      catalogMap,
+      foreignKeys: schemaCache.foreign_keys as AiForeignKey[],
+      cacheFresh: true,
+      cacheTableMap,
+      schemaCache,
+    };
+  }
+
+  const catalog = await client.listObjects(database, true);
+  const catalogMap = new Map<string, CatalogEntry>();
+  for (const bucket of ["tables", "views"] as const) {
+    for (const item of (catalog.objects[bucket] || []) as {
+      schema?: string;
+      name?: string;
+      is_system?: boolean;
+      row_count?: number | null;
+      size_kb?: number | null;
+    }[]) {
+      if (item.is_system) continue;
+      const schema = String(item.schema || "dbo");
+      const name = String(item.name || "");
+      if (!name) continue;
+      catalogMap.set(fkKey(schema, name), {
+        schema,
+        name,
+        kind: bucket === "tables" ? "table" : "view",
+        row_count: item.row_count ?? null,
+        size_kb: item.size_kb ?? null,
+      });
+    }
+  }
+
+  let foreignKeys: AiForeignKey[] = [];
+  try {
+    const fkRows = await client.listForeignKeys(database);
+    const grouped = new Map<string, AiForeignKey>();
+    for (const row of fkRows) {
+      const fromSchema = String(row.from_schema || "dbo");
+      const fromTable = String(row.from_table || "");
+      const toSchema = String(row.to_schema || "dbo");
+      const toTable = String(row.to_table || "");
+      const fromColumn = String(row.from_column || "");
+      if (!fromTable || !toTable || !fromColumn) continue;
+      const from = `${fromSchema}.${fromTable}`;
+      const to = `${toSchema}.${toTable}`;
+      const key = `${from}->${to}:${String(row.constraint_name || "")}`;
+      const hit = grouped.get(key) || {
+        from,
+        to,
+        columns: [],
+        constraint: String(row.constraint_name || ""),
+      };
+      hit.columns.push(`${fromColumn}->${String(row.to_column || "")}`);
+      grouped.set(key, hit);
+    }
+    foreignKeys = [...grouped.values()];
+  } catch {
+    foreignKeys = [];
+  }
+
+  return {
+    catalogMap,
+    foreignKeys,
+    cacheFresh: false,
+    cacheTableMap: new Map<string, SchemaCacheTable>(),
+    schemaCache: null as SchemaCacheEntry | null,
+    liveCatalog: catalog,
+  };
+}
+
+export async function gatherContext(client: SqlServerClient, ask: AiAsk, cfg?: ConnectionConfig) {
   const steps: AiStep[] = [];
   const started = Date.now();
   const message = String(ask.message || "");
@@ -229,11 +540,18 @@ export async function gatherContext(client: SqlServerClient, ask: AiAsk) {
   }
   databases = databases.slice(0, 8);
 
-  const pinned = mergePinnedTables(ask, databases) || [];
-  const joinMode = wantsJoin(message, pinned.length);
-  const wanted = new Set(pinned.map((item) => `${item.database || ""}|${item.schema}|${item.name}`.toLowerCase()));
+  const focus = mergeFocusTables(ask, databases);
+  const wanted = new Set(focus.map((item) => `${item.database || ""}|${item.schema}|${item.name}`.toLowerCase()));
+  const exploreMode = wantsSchemaExplore(message, ask.history);
+  const joinMode = wantsJoin(message, wanted.size) || exploreMode || wanted.size > 1;
 
-  step(steps, "scope", "Scope", `${databases.length} database(s): ${databases.join(", ")}`, started);
+  step(
+    steps,
+    "scope",
+    "Scope",
+    `${databases.length} database(s): ${databases.join(", ")} · focus ${wanted.size} · ${exploreMode ? "explore" : joinMode ? "join" : "lookup"}`,
+    started,
+  );
 
   const context: AiContextDb[] = [];
   let sampleBudget = ask.includeSamples === false ? 0 : 12;
@@ -241,26 +559,9 @@ export async function gatherContext(client: SqlServerClient, ask: AiAsk) {
 
   for (const database of databases) {
     const dbStarted = Date.now();
-    const catalog = await client.listObjects(database, true);
-    const metrics = new Map<string, { row_count?: number | null; size_kb?: number | null }>();
-    for (const bucket of ["tables", "views"] as const) {
-      for (const item of (catalog.objects[bucket] || []) as {
-        schema?: string;
-        name?: string;
-        is_system?: boolean;
-        row_count?: number | null;
-        size_kb?: number | null;
-      }[]) {
-        if (item.is_system) continue;
-        const schema = String(item.schema || "dbo");
-        const name = String(item.name || "");
-        if (!name) continue;
-        metrics.set(fkKey(schema, name), {
-          row_count: item.row_count ?? null,
-          size_kb: item.size_kb ?? null,
-        });
-      }
-    }
+    const sources = await loadDatabaseSources(client, cfg, database, steps, dbStarted);
+    const { catalogMap, foreignKeys, cacheFresh, cacheTableMap, schemaCache } = sources;
+    const liveCatalog = "liveCatalog" in sources ? sources.liveCatalog : null;
 
     const candidates: {
       schema: string;
@@ -271,69 +572,94 @@ export async function gatherContext(client: SqlServerClient, ask: AiAsk) {
       score: number;
       wanted: boolean;
     }[] = [];
-    const push = (items: { schema?: string; name?: string; is_system?: boolean }[], kind: string) => {
-      for (const item of items || []) {
-        if (item.is_system) continue;
-        const schema = String(item.schema || "dbo");
-        const name = String(item.name || "");
-        if (!name) continue;
+
+    if (cacheFresh) {
+      for (const entry of catalogMap.values()) {
         const isWanted =
-          wanted.has(`${database}|${schema}|${name}`.toLowerCase()) ||
-          wanted.has(`|${schema}|${name}`.toLowerCase());
-        if (wanted.size && !isWanted) continue;
-        const stat = metrics.get(fkKey(schema, name));
+          wanted.has(`${database}|${entry.schema}|${entry.name}`.toLowerCase()) ||
+          wanted.has(`|${entry.schema}|${entry.name}`.toLowerCase());
+        if (wanted.size && !exploreMode && !isWanted) continue;
         candidates.push({
-          schema,
-          name,
-          kind,
-          row_count: stat?.row_count ?? null,
-          size_kb: stat?.size_kb ?? null,
-          score: scoreObject(database, schema, name, kind, stat?.row_count, message, joinMode),
+          ...entry,
+          score:
+            scoreObject(database, entry.schema, entry.name, entry.kind, entry.row_count, message, joinMode) +
+            (isWanted ? 100 : 0),
           wanted: isWanted,
         });
       }
-    };
-    push((catalog.objects.tables || []) as { schema?: string; name?: string; is_system?: boolean }[], "table");
-    push((catalog.objects.views || []) as { schema?: string; name?: string; is_system?: boolean }[], "view");
-
-    let foreignKeys: AiForeignKey[] = [];
-    try {
-      const fkRows = await client.listForeignKeys(database);
-      const grouped = new Map<string, AiForeignKey>();
-      for (const row of fkRows) {
-        const fromSchema = String(row.from_schema || "dbo");
-        const fromTable = String(row.from_table || "");
-        const toSchema = String(row.to_schema || "dbo");
-        const toTable = String(row.to_table || "");
-        const fromColumn = String(row.from_column || "");
-        if (!fromTable || !toTable || !fromColumn) continue;
-        const from = `${fromSchema}.${fromTable}`;
-        const to = `${toSchema}.${toTable}`;
-        const key = `${from}->${to}:${String(row.constraint_name || "")}`;
-        const hit = grouped.get(key) || {
-          from,
-          to,
-          columns: [],
-          constraint: String(row.constraint_name || ""),
-        };
-        hit.columns.push(`${fromColumn}->${String(row.to_column || "")}`);
-        grouped.set(key, hit);
-      }
-      foreignKeys = [...grouped.values()].slice(0, 80);
-    } catch {
-      foreignKeys = [];
+    } else {
+      const push = (items: { schema?: string; name?: string; is_system?: boolean }[], kind: string) => {
+        for (const item of items || []) {
+          if (item.is_system) continue;
+          const schema = String(item.schema || "dbo");
+          const name = String(item.name || "");
+          if (!name) continue;
+          const isWanted =
+            wanted.has(`${database}|${schema}|${name}`.toLowerCase()) ||
+            wanted.has(`|${schema}|${name}`.toLowerCase());
+          if (wanted.size && !exploreMode && !isWanted) continue;
+          const stat = catalogMap.get(fkKey(schema, name));
+          candidates.push({
+            schema,
+            name,
+            kind,
+            row_count: stat?.row_count ?? null,
+            size_kb: stat?.size_kb ?? null,
+            score: scoreObject(database, schema, name, kind, stat?.row_count, message, joinMode) + (isWanted ? 100 : 0),
+            wanted: isWanted,
+          });
+        }
+      };
+      push((liveCatalog!.objects.tables || []) as { schema?: string; name?: string; is_system?: boolean }[], "table");
+      push((liveCatalog!.objects.views || []) as { schema?: string; name?: string; is_system?: boolean }[], "view");
     }
 
-    const pickedNames = new Set<string>();
-    const limit = wanted.size ? 40 : joinMode ? 30 : 25;
+    const fkLimit = cacheFresh ? foreignKeys.length : exploreMode ? 200 : 80;
+    const trimmedForeignKeys = foreignKeys.slice(0, fkLimit);
+
     const ranked = [...candidates].sort((a, b) => b.score - a.score);
+    const pickedNames = new Set<string>();
     for (const item of ranked) {
-      if (pickedNames.size >= limit) break;
+      if (!item.wanted) continue;
       pickedNames.add(fkKey(item.schema, item.name));
     }
-    if (joinMode) {
-      for (const fk of foreignKeys) {
-        if (pickedNames.size >= limit) break;
+    if (!pickedNames.size && focus.length) {
+      for (const item of focus) {
+        if ((item.database || database).toLowerCase() !== database.toLowerCase()) continue;
+        pickedNames.add(fkKey(item.schema, item.name));
+      }
+    }
+
+    const rootKeys = new Set<string>();
+    for (const key of pickedNames) rootKeys.add(key);
+    if (!rootKeys.size && exploreMode) {
+      for (const item of ranked.slice(0, 12)) rootKeys.add(fkKey(item.schema, item.name));
+    }
+    if (joinMode || exploreMode) {
+      const expanded = expandFkNeighbors(
+        rootKeys,
+        trimmedForeignKeys,
+        exploreMode ? 4 : 2,
+        cacheFresh ? 150 : exploreMode ? 55 : 35,
+      );
+      for (const key of expanded) pickedNames.add(key);
+    }
+    if (exploreMode || (joinMode && rootKeys.size)) {
+      if (cacheFresh && schemaCache) {
+        expandByIdColumnsFromCache(
+          schemaCache,
+          rootKeys,
+          catalogMap,
+          pickedNames,
+          exploreMode ? 80 : 40,
+        );
+      } else {
+        await expandByIdColumns(client, database, rootKeys, catalogMap, pickedNames, exploreMode ? 40 : 24);
+      }
+    }
+    if (exploreMode) {
+      for (const fk of trimmedForeignKeys) {
+        if (pickedNames.size >= (cacheFresh ? 150 : 55)) break;
         for (const part of [fk.from, fk.to]) {
           const [schema, name] = part.split(".");
           if (schema && name) pickedNames.add(fkKey(schema, name));
@@ -341,19 +667,72 @@ export async function gatherContext(client: SqlServerClient, ask: AiAsk) {
       }
     }
 
+    const limit = cacheFresh
+      ? exploreMode
+        ? Math.min(150, catalogMap.size)
+        : wanted.size
+          ? 80
+          : 60
+      : exploreMode
+        ? 55
+        : wanted.size
+          ? 40
+          : joinMode
+            ? 30
+            : 25;
+    if (pickedNames.size < limit) {
+      for (const item of ranked) {
+        if (pickedNames.size >= limit) break;
+        pickedNames.add(fkKey(item.schema, item.name));
+      }
+    }
+
+    const resolveCandidate = (key: string) => {
+      const rankedHit = ranked.find((row) => fkKey(row.schema, row.name) === key);
+      if (rankedHit) return rankedHit;
+      const cat = catalogMap.get(key);
+      if (!cat) return null;
+      return {
+        ...cat,
+        score: 0,
+        wanted: wanted.has(`${database}|${cat.schema}|${cat.name}`.toLowerCase()),
+      };
+    };
+
     step(
       steps,
       `catalog-${database}`,
       `Catalog · ${database}`,
-      `${candidates.length} candidate object(s), ${foreignKeys.length} FK(s), sending ${pickedNames.size}`,
+      `${candidates.length} candidate object(s), ${trimmedForeignKeys.length} FK(s), sending ${pickedNames.size}${cacheFresh ? " · cache" : ""}`,
       dbStarted,
     );
 
     const objects: AiContextObject[] = [];
     const colStarted = Date.now();
     for (const key of pickedNames) {
-      const item = ranked.find((row) => fkKey(row.schema, row.name) === key);
+      const item = resolveCandidate(key);
       if (!item) continue;
+      const cached = cacheTableMap.get(key);
+      if (cacheFresh && cached) {
+        objects.push({
+          database,
+          schema: cached.schema,
+          name: cached.name,
+          kind: cached.kind,
+          row_count: cached.row_count,
+          size_kb: cached.size_kb,
+          pk: cached.pk,
+          columns: cached.columns.slice(0, 48).map((col) => ({
+            name: col.name,
+            type: col.type,
+            nullable: col.nullable,
+          })),
+          sample: cached.sample,
+          reason: reasonFor(item.score, item.wanted, joinMode),
+        });
+        if (cached.sample?.rows?.length) sampleUsed += 1;
+        continue;
+      }
       let columns: AiColumn[] = [];
       try {
         const cols = await client.listColumns(database, item.schema, item.name);
@@ -396,24 +775,28 @@ export async function gatherContext(client: SqlServerClient, ask: AiAsk) {
         reason: reasonFor(item.score, item.wanted, joinMode),
       });
     }
+    const inferredLinks = inferColumnLinks(objects);
     step(
       steps,
       `columns-${database}`,
       `Columns · ${database}`,
-      `${objects.length} object(s), ${sampleUsed} sample(s) so far`,
+      `${objects.length} object(s), ${sampleUsed} sample(s), ${inferredLinks.length} inferred link(s)`,
       colStarted,
     );
 
     context.push({
       database,
       object_count: objects.length,
-      fk_count: foreignKeys.length,
+      fk_count: trimmedForeignKeys.length,
       objects,
-      foreign_keys: foreignKeys.filter((fk) => {
-        const from = fk.from.split(".")[1];
-        const to = fk.to.split(".")[1];
-        return objects.some((obj) => obj.name === from) || objects.some((obj) => obj.name === to) || joinMode;
-      }),
+      foreign_keys: exploreMode
+        ? trimmedForeignKeys
+        : trimmedForeignKeys.filter((fk) => {
+            const from = fk.from.split(".")[1];
+            const to = fk.to.split(".")[1];
+            return objects.some((obj) => obj.name === from) || objects.some((obj) => obj.name === to) || joinMode;
+          }),
+      inferred_links: inferredLinks,
     });
   }
 
@@ -424,7 +807,7 @@ export async function gatherContext(client: SqlServerClient, ask: AiAsk) {
   return { context, steps };
 }
 
-export async function listCatalogIndex(client: SqlServerClient, databases?: string[]) {
+export async function listCatalogIndex(client: SqlServerClient, databases?: string[], cfg?: ConnectionConfig) {
   let dbs = (databases || []).map((name) => String(name || "").trim()).filter(Boolean);
   if (!dbs.length) {
     const all = await client.listDatabases();
@@ -435,6 +818,11 @@ export async function listCatalogIndex(client: SqlServerClient, databases?: stri
   dbs = dbs.slice(0, 8);
   const catalog: AiCatalogItem[] = [];
   for (const database of dbs) {
+    const cached = cfg ? readSchemaCache(cfg, database) : null;
+    if (cached && isSchemaCacheFresh(cached)) {
+      catalog.push(...cacheCatalogItems(cached));
+      continue;
+    }
     const listed = await client.listObjects(database, true);
     for (const bucket of ["tables", "views"] as const) {
       const kind = bucket === "tables" ? "table" : "view";
@@ -460,11 +848,11 @@ export async function listCatalogIndex(client: SqlServerClient, databases?: stri
   return catalog;
 }
 
-export async function previewAiContext(client: SqlServerClient, ask: AiAsk) {
+export async function previewAiContext(client: SqlServerClient, ask: AiAsk, cfg?: ConnectionConfig) {
   const databases = (ask.databases || []).map((name) => String(name || "").trim()).filter(Boolean).slice(0, 8);
   const [catalog, gathered] = await Promise.all([
-    listCatalogIndex(client, databases),
-    gatherContext(client, ask),
+    listCatalogIndex(client, databases, cfg),
+    gatherContext(client, ask, cfg),
   ]);
   return { ...gathered, catalog };
 }
@@ -477,8 +865,17 @@ function compactContextText(context: AiContextDb[]) {
       chunks.push(
         "Foreign keys:\n" +
           db.foreign_keys
-            .slice(0, 40)
+            .slice(0, 100)
             .map((fk) => `- ${fk.from} -> ${fk.to} (${fk.columns.join(", ")})`)
+            .join("\n"),
+      );
+    }
+    if (db.inferred_links?.length) {
+      chunks.push(
+        "Inferred links (id_* column matches another table PK — verify in DB):\n" +
+          db.inferred_links
+            .slice(0, 60)
+            .map((link) => `- ${link.from} -> ${link.to} (${link.columns.join(", ")})`)
             .join("\n"),
       );
     }
@@ -607,11 +1004,13 @@ function userPrompt(ask: AiAsk, context: AiContextDb[]) {
   const task =
     mode === "analyze"
       ? "Analyze the SQL the user pasted against the catalog. Explain it, flag mismatches, and improve it if needed."
-      : "Write accurate T-SQL that answers the user request, including JOINs when multiple tables are involved. Return one complete statement in sql[0].";
+      : wantsSchemaExplore(String(ask.message || ""), ask.history)
+        ? "Map relationships from the focus tables and catalog. Explain FK/inferred links in notes, then write SQL that joins lookup tables for school, program, mentor, etc. Do NOT pick an unrelated table."
+        : "Write accurate T-SQL that answers the user request, including JOINs when multiple tables are involved. Return one complete statement in sql[0].";
   return [
     `Mode: ${mode}`,
     `Task: ${task}`,
-    ask.message ? `User request: ${ask.message}` : "",
+    ask.message ? `Latest user request: ${ask.message}` : "",
     ask.sql ? `SQL to analyze:\n${ask.sql}` : "",
     compactContextText(context),
   ]
@@ -619,7 +1018,7 @@ function userPrompt(ask: AiAsk, context: AiContextDb[]) {
     .join("\n\n");
 }
 
-export async function askAi(client: SqlServerClient, ask: AiAsk) {
+export async function askAi(client: SqlServerClient, ask: AiAsk, cfg?: ConnectionConfig) {
   const mode = ask.mode || "query";
   if (mode === "analyze") {
     if (!(ask.sql || "").trim()) throw new ClientError("Paste SQL to analyze.");
@@ -627,7 +1026,7 @@ export async function askAi(client: SqlServerClient, ask: AiAsk) {
     throw new ClientError("Write what you want the AI to do.");
   }
 
-  const { context, steps } = await gatherContext(client, ask);
+  const { context, steps } = await gatherContext(client, ask, cfg);
   const tables = context.reduce((sum, db) => sum + db.objects.length, 0);
   if (!tables) {
     throw new ClientError("No tables found in the selected databases.");
@@ -635,13 +1034,20 @@ export async function askAi(client: SqlServerClient, ask: AiAsk) {
 
   const modelStarted = Date.now();
   const status = openaiStatus();
-  const content = await chatOpenAi(
-    [
-      { role: "system", content: SYSTEM },
-      { role: "user", content: userPrompt(ask, context) },
-    ],
-    { json: true, temperature: 0.1 },
-  );
+  const chatMessages: { role: "system" | "user" | "assistant"; content: string }[] = [
+    { role: "system", content: SYSTEM },
+  ];
+  for (const item of (ask.history || []).slice(-8)) {
+    const text = String(item.text || "").trim();
+    if (!text) continue;
+    const suffix = item.used_objects?.length ? `\n[objects: ${item.used_objects.join(", ")}]` : "";
+    chatMessages.push({
+      role: item.role === "user" ? "user" : "assistant",
+      content: text + suffix,
+    });
+  }
+  chatMessages.push({ role: "user", content: userPrompt(ask, context) });
+  const content = await chatOpenAi(chatMessages, { json: true, temperature: 0.1 });
   step(steps, "model", "OpenAI", status.model, modelStarted);
 
   const parsed = parseModelJson(content);

@@ -85,12 +85,20 @@ export type AiContextObject = {
   reason?: string
 }
 
+export type AiInferredLink = {
+  from: string
+  to: string
+  columns: string[]
+  source?: string
+}
+
 export type AiContextDb = {
   database: string
   object_count: number
   fk_count: number
   objects: AiContextObject[]
   foreign_keys: AiForeignKey[]
+  inferred_links?: AiInferredLink[]
 }
 
 export type AiCatalogItem = {
@@ -99,6 +107,20 @@ export type AiCatalogItem = {
   name: string
   kind: string
   row_count?: number | null
+}
+
+export type SchemaCacheStatus = {
+  database: string
+  ready: boolean
+  building: boolean
+  built_at?: string
+  age_sec?: number
+  tables: number
+  columns: number
+  samples: number
+  foreign_keys: number
+  progress?: number
+  error?: string | null
 }
 
 export type AiContextReply = {
@@ -345,4 +367,14 @@ export const api = {
     }),
   aiAsk: (body: Record<string, unknown>) =>
     request<AiReply>('/api/v1/ai/ask', { method: 'POST', body: JSON.stringify(body) }),
+  schemaCacheStatus: (body: { databases: string[] }) =>
+    request<{ caches: SchemaCacheStatus[] }>('/api/v1/schema/cache/status', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  schemaCacheBuild: (body: { databases: string[] }) =>
+    request<{ caches: SchemaCacheStatus[] }>('/api/v1/schema/cache/build', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
 }

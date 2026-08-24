@@ -5,8 +5,13 @@ import { ContextTree, SqlBlock } from '@/components/ai-context-tree'
 import { Button } from '@/components/ui/button'
 import { PasswordInput } from '@/components/ui/password-input'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { parseMentionTables } from '@/lib/ai-mentions'
-import { api, type AiStep, type DatabaseRow } from '@/lib/api'
+import { collectFocusTables, parseMentionTables } from '@/lib/ai-mentions'
+import {
+  api,
+  type AiStep,
+  type DatabaseRow,
+  type SchemaCacheStatus,
+} from '@/lib/api'
 import { localeTag, useLocale } from '@/lib/i18n'
 import {
   addChatSession,
@@ -114,6 +119,7 @@ export function AiView({
   const [key, setKey] = useState('')
   const [masked, setMasked] = useState('')
   const [configured, setConfigured] = useState(false)
+  const [cacheStatus, setCacheStatus] = useState<SchemaCacheStatus[]>([])
 
   const patchAi = onAiChange
   const session = getActiveSession(ai)
@@ -154,6 +160,36 @@ export function AiView({
     () => parseMentionTables(message, defaultDb),
     [message, defaultDb],
   )
+
+  const refreshCacheStatus = useCallback(() => {
+    if (!selected.length) {
+      setCacheStatus([])
+      return
+    }
+    void api
+      .schemaCacheStatus({ databases: selected })
+      .then((result) => setCacheStatus(result.caches))
+      .catch(() => setCacheStatus([]))
+  }, [selected])
+
+  useEffect(() => {
+    if (!active) return
+    refreshCacheStatus()
+  }, [active, selectedKey, connectionId, refreshCacheStatus])
+
+  useEffect(() => {
+    if (!active || !cacheStatus.some((row) => row.building)) return
+    const timer = window.setInterval(() => refreshCacheStatus(), 2000)
+    return () => window.clearInterval(timer)
+  }, [active, cacheStatus, refreshCacheStatus])
+
+  const buildSchemaCache = () => {
+    if (!selected.length) return
+    void api.schemaCacheBuild({ databases: selected }).then((result) => {
+      setCacheStatus(result.caches)
+      refreshCacheStatus()
+    })
+  }
 
   useEffect(() => {
     setBusy(false)
@@ -263,13 +299,19 @@ export function AiView({
       ],
     }))
     try {
+      const focusTables = collectFocusTables(items, prompt, defaultDb)
       const reply = await api.aiAsk({
         mode,
         message: prompt,
         databases: selected,
-        tables: mentionTables,
+        tables: focusTables.length ? focusTables : mentionTables,
         include_samples: samples,
         sql: mode === 'analyze' ? sql : undefined,
+        history: items.slice(-10).map((item) => ({
+          role: item.role,
+          text: item.text,
+          used_objects: item.used_objects,
+        })),
       })
       patchSession((current) => {
         const nextItems = [
@@ -413,6 +455,33 @@ export function AiView({
             />
             {t('ai.samples')}
           </label>
+          <div className="space-y-2 border-t border-border px-3 py-2">
+            <div className="font-mono text-[10px] tracking-widest text-muted-foreground">{t('ai.schemaCache')}</div>
+            <p className="font-mono text-[10px] text-muted-foreground">{t('ai.schemaCacheHint')}</p>
+            {selected.map((db) => {
+              const row = cacheStatus.find((item) => item.database === db)
+              return (
+                <div key={db} className="rounded border border-border bg-background/40 px-2 py-1.5 font-mono text-[10px]">
+                  <div className="truncate text-foreground">{db}</div>
+                  <div className="mt-0.5 text-muted-foreground">
+                    {row?.building
+                      ? t('ai.cacheBuilding', { n: row.progress || 0 })
+                      : row?.ready
+                        ? t('ai.cacheReady', {
+                            tables: row.tables,
+                            columns: row.columns,
+                            samples: row.samples,
+                          })
+                        : t('ai.cacheMissing')}
+                  </div>
+                  {row?.error ? <div className="mt-0.5 text-destructive">{row.error}</div> : null}
+                </div>
+              )
+            })}
+            <Button variant="outline" size="sm" className="w-full" disabled={!selected.length || busy} onClick={buildSchemaCache}>
+              {cacheStatus.some((row) => row.building) ? t('ai.cacheBuilding', { n: 0 }) : t('ai.buildCache')}
+            </Button>
+          </div>
           <div className="space-y-2 border-t border-border px-3 py-2">
             <div className="font-mono text-[10px] text-muted-foreground">{t('ai.key')}</div>
             <PasswordInput value={key} onChange={(e) => setKey(e.target.value)} placeholder={masked || 'sk-...'} />

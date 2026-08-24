@@ -526,6 +526,25 @@ ORDER BY c.ORDINAL_POSITION`,
     );
   }
 
+  async listAllColumns(database: string) {
+    const db = qident(assertDb(database));
+    return this.queryDicts(
+      `SELECT
+    c.TABLE_SCHEMA AS table_schema,
+    c.TABLE_NAME AS table_name,
+    c.COLUMN_NAME AS name,
+    c.DATA_TYPE AS data_type,
+    c.IS_NULLABLE AS is_nullable
+FROM ${db}.INFORMATION_SCHEMA.COLUMNS AS c
+JOIN ${db}.INFORMATION_SCHEMA.TABLES AS t
+  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME
+WHERE t.TABLE_TYPE IN ('BASE TABLE', 'VIEW')
+ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION`,
+      undefined,
+      200000,
+    );
+  }
+
   async listForeignKeys(database: string) {
     const db = qident(assertDb(database));
     return this.queryDicts(
@@ -549,6 +568,25 @@ WHERE po.is_ms_shipped = 0 AND ro.is_ms_shipped = 0
 ORDER BY ps.name, po.name, fkc.constraint_column_id`,
       undefined,
       5000,
+    );
+  }
+
+  async listPrimaryKeyIndex(database: string) {
+    const db = qident(assertDb(database));
+    return this.queryDicts(
+      `SELECT
+    s.name AS table_schema,
+    t.name AS table_name,
+    c.name AS column_name
+FROM ${db}.sys.indexes AS i
+JOIN ${db}.sys.tables AS t ON t.object_id = i.object_id
+JOIN ${db}.sys.schemas AS s ON s.schema_id = t.schema_id
+JOIN ${db}.sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+JOIN ${db}.sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE i.is_primary_key = 1 AND t.is_ms_shipped = 0
+ORDER BY s.name, t.name, ic.key_ordinal`,
+      undefined,
+      8000,
     );
   }
 

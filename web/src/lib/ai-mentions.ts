@@ -93,6 +93,44 @@ export function parseMentionTables(text: string, defaultDb: string): MentionTabl
   return tables
 }
 
+function parseObjectRef(ref: string, defaultDb: string): MentionTable | null {
+  const parts = ref
+    .split('.')
+    .map((part) => part.trim())
+    .filter(Boolean)
+  if (parts.length === 3) return { database: parts[0], schema: parts[1], name: parts[2] }
+  if (parts.length === 2 && defaultDb) return { database: defaultDb, schema: parts[0], name: parts[1] }
+  return null
+}
+
+export function collectFocusTables(
+  history: { role: string; text: string; used_objects?: string[] }[],
+  currentMessage: string,
+  defaultDb: string,
+): MentionTable[] {
+  const seen = new Set<string>()
+  const out: MentionTable[] = []
+  const push = (item: MentionTable) => {
+    const db = item.database || defaultDb
+    if (!db) return
+    const key = `${db}|${item.schema}|${item.name}`.toLowerCase()
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push({ database: db, schema: item.schema, name: item.name })
+  }
+  for (const item of history) {
+    if (item.role === 'user') {
+      for (const table of parseMentionTables(item.text, defaultDb)) push(table)
+    }
+    for (const ref of item.used_objects || []) {
+      const parsed = parseObjectRef(ref, defaultDb)
+      if (parsed) push(parsed)
+    }
+  }
+  for (const table of parseMentionTables(currentMessage, defaultDb)) push(table)
+  return out
+}
+
 export function mentionFilterAt(value: string, cursor: number) {
   const before = value.slice(0, cursor)
   const at = before.lastIndexOf('@')

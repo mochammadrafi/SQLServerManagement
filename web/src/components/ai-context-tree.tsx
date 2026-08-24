@@ -173,6 +173,18 @@ export function ContextTree({
                     </div>
                   </div>
                 ) : null}
+                {db.inferred_links?.length ? (
+                  <div>
+                    <div className="font-mono text-[9px] tracking-widest text-muted-foreground">{t('ai.inferredLinks')}</div>
+                    <div className="mt-1 max-h-28 space-y-1 overflow-auto font-mono text-[10px] text-muted-foreground">
+                      {db.inferred_links.slice(0, 16).map((link) => (
+                        <div key={`${link.from}-${link.to}-${link.columns.join(',')}`}>
+                          {link.from} → {link.to} ({link.columns.join(', ')})
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
                 {db.objects.map((obj) => {
                   const key = `${db.database}.${obj.schema}.${obj.name}`
                   return (

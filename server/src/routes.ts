@@ -34,6 +34,7 @@ import { existingStartDir, listFolders, pickFolder } from "./sql/fs.js";
 import { deleteProfile, getProfile, listProfiles, readPassword, upsertProfile } from "./sql/profiles.js";
 import { askAi, listCatalogIndex, previewAiContext } from "./sql/ai.js";
 import { openaiStatus, saveOpenAiKey } from "./sql/openai.js";
+import { listSchemaCacheStatuses, startSchemaCacheBuild } from "./sql/schema-cache.js";
 
 function body<T>(request: FastifyRequest): T {
   return (request.body || {}) as T;
@@ -310,28 +311,35 @@ export async function registerRoutes(app: FastifyInstance) {
   });
   app.post("/api/v1/ai/catalog", async (request) => {
     const client = await clientOf(request);
+    const cfg = needCfg(request);
     const payload = body<{ databases?: string[] }>(request);
-    return ok("Catalog ready", { catalog: await listCatalogIndex(client, payload.databases) });
+    return ok("Catalog ready", { catalog: await listCatalogIndex(client, payload.databases, cfg) });
   });
   app.post("/api/v1/ai/context", async (request) => {
     const client = await clientOf(request);
+    const cfg = needCfg(request);
     const payload = body<{
       message?: string;
       databases?: string[];
       tables?: { database?: string; schema: string; name: string }[];
       include_samples?: boolean;
     }>(request);
-    const result = await previewAiContext(client, {
-      message: payload.message,
-      databases: payload.databases,
-      tables: payload.tables,
-      includeSamples: payload.include_samples,
-      mode: "query",
-    });
+    const result = await previewAiContext(
+      client,
+      {
+        message: payload.message,
+        databases: payload.databases,
+        tables: payload.tables,
+        includeSamples: payload.include_samples,
+        mode: "query",
+      },
+      cfg,
+    );
     return ok("Context ready", result);
   });
   app.post("/api/v1/ai/ask", async (request) => {
     const client = await clientOf(request);
+    const cfg = needCfg(request);
     const payload = body<{
       mode?: "query" | "analyze";
       message?: string;
@@ -339,18 +347,37 @@ export async function registerRoutes(app: FastifyInstance) {
       tables?: { database?: string; schema: string; name: string }[];
       include_samples?: boolean;
       sql?: string;
+      history?: { role: "user" | "ai"; text?: string; used_objects?: string[] }[];
     }>(request);
     return ok(
       "AI ready",
-      await askAi(client, {
-        mode: payload.mode,
-        message: payload.message,
-        databases: payload.databases,
-        tables: payload.tables,
-        includeSamples: payload.include_samples,
-        sql: payload.sql,
-      }),
+      await askAi(
+        client,
+        {
+          mode: payload.mode,
+          message: payload.message,
+          databases: payload.databases,
+          tables: payload.tables,
+          includeSamples: payload.include_samples,
+          sql: payload.sql,
+          history: payload.history,
+        },
+        cfg,
+      ),
     );
+  });
+  app.post("/api/v1/schema/cache/status", async (request) => {
+    const cfg = needCfg(request);
+    const payload = body<{ databases?: string[] }>(request);
+    const databases = (payload.databases || []).map((name) => String(name || "").trim()).filter(Boolean);
+    return ok("Schema cache status", { caches: listSchemaCacheStatuses(cfg, databases) });
+  });
+  app.post("/api/v1/schema/cache/build", async (request) => {
+    const client = await clientOf(request);
+    const cfg = needCfg(request);
+    const payload = body<{ databases?: string[] }>(request);
+    const databases = (payload.databases || []).map((name) => String(name || "").trim()).filter(Boolean);
+    return ok("Schema cache build started", { caches: startSchemaCacheBuild(cfg, client, databases) });
   });
 }
 
