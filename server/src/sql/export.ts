@@ -755,29 +755,48 @@ async function runExport(job: Job) {
   }
 }
 
-function register(sid: string, job: Job) {
-  const active = [...JOBS.values()].filter((item) => item.sid === sid && ["queued", "running", "paused"].includes(item.status));
-  if (active.length >= settings.maxJobs) {
-    throw new ClientError("Too many concurrent jobs.");
+function isActiveStatus(status: JobStatus) {
+  return ["queued", "running", "paused", "cancelling"].includes(status);
+}
+
+function activeJobs(sid: string, exceptId?: string) {
+  return [...JOBS.values()].filter((item) => item.sid === sid && item.id !== exceptId && isActiveStatus(item.status));
+}
+
+function jobWorkerCost(job: Pick<Job, "kind" | "workers">) {
+  return job.kind === "backup" ? 1 : Math.max(1, job.workers);
+}
+
+function usedWorkers(sid: string, exceptId?: string) {
+  return activeJobs(sid, exceptId).reduce((sum, job) => sum + jobWorkerCost(job), 0);
+}
+
+function takeWorkers(sid: string, wanted: number, exceptId?: string) {
+  const remaining = settings.maxWorkers - usedWorkers(sid, exceptId);
+  if (remaining < 1) {
+    throw new ClientError(
+      "Export worker limit reached.",
+      `At most ${settings.maxWorkers} workers can run at once. Pause or cancel a job, then start another.`,
+    );
   }
+  return Math.min(Math.max(1, wanted), remaining);
+}
+
+function assertCanStart(sid: string, exceptId?: string) {
+  if (activeJobs(sid, exceptId).length >= settings.maxJobs) {
+    throw new ClientError(
+      "Too many concurrent jobs.",
+      `At most ${settings.maxJobs} export jobs can run at once. Pause or cancel one first.`,
+    );
+  }
+}
+
+function register(sid: string, job: Job) {
+  assertCanStart(sid);
+  job.workers = takeWorkers(sid, job.workers);
   JOBS.set(job.id, job);
   void runExport(job);
   return job;
-}
-
-function assertNoActiveExport(sid: string, exceptId?: string) {
-  const active = [...JOBS.values()].filter(
-    (item) =>
-      item.sid === sid &&
-      item.id !== exceptId &&
-      ["queued", "running", "paused", "cancelling"].includes(item.status),
-  );
-  if (active.length) {
-    throw new ClientError(
-      "Another export job is still running.",
-      "Wait for it to finish or cancel it first.",
-    );
-  }
 }
 
 export async function startExport(
@@ -798,7 +817,6 @@ export async function startExport(
     file_name?: string;
   },
 ) {
-  assertNoActiveExport(sid);
   const where = validateWhere(body.where);
   const chunks = normalizeChunks(Number(body.chunk_rows || 0), Number(body.chunk_bytes || 0));
   const probe = await connectClient(cfg);
@@ -869,7 +887,6 @@ export async function startDatabaseExport(
     file_name?: string;
   },
 ) {
-  assertNoActiveExport(sid);
   const chunks = normalizeChunks(Number(body.chunk_rows || 0), Number(body.chunk_bytes || 0));
   const probe = await connectClient(cfg);
   try {
@@ -934,7 +951,6 @@ export async function startBackup(
   cfg: ConnectionConfig,
   body: { database: string; folder?: string; compress?: boolean; chunk_bytes?: number },
 ) {
-  assertNoActiveExport(sid);
   const database = String(body.database || "").trim();
   if (!database) throw new ClientError("Select a database for backup.");
   const chunks = normalizeChunks(0, Number(body.chunk_bytes || 0));
@@ -1020,7 +1036,7 @@ export function pauseJob(sid: string, id: string) {
 
 export function resumeJob(sid: string, id: string, cfg?: ConnectionConfig) {
   if (!cfg) throw new ClientError("Not connected to SQL Server.", "Reconnect and try again.");
-  assertNoActiveExport(sid, id);
+  assertCanStart(sid, id);
 
   let job = JOBS.get(id);
   if (!job || job.sid !== sid) {
@@ -1035,6 +1051,7 @@ export function resumeJob(sid: string, id: string, cfg?: ConnectionConfig) {
 
   if (!canResumeStatus(job.status)) throw new ClientError("Job cannot be resumed.");
 
+  job.workers = takeWorkers(sid, job.workers, job.id);
   job.pause = false;
   job.cancel = false;
   job.error = null;
