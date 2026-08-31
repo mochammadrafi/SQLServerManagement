@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Fastify from "fastify";
@@ -7,11 +7,31 @@ import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
 import session from "@fastify/session";
 import fastifyStatic from "@fastify/static";
-import { settings } from "./config.js";
+import { STORE_DIR, settings } from "./config.js";
 import { ClientError } from "./errors.js";
 import { fail, ok } from "./responses.js";
 import { registerRoutes } from "./routes.js";
 import { loadMsnodesqlv8, pickOdbcDrivers } from "./sql/odbc.js";
+
+function logFatal(kind: string, err: unknown) {
+  const text = err instanceof Error ? err.stack || err.message : String(err);
+  const line = `${new Date().toISOString()} ${kind} ${text}\n`;
+  console.error(line.trim());
+  try {
+    mkdirSync(STORE_DIR, { recursive: true });
+    appendFileSync(join(STORE_DIR, "server.log"), line);
+  } catch {
+    /* ignore disk errors */
+  }
+}
+
+process.on("unhandledRejection", (err) => {
+  logFatal("unhandledRejection", err);
+});
+process.on("uncaughtException", (err) => {
+  logFatal("uncaughtException", err);
+  process.exit(1);
+});
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const webDist = join(root, "web", "dist");

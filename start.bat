@@ -35,6 +35,15 @@ if not exist "web\dist" (
   call npm run build -w web
 )
 
+if not exist "%USERPROFILE%\.sqlsm" mkdir "%USERPROFILE%\.sqlsm"
 start "" "http://127.0.0.1:8000"
+
+:run
+echo [%DATE% %TIME%] starting SQLSM
 call npm start
-if errorlevel 1 pause
+set EXITCODE=%ERRORLEVEL%
+echo [%DATE% %TIME%] SQLSM exited with code %EXITCODE%
+>> "%USERPROFILE%\.sqlsm\server.log" echo [%DATE% %TIME%] npm start exited %EXITCODE%
+echo Restarting in 5 seconds. Close this window or press Ctrl+C to stop.
+ping -n 6 127.0.0.1 >nul
+goto run

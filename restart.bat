@@ -46,7 +46,16 @@ if errorlevel 1 (
   exit /b 1
 )
 
+if not exist "%USERPROFILE%\.sqlsm" mkdir "%USERPROFILE%\.sqlsm"
 echo Starting...
 start "" "http://127.0.0.1:%PORT%"
+
+:run
+echo [%DATE% %TIME%] starting SQLSM
 call npm start
-if errorlevel 1 pause
+set EXITCODE=%ERRORLEVEL%
+echo [%DATE% %TIME%] SQLSM exited with code %EXITCODE%
+>> "%USERPROFILE%\.sqlsm\server.log" echo [%DATE% %TIME%] npm start exited %EXITCODE%
+echo Restarting in 5 seconds. Close this window or press Ctrl+C to stop.
+ping -n 6 127.0.0.1 >nul
+goto run
