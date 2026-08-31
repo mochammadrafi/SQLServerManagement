@@ -1,4 +1,5 @@
-import { createWriteStream, mkdirSync, existsSync, writeFileSync, readdirSync, readFileSync, chmodSync } from "node:fs";
+import { createWriteStream, mkdirSync, existsSync, writeFileSync, readdirSync, readFileSync, chmodSync, statSync } from "node:fs";
+import { once } from "node:events";
 import { createGzip } from "node:zlib";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -121,8 +122,10 @@ type JobSnapshot = {
 
 const JOBS = new Map<string, Job>();
 const PERSISTED = new Map<string, JobSnapshot>();
+const ACTIVE_RUNS = new Set<string>();
 const JOB_STORE_DIR = join(STORE_DIR, "export-jobs");
 const CHECKPOINT_ROWS = 500;
+const PART_FILE = /_part-\d+\.csv(\.gz)?$/i;
 
 function createJobLock() {
   let tail = Promise.resolve();
@@ -140,16 +143,95 @@ function createJobLock() {
 
 type JobLock = ReturnType<typeof createJobLock>;
 
-function nextPartIndex(job: Job, prefix: string) {
+function partNumber(name: string, prefix: string) {
   const base = safeName(prefix);
+  const marker = `${base}_part-`;
+  if (!name.startsWith(marker)) return 0;
+  const num = Number.parseInt(name.slice(marker.length).split(".")[0] || "", 10);
+  return Number.isFinite(num) ? num : 0;
+}
+
+function nextPartIndex(job: Job, prefix: string, scanDisk = false) {
   let max = 0;
   for (const part of job.parts) {
-    if (!part.name.startsWith(`${base}_part-`)) continue;
-    const tail = part.name.slice(`${base}_part-`.length);
-    const num = Number.parseInt(tail.split(".")[0] || "", 10);
-    if (Number.isFinite(num)) max = Math.max(max, num);
+    max = Math.max(max, partNumber(part.name, prefix));
+  }
+  if (scanDisk) {
+    try {
+      for (const name of readdirSync(job.folder)) {
+        max = Math.max(max, partNumber(name, prefix));
+      }
+    } catch {
+      /* folder missing */
+    }
   }
   return max + 1;
+}
+
+function adoptFolderParts(parts: Job["parts"], folder: string) {
+  const known = new Set(parts.map((part) => part.name));
+  let added = false;
+  try {
+    for (const name of readdirSync(folder)) {
+      if (known.has(name) || !PART_FILE.test(name)) continue;
+      const path = join(folder, name);
+      if (!existsSync(path)) continue;
+      let bytes = 0;
+      try {
+        bytes = statSync(path).size;
+      } catch {
+        continue;
+      }
+      parts.push({ name, rows: 0, bytes, path });
+      known.add(name);
+      added = true;
+    }
+  } catch {
+    /* folder missing */
+  }
+  if (added) parts.sort((a, b) => a.name.localeCompare(b.name));
+  return added;
+}
+
+function endPartStreams(
+  gzip: ReturnType<typeof createGzip> | null,
+  file: ReturnType<typeof createWriteStream>,
+) {
+  return new Promise<void>((resolve, reject) => {
+    if (file.destroyed || file.writableEnded) {
+      resolve();
+      return;
+    }
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+    file.once("error", fail);
+    file.once("finish", finish);
+    if (gzip) {
+      gzip.once("error", fail);
+      gzip.end();
+    } else {
+      file.end();
+    }
+  });
+}
+
+async function writeStream(stream: NodeJS.WritableStream, data: string) {
+  if (stream.write(data)) return;
+  await Promise.race([
+    once(stream, "drain"),
+    once(stream, "error").then((args) => {
+      throw args[0];
+    }),
+  ]);
 }
 
 function migrateLegacyTableKeys(job: Job) {
@@ -223,6 +305,7 @@ function canResumeStatus(status: JobStatus) {
 }
 
 function publicJobFromSnapshot(snap: JobSnapshot): JobPublic {
+  adoptFolderParts(snap.parts, snap.folder);
   const folder = snap.folder.replace(/[\\/]+$/, "");
   return {
     id: snap.id,
@@ -327,6 +410,7 @@ function hydrateJob(snap: JobSnapshot, cfg: ConnectionConfig): Job {
     backupFiles: snap.backupFiles ? [...snap.backupFiles] : undefined,
   };
   migrateLegacyTableKeys(job);
+  adoptFolderParts(job.parts, job.folder);
   return job;
 }
 
@@ -373,6 +457,7 @@ function findJob(sid: string, id: string) {
 }
 
 function publicJobLive(job: Job): JobPublic {
+  adoptFolderParts(job.parts, job.folder);
   const folder = job.folder.replace(/[\\/]+$/, "");
   return {
     id: job.id,
@@ -453,8 +538,13 @@ export function jobPartPath(sid: string, id: string, name: string) {
   const hit = findJob(sid, id);
   const parts = hit.live?.parts || hit.snap?.parts || [];
   const part = parts.find((item) => item.name === name);
-  if (!part || !existsSync(part.path)) throw new ClientError("Export file not found.");
-  return part.path;
+  if (part && existsSync(part.path)) return part.path;
+  const folder = hit.live?.folder || hit.snap?.folder;
+  if (folder && PART_FILE.test(name) && !/[\\/]/.test(name)) {
+    const fallback = join(folder, name);
+    if (existsSync(fallback)) return fallback;
+  }
+  throw new ClientError("Export file not found.");
 }
 
 function waitIfPaused(job: Job) {
@@ -485,9 +575,12 @@ async function writeCsvPart(
   const tableEntry = opts.tableEntry;
   const orderKeys = opts.orderKeys;
   let lastKey = opts.startKey ?? null;
+  const scanDisk = Boolean(opts.startKey) || job.parts.length > 0;
+  if (lock) await lock.run(() => adoptFolderParts(job.parts, job.folder));
+  else adoptFolderParts(job.parts, job.folder);
   let partIndex = lock
-    ? await lock.run(() => nextPartIndex(job, prefix))
-    : nextPartIndex(job, prefix);
+    ? await lock.run(() => nextPartIndex(job, prefix, scanDisk))
+    : nextPartIndex(job, prefix, scanDisk);
   let rowsInPart = 0;
   let bytesInPart = 0;
   let rowsSinceCheckpoint = 0;
@@ -507,21 +600,37 @@ async function writeCsvPart(
     return { name, path, file, gzip, target };
   };
   let current = openPart();
+  let finalized = false;
   const pushPart = async () => {
     const part = { name: current.name, rows: rowsInPart, bytes: bytesInPart, path: current.path };
-    if (lock) {
-      await lock.run(() => {
+    const apply = () => {
+      const existing = job.parts.find((item) => item.name === part.name);
+      if (existing) {
+        existing.rows = part.rows;
+        existing.bytes = part.bytes;
+        existing.path = part.path;
+      } else {
         job.parts.push(part);
-      });
-    } else {
-      job.parts.push(part);
+      }
+    };
+    if (lock) await lock.run(apply);
+    else apply();
+  };
+  const finalizeCurrent = async () => {
+    if (finalized) return;
+    finalized = true;
+    try {
+      await endPartStreams(current.gzip, current.file);
+    } catch {
+      /* still register the file so it does not vanish from the job */
     }
+    if (rowsInPart || !job.parts.length) await pushPart();
   };
   const rotate = async () => {
-    current.target.end();
-    await pushPart();
+    await finalizeCurrent();
     partIndex += 1;
     current = openPart();
+    finalized = false;
   };
   const checkpoint = async (force = false) => {
     if (!force && rowsSinceCheckpoint < CHECKPOINT_ROWS) return;
@@ -540,57 +649,62 @@ async function writeCsvPart(
     if (lock) await lock.run(flush);
     else flush();
   };
-  for await (const batch of client.iterTableRows(job.database, schema, table, columns, {
-    where: job.where,
-    orderKeys,
-    nolock: job.nolock,
-    batchSize: job.batchSize,
-    after: lastKey,
-    shouldStop: () => job.cancel || job.skip.has(`${schema}\0${table}`),
-  })) {
-    await waitIfPaused(job);
-    if (job.cancel || job.skip.has(`${schema}\0${table}`)) break;
-    for (const row of batch) {
-      const line = `${row.map((value) => {
-        const text = String(csvValue(value));
-        return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
-      }).join(",")}\n`;
-      const size = Buffer.byteLength(line);
-      if (
-        (job.chunkRows && rowsInPart >= job.chunkRows) ||
-        (job.chunkBytes && bytesInPart + size >= job.chunkBytes)
-      ) {
-        await rotate();
+  try {
+    for await (const batch of client.iterTableRows(job.database, schema, table, columns, {
+      where: job.where,
+      orderKeys,
+      nolock: job.nolock,
+      batchSize: job.batchSize,
+      after: lastKey,
+      shouldStop: () => job.cancel || job.skip.has(`${schema}\0${table}`),
+    })) {
+      await waitIfPaused(job);
+      if (job.cancel || job.skip.has(`${schema}\0${table}`)) break;
+      for (const row of batch) {
+        const line = `${row.map((value) => {
+          const text = String(csvValue(value));
+          return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+        }).join(",")}\n`;
+        const size = Buffer.byteLength(line);
+        if (
+          (job.chunkRows && rowsInPart >= job.chunkRows) ||
+          (job.chunkBytes && bytesInPart + size >= job.chunkBytes)
+        ) {
+          await rotate();
+        }
+        await writeStream(current.target, line);
+        rowsInPart += 1;
+        bytesInPart += size;
+        tableRows += 1;
+        rowsSinceCheckpoint += 1;
+        const applyCounts = () => {
+          job.rowsWritten += 1;
+          job.bytesWritten += size;
+        };
+        if (lock) await lock.run(applyCounts);
+        else applyCounts();
+        if (orderKeys.length) {
+          lastKey = Object.fromEntries(
+            orderKeys.map((key) => {
+              const index = columns.indexOf(key);
+              return [key, index >= 0 ? row[index] : undefined];
+            }),
+          );
+        }
+        await checkpoint();
       }
-      current.target.write(line);
-      rowsInPart += 1;
-      bytesInPart += size;
-      tableRows += 1;
-      rowsSinceCheckpoint += 1;
-      const applyCounts = () => {
-        job.rowsWritten += 1;
-        job.bytesWritten += size;
-      };
-      if (lock) await lock.run(applyCounts);
-      else applyCounts();
-      if (orderKeys.length) {
-        lastKey = Object.fromEntries(orderKeys.map((key, index) => [key, row[columns.indexOf(key)] ?? row[index]]));
-      }
-      await checkpoint();
+      await checkpoint(true);
     }
-    await checkpoint(true);
-  }
-  current.target.end();
-  if (rowsInPart || !job.parts.length) {
-    await pushPart();
-  }
-  if (tableEntry) {
-    const done = () => {
-      tableEntry.rows_written = tableRows;
-      tableEntry.last_key = null;
-    };
-    if (lock) await lock.run(done);
-    else done();
+  } finally {
+    await finalizeCurrent();
+    if (tableEntry) {
+      const done = () => {
+        tableEntry.rows_written = tableRows;
+        tableEntry.last_key = lastKey;
+      };
+      if (lock) await lock.run(done);
+      else done();
+    }
   }
 }
 
@@ -690,6 +804,8 @@ async function runExportDatabase(job: Job) {
 }
 
 async function runExport(job: Job) {
+  if (ACTIVE_RUNS.has(job.id)) return;
+  ACTIVE_RUNS.add(job.id);
   job.status = "running";
   job.startedAt = job.startedAt || now();
   saveMeta(job);
@@ -751,6 +867,7 @@ async function runExport(job: Job) {
   } finally {
     job.finishedAt = now();
     job.current = undefined;
+    ACTIVE_RUNS.delete(job.id);
     saveMeta(job);
   }
 }
@@ -1051,23 +1168,33 @@ export function resumeJob(sid: string, id: string, cfg?: ConnectionConfig) {
 
   if (!canResumeStatus(job.status)) throw new ClientError("Job cannot be resumed.");
 
-  job.workers = takeWorkers(sid, job.workers, job.id);
+  const liveRun = ACTIVE_RUNS.has(job.id);
+  job.workers = liveRun ? job.workers : takeWorkers(sid, job.workers, job.id);
   job.pause = false;
   job.cancel = false;
   job.error = null;
   job.hint = null;
   job.finishedAt = "";
 
-  if (job.kind === "backup") {
-    job.parts = [];
-  } else if (job.kind === "export_db") {
-    for (const table of job.tables) {
-      if (table.status === "running") table.status = "queued";
+  if (!liveRun) {
+    adoptFolderParts(job.parts, job.folder);
+    if (job.kind === "backup") {
+      job.parts = [];
+    } else if (job.kind === "export_db") {
+      for (const table of job.tables) {
+        if (table.status === "running") table.status = "queued";
+      }
+    } else if (job.kind === "export" && !job.lastKey) {
+      job.parts = [];
+      job.rowsWritten = 0;
+      job.bytesWritten = 0;
     }
-  } else if (job.kind === "export" && !job.lastKey) {
-    job.parts = [];
-    job.rowsWritten = 0;
-    job.bytesWritten = 0;
+  }
+
+  if (liveRun) {
+    job.status = "running";
+    saveMeta(job);
+    return publicJob(job);
   }
 
   job.status = "queued";
