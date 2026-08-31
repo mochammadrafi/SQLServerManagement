@@ -124,7 +124,7 @@ const JOBS = new Map<string, Job>();
 const PERSISTED = new Map<string, JobSnapshot>();
 const ACTIVE_RUNS = new Set<string>();
 const JOB_STORE_DIR = join(STORE_DIR, "export-jobs");
-const CHECKPOINT_ROWS = 500;
+const CHECKPOINT_ROWS = 10000;
 const PART_FILE = /_part-\d+\.csv(\.gz)?$/i;
 
 function createJobLock() {
@@ -149,6 +149,25 @@ function partNumber(name: string, prefix: string) {
   if (!name.startsWith(marker)) return 0;
   const num = Number.parseInt(name.slice(marker.length).split(".")[0] || "", 10);
   return Number.isFinite(num) ? num : 0;
+}
+
+function lastPartForPrefix(job: Job, prefix: string) {
+  let best: Job["parts"][number] | null = null;
+  let max = 0;
+  for (const part of job.parts) {
+    const num = partNumber(part.name, prefix);
+    if (num > max) {
+      max = num;
+      best = part;
+    }
+  }
+  return best;
+}
+
+function partIsFull(job: Job, part: Job["parts"][number]) {
+  if (job.chunkRows && part.rows > 0 && part.rows >= job.chunkRows) return true;
+  if (job.chunkBytes && part.bytes > 0 && part.bytes >= job.chunkBytes) return true;
+  return false;
 }
 
 function nextPartIndex(job: Job, prefix: string, scanDisk = false) {
@@ -557,6 +576,15 @@ function waitIfPaused(job: Job) {
   });
 }
 
+function csvLine(row: unknown[]) {
+  return `${row
+    .map((value) => {
+      const text = String(csvValue(value));
+      return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+    })
+    .join(",")}\n`;
+}
+
 async function writeCsvPart(
   job: Job,
   client: SqlServerClient,
@@ -574,32 +602,45 @@ async function writeCsvPart(
   const lock = opts.lock;
   const tableEntry = opts.tableEntry;
   const orderKeys = opts.orderKeys;
+  const keyIndexes = orderKeys.map((key) => columns.indexOf(key));
   let lastKey = opts.startKey ?? null;
   const scanDisk = Boolean(opts.startKey) || job.parts.length > 0;
   if (lock) await lock.run(() => adoptFolderParts(job.parts, job.folder));
   else adoptFolderParts(job.parts, job.folder);
-  let partIndex = lock
-    ? await lock.run(() => nextPartIndex(job, prefix, scanDisk))
-    : nextPartIndex(job, prefix, scanDisk);
-  let rowsInPart = 0;
-  let bytesInPart = 0;
+  const resumePart = lastKey
+    ? lock
+      ? await lock.run(() => lastPartForPrefix(job, prefix))
+      : lastPartForPrefix(job, prefix)
+    : null;
+  const reusePart = Boolean(
+    resumePart && existsSync(resumePart.path) && !partIsFull(job, resumePart),
+  );
+  let partIndex = reusePart
+    ? partNumber(resumePart!.name, prefix)
+    : lock
+      ? await lock.run(() => nextPartIndex(job, prefix, scanDisk))
+      : nextPartIndex(job, prefix, scanDisk);
+  let rowsInPart = reusePart ? resumePart!.rows || 0 : 0;
+  let bytesInPart = reusePart ? resumePart!.bytes || 0 : 0;
   let rowsSinceCheckpoint = 0;
-  let tableRows = 0;
+  let tableRows = tableEntry?.rows_written || 0;
   const ext = job.gzip ? ".csv.gz" : ".csv";
-  const openPart = () => {
+  const openPart = (append = false) => {
     const name = `${safeName(prefix)}_part-${String(partIndex).padStart(5, "0")}${ext}`;
     const path = join(job.folder, name);
-    const file = createWriteStream(path);
-    const gzip = job.gzip ? createGzip() : null;
+    const file = createWriteStream(path, append ? { flags: "a" } : undefined);
+    const gzip = job.gzip ? createGzip({ level: 6 }) : null;
     if (gzip) gzip.pipe(file);
-    const header = `${columns.join(",")}\n`;
     const target = gzip || file;
-    target.write(header);
-    bytesInPart = Buffer.byteLength(header);
-    rowsInPart = 0;
+    if (!append) {
+      const header = `${columns.join(",")}\n`;
+      target.write(header);
+      bytesInPart = Buffer.byteLength(header);
+      rowsInPart = 0;
+    }
     return { name, path, file, gzip, target };
   };
-  let current = openPart();
+  let current = openPart(reusePart);
   let finalized = false;
   const pushPart = async () => {
     const part = { name: current.name, rows: rowsInPart, bytes: bytesInPart, path: current.path };
@@ -629,7 +670,7 @@ async function writeCsvPart(
   const rotate = async () => {
     await finalizeCurrent();
     partIndex += 1;
-    current = openPart();
+    current = openPart(false);
     finalized = false;
   };
   const checkpoint = async (force = false) => {
@@ -660,51 +701,62 @@ async function writeCsvPart(
     })) {
       await waitIfPaused(job);
       if (job.cancel || job.skip.has(`${schema}\0${table}`)) break;
-      for (const row of batch) {
-        const line = `${row.map((value) => {
-          const text = String(csvValue(value));
-          return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
-        }).join(",")}\n`;
-        const size = Buffer.byteLength(line);
-        if (
-          (job.chunkRows && rowsInPart >= job.chunkRows) ||
-          (job.chunkBytes && bytesInPart + size >= job.chunkBytes)
-        ) {
-          await rotate();
-        }
-        await writeStream(current.target, line);
-        rowsInPart += 1;
-        bytesInPart += size;
-        tableRows += 1;
-        rowsSinceCheckpoint += 1;
+      let chunk = "";
+      let addedRows = 0;
+      let addedBytes = 0;
+      let pendingKey = lastKey;
+      const flushChunk = async () => {
+        if (!chunk) return;
+        await writeStream(current.target, chunk);
+        rowsInPart += addedRows;
+        bytesInPart += addedBytes;
+        tableRows += addedRows;
+        rowsSinceCheckpoint += addedRows;
+        lastKey = pendingKey;
+        const rows = addedRows;
+        const bytes = addedBytes;
+        addedRows = 0;
+        addedBytes = 0;
+        chunk = "";
         const applyCounts = () => {
-          job.rowsWritten += 1;
-          job.bytesWritten += size;
+          job.rowsWritten += rows;
+          job.bytesWritten += bytes;
         };
         if (lock) await lock.run(applyCounts);
         else applyCounts();
-        if (orderKeys.length) {
-          lastKey = Object.fromEntries(
-            orderKeys.map((key) => {
-              const index = columns.indexOf(key);
-              return [key, index >= 0 ? row[index] : undefined];
-            }),
-          );
+      };
+      for (const row of batch) {
+        const line = csvLine(row);
+        const size = Buffer.byteLength(line);
+        if (
+          (job.chunkRows && rowsInPart + addedRows >= job.chunkRows) ||
+          (job.chunkBytes && bytesInPart + addedBytes + size >= job.chunkBytes)
+        ) {
+          await flushChunk();
+          await rotate();
         }
-        await checkpoint();
+        chunk += line;
+        addedRows += 1;
+        addedBytes += size;
+        if (orderKeys.length) {
+          pendingKey = Object.fromEntries(orderKeys.map((key, index) => [key, row[keyIndexes[index]]]));
+        }
       }
-      await checkpoint(true);
+      await flushChunk();
+      await checkpoint();
     }
   } finally {
     await finalizeCurrent();
-    if (tableEntry) {
-      const done = () => {
+    const done = () => {
+      if (tableEntry) {
         tableEntry.rows_written = tableRows;
         tableEntry.last_key = lastKey;
-      };
-      if (lock) await lock.run(done);
-      else done();
-    }
+      }
+      job.lastKey = lastKey;
+      saveMeta(job);
+    };
+    if (lock) await lock.run(done);
+    else done();
   }
 }
 

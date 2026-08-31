@@ -87,6 +87,7 @@ function tediousConfig(cfg: ConnectionConfig, queryTimeoutSec?: number): sql.con
       appName: "SQLSM",
       instanceName: instance || undefined,
       tdsVersion: "7_4",
+      packetSize: 32767,
       fallbackToDefaultDb: true,
       cryptoCredentialsDetails: cfg.encrypt ? { minVersion: "TLSv1" } : {},
     },
@@ -847,33 +848,75 @@ WHERE s.name = ${qstr(schema)} AND o.name = ${qstr(table)} AND p.index_id IN (0,
     request.stream = true;
     params.forEach((value, index) => request.input(`p${index}`, value as never));
     const queue: unknown[][] = [];
+    const highWater = fetchN * 3;
+    const lowWater = fetchN;
     let done = false;
     let error: unknown = null;
+    let wake: (() => void) | null = null;
+    const kick = () => {
+      wake?.();
+      wake = null;
+    };
+    const pause = () => {
+      try {
+        request.pause();
+      } catch {
+        /* msnodesqlv8 may not support pause */
+      }
+    };
+    const resume = () => {
+      try {
+        request.resume();
+      } catch {
+        /* ignore */
+      }
+    };
     request.on("row", (row: Record<string, unknown>) => {
       queue.push(columns.map((name) => row[name]));
+      if (queue.length >= highWater) pause();
+      kick();
     });
     request.on("error", (err) => {
       error = err;
       done = true;
+      kick();
     });
     request.on("done", () => {
       done = true;
+      kick();
     });
     request.query(sqlText).catch((err) => {
       error = err;
       done = true;
+      kick();
     });
     while (!done || queue.length) {
       if (opts.shouldStop?.() || this.cancelFlag) {
         request.cancel();
         throw new ClientError("Command cancelled.");
       }
-      if (queue.length) {
-        const batch = queue.splice(0, fetchN);
-        yield batch;
+      if (!queue.length) {
+        await new Promise<void>((resolve) => {
+          if (done || queue.length || opts.shouldStop?.() || this.cancelFlag) return resolve();
+          let settled = false;
+          let timer: ReturnType<typeof setInterval> | undefined;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearInterval(timer);
+            if (wake === finish) wake = null;
+            resolve();
+          };
+          timer = setInterval(() => {
+            if (done || queue.length || opts.shouldStop?.() || this.cancelFlag) finish();
+          }, 250);
+          wake = finish;
+        });
         continue;
       }
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      const batch = queue.splice(0, fetchN);
+      if (queue.length <= lowWater) resume();
+      yield batch;
     }
     if (error) {
       if (isCancelled(error)) throw new ClientError("Command cancelled.");
